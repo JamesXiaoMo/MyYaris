@@ -14,7 +14,11 @@ class MainActivity : FlutterActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName).setMethodCallHandler { call, result ->
             when (call.method) {
                 "launchCarNavitime" -> {
-                    val geoUriString = call.argument<String>("geoUri") ?: "geo:35.6812,139.7671?q=Tokyo+Station"
+                    val geoUriString = call.argument<String>("geoUri")
+                    if (geoUriString.isNullOrBlank()) {
+                        result.error("INVALID_ARGUMENT", "geoUri parameter is required and cannot be empty", null)
+                        return@setMethodCallHandler
+                    }
                     try {
                         val intent = Intent(Intent.ACTION_VIEW, Uri.parse(geoUriString)).apply {
                             setPackage("com.navitime.local.carnavitime")
@@ -23,18 +27,7 @@ class MainActivity : FlutterActivity() {
                         startActivity(intent)
                         result.success(mapOf("success" to true, "mode" to "geo_uri", "uri" to geoUriString))
                     } catch (e: Exception) {
-                        try {
-                            val launchIntent = packageManager.getLaunchIntentForPackage("com.navitime.local.carnavitime")
-                            if (launchIntent != null) {
-                                launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                startActivity(launchIntent)
-                                result.success(mapOf("success" to true, "mode" to "package_launch"))
-                            } else {
-                                result.error("LAUNCH_FAILED", e.localizedMessage, null)
-                            }
-                        } catch (fallbackEx: Exception) {
-                            result.error("LAUNCH_FAILED", fallbackEx.localizedMessage, null)
-                        }
+                        result.error("LAUNCH_FAILED", e.localizedMessage ?: "Failed to launch $geoUriString", null)
                     }
                 }
                 "checkNavitimeInstalled" -> {
