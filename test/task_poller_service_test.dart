@@ -218,6 +218,44 @@ void main() {
       expect(mockClient.recordedPhases.contains(TaskAckPhase.launchRequested), isFalse);
     });
 
+    test('freshTask re-check with mismatched taskId or invalid fresh coords aborts launch', () async {
+      final initialTask = TaskModel(
+        taskId: 'task_mismatch_check',
+        deviceId: 'car_p3pro',
+        title: 'Valid Initial Destination',
+        latitude: 34.399,
+        longitude: 132.711,
+        status: 'queued',
+        createdAt: DateTime.now().toUtc(),
+        expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+      );
+
+      // freshTask returns mismatched taskId
+      final mismatchedFreshTask = TaskModel(
+        taskId: 'task_different_id',
+        deviceId: 'car_p3pro',
+        title: 'Mismatched ID',
+        latitude: 34.399,
+        longitude: 132.711,
+        status: 'queued',
+        createdAt: DateTime.now().toUtc(),
+        expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+      );
+
+      mockClient.nextTaskToReturn = initialTask;
+      mockClient.freshTaskToReturn = mismatchedFreshTask;
+      mockClient.ackResultToReturn = const AckResult.accepted();
+
+      poller.start();
+      await Future.delayed(const Duration(milliseconds: 60));
+      poller.stop();
+
+      // received was sent
+      expect(mockClient.recordedPhases, contains(TaskAckPhase.received));
+      // launchRequested was NOT sent!
+      expect(mockClient.recordedPhases.contains(TaskAckPhase.launchRequested), isFalse);
+    });
+
     test('Pre-execution validation failure reports failed ack immediately without received', () async {
       // Task with invalid coordinate lat = 999.0
       mockClient.nextTaskToReturn = TaskModel(

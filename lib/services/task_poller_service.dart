@@ -264,23 +264,24 @@ class TaskPollerService extends ChangeNotifier {
       return;
     }
 
-    // Validate fresh task status and expiry
-    final freshStatus = freshTask.status.toLowerCase();
-    if (freshStatus != 'queued' && freshStatus != 'received') {
-      _log('任务 [${task.taskId}] 服务端最新状态为 [$freshStatus]（非 queued/received），取消拉起导航');
+    // Validate fresh task ID matches the initial task
+    if (freshTask.taskId != task.taskId) {
+      _log('任务 [${task.taskId}] 复核ID不一致: 服务端返回 [${freshTask.taskId}]，取消拉起');
       await storage.addProcessedTaskId(task.taskId);
       return;
     }
 
-    if (freshTask.isExpired) {
-      _log('任务 [${task.taskId}] 服务端复核已过期 (${freshTask.expiresAt})，上报 failed 并取消拉起');
+    // Comprehensive validation on freshTask (status, deviceId, coordSystem, coordinates, expiry)
+    final freshValidationError = freshTask.validateForExecution(expectedDeviceId: storage.deviceId);
+    if (freshValidationError != null) {
+      _log('任务 [${task.taskId}] 服务端最新数据复核未通过 ($freshValidationError)，上报 failed 并取消拉起');
       await _sendAck(
         backendUrl: backendUrl,
         carToken: carToken,
         taskId: task.taskId,
         phase: TaskAckPhase.failed,
-        errorCode: 'TASK_EXPIRED',
-        errorDetail: 'Task expired on fresh server check',
+        errorCode: 'FRESH_VALIDATION_FAILED',
+        errorDetail: freshValidationError,
       );
       await storage.addProcessedTaskId(task.taskId);
       return;

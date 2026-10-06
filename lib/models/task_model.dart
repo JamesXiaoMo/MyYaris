@@ -101,16 +101,20 @@ class TaskModel {
     return 'geo:0,0?q=$latitude,$longitude';
   }
 
-  factory TaskModel.fromJson(Map<String, dynamic> json) {
-    DateTime? parsedCreatedAt;
-    if (json['created_at'] != null && (json['created_at'] as String).isNotEmpty) {
-      parsedCreatedAt = DateTime.tryParse(json['created_at'] as String)?.toUtc();
+  /// Helper to safely parse UTC datetimes. Server naive ISO strings without timezone (e.g. 2026-10-06T12:43:09.926576)
+  /// are treated as UTC rather than local device time.
+  static DateTime? parseUtcDateTime(String? raw) {
+    if (raw == null || raw.trim().isEmpty) return null;
+    var str = raw.trim();
+    if (!str.endsWith('Z') && !str.contains('+') && !RegExp(r'-\d{2}:\d{2}$').hasMatch(str)) {
+      str = '${str}Z';
     }
+    return DateTime.tryParse(str)?.toUtc();
+  }
 
-    DateTime? parsedExpiresAt;
-    if (json['expires_at'] != null && (json['expires_at'] as String).isNotEmpty) {
-      parsedExpiresAt = DateTime.tryParse(json['expires_at'] as String)?.toUtc();
-    }
+  factory TaskModel.fromJson(Map<String, dynamic> json) {
+    final parsedCreatedAt = parseUtcDateTime(json['created_at'] as String?);
+    final parsedExpiresAt = parseUtcDateTime(json['expires_at'] as String?);
 
     return TaskModel(
       taskId: json['task_id'] as String? ?? '',

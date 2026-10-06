@@ -6,12 +6,13 @@
 
 ## 1. 前置网络与安全要求
 
-1. **Tailscale 私网接入**：
+1. **Tailscale 私网接入与 HTTPS 入口**：
    - iPhone 必须安装并登录 Tailscale，且处于已连接状态（与 R9000P 处于同一 Tailscale Tailnet）。
-   - 后端统一 HTTPS 接入地址：
+   - 服务端已启用 Tailscale Serve 并在标准 HTTPS (443) 端口提供服务：
      ```text
      https://myyaris.example.com
      ```
+     （端点健康检查：`https://myyaris.example.com/health`，返回 `{"status":"ok",...}`）
 2. **手机鉴权令牌（PHONE_TOKEN）**：
    - 接口需携带 `Authorization: Bearer <YOUR_PHONE_TOKEN>` 请求头。
    - **安全提示**：请在快捷指令中通过独立的文本变量保存您的令牌，**切勿将真实令牌写入公开文档或代码仓库**。
@@ -109,28 +110,56 @@
 
 ---
 
-## 6. 响应解析与准确反馈文案
+## 6. 响应解析、候选确认与任务状态查询
 
 在“获取 URL 内容”后，添加动作**获取字典值**（Get Dictionary Value）提取键 `status`：
 
-根据返回的 `status` 字段显示准确的通知或提示弹窗（**严禁仅凭 HTTP 200 就声称车机已完成导航**）：
+根据返回的 `status` 字段执行对应处理：
 
-1. **`status == "resolved"`**：
-   - 提取 `task_id`。
-   - **反馈文案**：
-     > 🚗 **已生成车机导航任务**
-     > 任务编号: `[task_id]`
-     > 状态: `queued`（已进入队列，等待车机前台长轮询接收拉起）
-2. **`status == "needs_clarification"`**：
-   - 提取 `clarification_question` 或 `candidates` 候选列表。
-   - **反馈文案**：
-     > ⚠️ **地点存在歧义，需进一步确认**
-     > 原因: 检索到多个合理匹配项，请在车机或手机端选择确认候选。
-3. **`status == "failed"`**：
-   - 提取 `error_message`。
-   - **反馈文案**：
-     > ❌ **目的地解析失败**
-     > 原因: `[error_message]`
+### 分支 1：`status == "resolved"`
+- 提取 `task_id`：
+  - **若 `task_id` 存在且非空**：
+    - 表明任务已生成并入队。
+    - （可选）添加动作“获取 URL 内容”：`GET https://myyaris.example.com/tasks/[task_id]`（携带 `Authorization: Bearer <TOKEN>`），查询任务实时状态（`queued` / `received` / `launch_requested`）。
+    - **反馈文案**：
+      > 🚗 **已生成车机导航任务**
+      > 任务编号: `[task_id]`
+      > 状态: `queued`（已进入队列，等待车机前台长轮询接收）
+  - **若 `task_id` 为空（null）**：
+    - **严禁声称 `queued`**！
+    - **反馈文案**：
+      > ℹ️ **目的地已解析，但尚未创建车机任务 (无 task_id)**
+
+### 分支 2：`status == "needs_clarification"`（候选确认流程）
+当解析结果存在多个地点候选时，需由用户确认候选：
+1. 从响应字典中提取 `request_id` 及 `candidates` 列表。
+2. 快捷指令动作“从列表中选择”展示候选名称供用户选取，得到选中的 `candidate_id`。
+3. 添加动作“获取 URL 内容”提交确认请求：
+   - **URL**：
+     ```text
+     https://myyaris.example.com/destinations/[request_id]/confirm
+     ```
+   - **方法**：`POST`
+   - **请求头**：`Content-Type: application/json`, `Authorization: Bearer <YOUR_PHONE_TOKEN>`
+   - **请求体（JSON）**：
+     ```json
+     {
+       "candidate_id": "<选中的 candidate_id>",
+       "target_device_id": "car_p3pro"
+     }
+     ```
+4. 确认请求将直接返回 `TaskOut` 对象（包含新生成的 `task_id` 及 `status: "queued"`）。
+5. （可选）调用 `GET https://myyaris.example.com/tasks/[task_id]` 追踪车机收取状态。
+6. **反馈文案**：
+   > 🚗 **候选地点已确认，导航任务已下发**
+   > 任务编号: `[task_id]`
+   > 状态: `queued`
+
+### 分支 3：`status == "failed"`
+- 提取 `error_message`。
+- **反馈文案**：
+  > ❌ **目的地解析失败**
+  > 原因: `[error_message]`
 
 ---
 
@@ -139,6 +168,7 @@
 1. **短链接解析限制**：
    - 服务端内置严密的 SSRF 防御机制（禁止内网重定向、过滤非信任域名）。
    - **不承诺支持所有第三方特殊短链接**。优先推荐在 Google Maps 中选择地点后直接分享完整链接，或直接提交准确坐标。
-2. **车机接收时机**：
+2. **车机接收时机与后台保活限制**：
    - 车机端（MyYaris App）必须在前台运行且已开启“长轮询接收”。
+   - Android 系统在拉起外部地图（如 CAR NAVITIME）后，若系统杀后台或休眠进程，前台轮询可能中断。跨 App 后台持续保活需后续车载系统特权开发，当前版本未实现后台常驻保活，仅保证前台链路可靠执行。
    - 若车机离线或未在前台运行，任务将在服务端保留（默认 60 分钟有效），待车机上线后自动收取。
