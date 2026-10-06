@@ -479,22 +479,38 @@ class _CarHomePageState extends State<CarHomePage> {
                                               decoration: BoxDecoration(
                                                 color: Colors.black26,
                                                 borderRadius: BorderRadius.circular(6),
-                                                border: Border.all(color: Colors.white10),
+                                                border: Border.all(
+                                                  color: t.status.toLowerCase() == 'failed'
+                                                      ? Colors.red.withValues(alpha: 0.3)
+                                                      : (t.status.toLowerCase() == 'launch_requested'
+                                                          ? Colors.green.withValues(alpha: 0.3)
+                                                          : Colors.white10),
+                                                ),
                                               ),
                                               child: Column(
                                                 crossAxisAlignment: CrossAxisAlignment.start,
                                                 children: [
-                                                  Text(
-                                                    t.title,
-                                                    style: const TextStyle(
-                                                      color: Colors.white,
-                                                      fontSize: 12,
-                                                      fontWeight: FontWeight.w600,
-                                                    ),
+                                                  Row(
+                                                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                                    children: [
+                                                      Expanded(
+                                                        child: Text(
+                                                          t.title,
+                                                          style: const TextStyle(
+                                                            color: Colors.white,
+                                                            fontSize: 12,
+                                                            fontWeight: FontWeight.w600,
+                                                          ),
+                                                          overflow: TextOverflow.ellipsis,
+                                                        ),
+                                                      ),
+                                                      const SizedBox(width: 6),
+                                                      _buildTaskStatusBadge(t.status),
+                                                    ],
                                                   ),
                                                   const SizedBox(height: 2),
                                                   Text(
-                                                    '${t.latitude}, ${t.longitude} (${t.coordSystem})',
+                                                    '${t.latitude.toStringAsFixed(6)}, ${t.longitude.toStringAsFixed(6)} (${t.coordSystem})',
                                                     style: const TextStyle(
                                                       color: Colors.blueAccent,
                                                       fontSize: 10,
@@ -510,6 +526,18 @@ class _CarHomePageState extends State<CarHomePage> {
                                                     ),
                                                     overflow: TextOverflow.ellipsis,
                                                   ),
+                                                  if (t.errorMessage != null && t.errorMessage!.isNotEmpty) ...[
+                                                    const SizedBox(height: 2),
+                                                    Text(
+                                                      '失败: ${t.errorMessage}',
+                                                      style: TextStyle(
+                                                        color: Colors.red.shade300,
+                                                        fontSize: 9,
+                                                      ),
+                                                      maxLines: 2,
+                                                      overflow: TextOverflow.ellipsis,
+                                                    ),
+                                                  ],
                                                 ],
                                               ),
                                             );
@@ -538,6 +566,28 @@ class _CarHomePageState extends State<CarHomePage> {
                                     ],
                                   ),
                                 ),
+                                const SizedBox(height: 4),
+                                // NAVITIME Disclaimer Notice
+                                Container(
+                                  padding: const EdgeInsets.all(6),
+                                  decoration: BoxDecoration(
+                                    color: Colors.amber.withValues(alpha: 0.08),
+                                    borderRadius: BorderRadius.circular(6),
+                                    border: Border.all(color: Colors.amber.withValues(alpha: 0.25)),
+                                  ),
+                                  child: const Row(
+                                    children: [
+                                      Icon(Icons.navigation_outlined, color: Colors.amberAccent, size: 14),
+                                      SizedBox(width: 6),
+                                      Expanded(
+                                        child: Text(
+                                          '唤起说明：向系统请求调起 CAR NAVITIME 目标坐标。因公开 geo Intent 仅定位地点并展示路线搜索，无法外部直接强制开启巡航导航，状态为【请求唤起】而非导航已开始。',
+                                          style: TextStyle(color: Colors.amberAccent, fontSize: 9),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
                               ],
                             ),
                           ),
@@ -551,6 +601,50 @@ class _CarHomePageState extends State<CarHomePage> {
           ),
         );
       },
+    );
+  }
+
+  Widget _buildTaskStatusBadge(String status) {
+    Color bg;
+    Color text;
+    String label;
+    switch (status.toLowerCase()) {
+      case 'launch_requested':
+        bg = Colors.green.withValues(alpha: 0.2);
+        text = Colors.greenAccent;
+        label = '请求唤起';
+        break;
+      case 'received':
+        bg = Colors.blue.withValues(alpha: 0.2);
+        text = Colors.blueAccent;
+        label = '已收到';
+        break;
+      case 'failed':
+        bg = Colors.red.withValues(alpha: 0.2);
+        text = Colors.redAccent;
+        label = '调起失败';
+        break;
+      case 'queued':
+        bg = Colors.orange.withValues(alpha: 0.2);
+        text = Colors.orangeAccent;
+        label = '待处理';
+        break;
+      default:
+        bg = Colors.grey.withValues(alpha: 0.2);
+        text = Colors.grey;
+        label = status;
+    }
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: text.withValues(alpha: 0.4)),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(color: text, fontSize: 9, fontWeight: FontWeight.bold),
+      ),
     );
   }
 }

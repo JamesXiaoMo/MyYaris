@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:my_yaris/models/task_model.dart';
 import 'package:my_yaris/services/backend_client.dart';
@@ -63,6 +64,8 @@ class MockBackendClient extends BackendClient {
 }
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
   group('TaskPollerService Logic & Concurrency Tests', () {
     late MockStorageService storage;
     late MockBackendClient mockClient;
@@ -315,5 +318,68 @@ void main() {
       expect(mockClient.recordedPhases, isEmpty);
       expect(mockClient.getTaskCallCount, 0);
     }, timeout: const Timeout(Duration(seconds: 5)));
+
+    test('Pre-execution validation failure records task as failed in storage.recentTasks', () async {
+      final invalidTask = TaskModel(
+        taskId: 'task_invalid_coords_recent',
+        deviceId: 'car_p3pro',
+        title: 'Invalid Coords Destination',
+        latitude: 999.0, // Invalid!
+        longitude: 132.711,
+        status: 'queued',
+        createdAt: DateTime.now().toUtc(),
+        expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+      );
+
+      mockClient.nextTaskToReturn = invalidTask;
+      poller.start();
+      await Future.delayed(const Duration(milliseconds: 60));
+      poller.stop();
+
+      expect(storage.recentTasks.length, 1);
+      final recorded = storage.recentTasks.first;
+      expect(recorded.taskId, 'task_invalid_coords_recent');
+      expect(recorded.status, 'failed');
+      expect(recorded.errorMessage, contains('坐标非法'));
+    });
+
+    test('Successful navigation launch records task as launch_requested in storage.recentTasks', () async {
+      final validTask = TaskModel(
+        taskId: 'task_valid_launch',
+        deviceId: 'car_p3pro',
+        title: 'Valid Destination',
+        latitude: 34.399,
+        longitude: 132.711,
+        status: 'queued',
+        createdAt: DateTime.now().toUtc(),
+        expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+      );
+
+      mockClient.nextTaskToReturn = validTask;
+      mockClient.freshTaskToReturn = validTask;
+      mockClient.ackResultToReturn = const AckResult.accepted();
+
+      // Setup channel mock
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+        const MethodChannel('com.myyaris.my_yaris/navigation'),
+        (call) async {
+          if (call.method == 'launchCarNavitime') {
+            return {'success': true, 'mode': 'geo_uri'};
+          }
+          return null;
+        },
+      );
+
+      poller.start();
+      await Future.delayed(const Duration(milliseconds: 80));
+      poller.stop();
+
+      expect(storage.recentTasks.length, 1);
+      final recorded = storage.recentTasks.first;
+      expect(recorded.taskId, 'task_valid_launch');
+      expect(recorded.status, 'launch_requested');
+      expect(recorded.toGeoUri(), 'geo:0,0?q=34.399,132.711');
+    });
   });
 }

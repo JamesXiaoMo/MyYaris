@@ -45,6 +45,36 @@ class TaskModel {
     this.errorMessage,
   });
 
+  TaskModel copyWith({
+    String? taskId,
+    String? deviceId,
+    String? title,
+    String? address,
+    double? latitude,
+    double? longitude,
+    String? coordSystem,
+    String? status,
+    DateTime? createdAt,
+    DateTime? expiresAt,
+    int? deliveryAttempts,
+    String? errorMessage,
+  }) {
+    return TaskModel(
+      taskId: taskId ?? this.taskId,
+      deviceId: deviceId ?? this.deviceId,
+      title: title ?? this.title,
+      address: address ?? this.address,
+      latitude: latitude ?? this.latitude,
+      longitude: longitude ?? this.longitude,
+      coordSystem: coordSystem ?? this.coordSystem,
+      status: status ?? this.status,
+      createdAt: createdAt ?? this.createdAt,
+      expiresAt: expiresAt ?? this.expiresAt,
+      deliveryAttempts: deliveryAttempts ?? this.deliveryAttempts,
+      errorMessage: errorMessage ?? this.errorMessage,
+    );
+  }
+
   /// Fail-closed: If expiresAt is null or unparseable, it is considered expired.
   bool get isExpired {
     if (expiresAt == null) return true;

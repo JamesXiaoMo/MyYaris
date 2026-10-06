@@ -214,6 +214,10 @@ class TaskPollerService extends ChangeNotifier {
         errorCode: 'VALIDATION_FAILED',
         errorDetail: validationError,
       );
+      await storage.addRecentTask(task.copyWith(
+        status: TaskAckPhase.failed.value,
+        errorMessage: validationError,
+      ));
       await storage.addProcessedTaskId(task.taskId);
       return;
     }
@@ -234,7 +238,12 @@ class TaskPollerService extends ChangeNotifier {
 
     // If explicit rejection by backend (accepted == false or 4xx):
     if (receivedAckResult.isExplicitlyRejected) {
-      _log('任务 [${task.taskId}] received 回执被后端明确拒绝 (${receivedAckResult.message ?? 'accepted=false'})，绝不拉起 Intent');
+      final rejectReason = receivedAckResult.message ?? 'accepted=false';
+      _log('任务 [${task.taskId}] received 回执被后端明确拒绝 ($rejectReason)，绝不拉起 Intent');
+      await storage.addRecentTask(task.copyWith(
+        status: TaskAckPhase.failed.value,
+        errorMessage: '后端明确拒绝: $rejectReason',
+      ));
       await storage.addProcessedTaskId(task.taskId);
       return;
     }
@@ -267,6 +276,10 @@ class TaskPollerService extends ChangeNotifier {
     // Validate fresh task ID matches the initial task
     if (freshTask.taskId != task.taskId) {
       _log('任务 [${task.taskId}] 复核ID不一致: 服务端返回 [${freshTask.taskId}]，取消拉起');
+      await storage.addRecentTask(task.copyWith(
+        status: TaskAckPhase.failed.value,
+        errorMessage: '服务端复核ID不一致: ${freshTask.taskId}',
+      ));
       await storage.addProcessedTaskId(task.taskId);
       return;
     }
@@ -283,6 +296,10 @@ class TaskPollerService extends ChangeNotifier {
         errorCode: 'FRESH_VALIDATION_FAILED',
         errorDetail: freshValidationError,
       );
+      await storage.addRecentTask(freshTask.copyWith(
+        status: TaskAckPhase.failed.value,
+        errorMessage: freshValidationError,
+      ));
       await storage.addProcessedTaskId(task.taskId);
       return;
     }
@@ -310,8 +327,10 @@ class TaskPollerService extends ChangeNotifier {
       if (success) {
         // Requirement 4: Success log only states launch request initiated, does not claim navigation confirmed
         _log('已向系统发起打开 CAR NAVITIME 请求，上报 [launch_requested] 回执');
+        await storage.addRecentTask(freshTask.copyWith(
+          status: TaskAckPhase.launchRequested.value,
+        ));
         await storage.addProcessedTaskId(freshTask.taskId);
-        await storage.addRecentTask(freshTask);
         await _sendAck(
           backendUrl: backendUrl,
           carToken: carToken,
@@ -324,6 +343,10 @@ class TaskPollerService extends ChangeNotifier {
       }
     } catch (e) {
       _log('发起打开 CAR NAVITIME 请求失败: $e，上报 [failed] 回执');
+      await storage.addRecentTask(freshTask.copyWith(
+        status: TaskAckPhase.failed.value,
+        errorMessage: '发起打开请求失败: $e',
+      ));
       await storage.addProcessedTaskId(freshTask.taskId);
       await _sendAck(
         backendUrl: backendUrl,
