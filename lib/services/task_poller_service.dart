@@ -22,6 +22,7 @@ class TaskPollerService extends ChangeNotifier {
   final IStorageService storage;
   final BackendClient _client;
 
+  int _loopGeneration = 0;
   PollerStatus _status = PollerStatus.idle;
   String _statusMessage = '待命中 (接收未启用)';
   int _consecutiveFailures = 0;
@@ -56,19 +57,23 @@ class TaskPollerService extends ChangeNotifier {
   void start() {
     if (_isRunning) return;
     _isRunning = true;
+    _loopGeneration++;
+    final currentGen = _loopGeneration;
     storage.setPollingEnabled(true);
     _consecutiveFailures = 0;
-    _log('启动车机长轮询接收引擎');
-    _runLoop();
+    _log('启动车机长轮询接收引擎 (Loop Gen: $currentGen)');
+    _runLoop(currentGen);
   }
 
   void stop() {
     if (!_isRunning) return;
     _isRunning = false;
+    _loopGeneration++; // Invalidate any running loops or in-flight tasks
     storage.setPollingEnabled(false);
     _status = PollerStatus.idle;
     _statusMessage = '已停止接收';
-    _activeSleepCompleter?.complete();
+    final sleep = _activeSleepCompleter;
+    if (sleep != null && !sleep.isCompleted) sleep.complete();
     _log('已手动停止长轮询');
     notifyListeners();
   }
@@ -81,11 +86,13 @@ class TaskPollerService extends ChangeNotifier {
     });
     await completer.future;
     timer.cancel();
-    _activeSleepCompleter = null;
+    if (identical(_activeSleepCompleter, completer)) {
+      _activeSleepCompleter = null;
+    }
   }
 
-  Future<void> _runLoop() async {
-    while (_isRunning) {
+  Future<void> _runLoop(int gen) async {
+    while (_isRunning && _loopGeneration == gen) {
       final backendUrl = storage.backendUrl;
       final deviceId = storage.deviceId;
       final carToken = storage.carToken;
@@ -103,6 +110,8 @@ class TaskPollerService extends ChangeNotifier {
       // Flush any pending un-acknowledged receipts from previous attempts
       await _flushPendingAcks(backendUrl, carToken);
 
+      if (!_isRunning || _loopGeneration != gen) break;
+
       _status = PollerStatus.polling;
       _statusMessage = '正在长轮询后端任务 (/devices/$deviceId/tasks/next)...';
       notifyListeners();
@@ -115,7 +124,10 @@ class TaskPollerService extends ChangeNotifier {
           timeoutSeconds: 20,
         );
 
-        if (!_isRunning) break;
+        if (!_isRunning || _loopGeneration != gen) {
+          _log('轮询已停止，丢弃本次长轮询响应');
+          break;
+        }
 
         if (task == null) {
           // 204 No Content: timeout reached, server has no new task
@@ -135,7 +147,12 @@ class TaskPollerService extends ChangeNotifier {
         _log('收到任务 [${task.taskId}] 目标: ${task.title} (${task.latitude}, ${task.longitude})');
         notifyListeners();
 
-        await _processIncomingTask(task, backendUrl, carToken);
+        await _processIncomingTask(task, backendUrl, carToken, gen);
+        // A server may immediately redeliver an unacknowledged task. Yield to
+        // timers and bound request frequency, including duplicate/rejected tasks.
+        if (_isRunning && _loopGeneration == gen) {
+          await _sleepCancelable(const Duration(milliseconds: 100));
+        }
       } on AuthException catch (e) {
         _status = PollerStatus.pausedAuthError;
         _statusMessage = '鉴权失败 (HTTP ${e.statusCode})，请检查令牌';
@@ -145,7 +162,7 @@ class TaskPollerService extends ChangeNotifier {
         await storage.setPollingEnabled(false);
         break;
       } catch (e) {
-        if (!_isRunning) break;
+        if (!_isRunning || _loopGeneration != gen) break;
         _consecutiveFailures++;
         final backoffSeconds = _calculateBackoff(_consecutiveFailures);
         _status = PollerStatus.reconnecting;
@@ -170,57 +187,115 @@ class TaskPollerService extends ChangeNotifier {
     TaskModel task,
     String backendUrl,
     String carToken,
+    int gen,
   ) async {
+    // Abort if poller stopped or restarted
+    if (!_isRunning || _loopGeneration != gen) {
+      _log('长轮询已停止，中止处理任务 [${task.taskId}]');
+      return;
+    }
+
     // 1. Check idempotency: Was this task already processed?
     if (storage.processedTaskIds.contains(task.taskId)) {
       _log('任务 [${task.taskId}] 已在本地持久化列表中，跳过重复执行');
       return;
     }
 
-    // 2. Validate expiration
-    if (task.isExpired) {
-      _log('任务 [${task.taskId}] 已过期 (过期时间: ${task.expiresAt})，上报 failed 回执');
+    // 2. Strict Pre-execution Check:
+    // taskId, deviceId, status (queued/received), coordSystem (wgs84), coordinates, createdAt, expiresAt (fail-closed)
+    final validationError = task.validateForExecution(expectedDeviceId: storage.deviceId);
+    if (validationError != null) {
+      _log('任务 [${task.taskId}] 本地校验未通过 ($validationError)，上报 failed 回执');
       await _sendAck(
         backendUrl: backendUrl,
         carToken: carToken,
         taskId: task.taskId,
         phase: TaskAckPhase.failed,
-        errorCode: 'TASK_EXPIRED',
-        errorDetail: 'Task expired on device before launch',
+        errorCode: 'VALIDATION_FAILED',
+        errorDetail: validationError,
       );
       await storage.addProcessedTaskId(task.taskId);
       return;
     }
 
-    // 3. Validate coordinates
-    if (!task.hasValidCoordinates) {
-      _log('任务 [${task.taskId}] 经纬度无效 (${task.latitude}, ${task.longitude})，上报 failed 回执');
-      await _sendAck(
-        backendUrl: backendUrl,
-        carToken: carToken,
-        taskId: task.taskId,
-        phase: TaskAckPhase.failed,
-        errorCode: 'INVALID_COORDINATES',
-        errorDetail: 'Coordinates out of bounds: lat=${task.latitude}, lon=${task.longitude}',
-      );
-      await storage.addProcessedTaskId(task.taskId);
+    if (!_isRunning || _loopGeneration != gen) {
+      _log('长轮询已停止，中止处理任务 [${task.taskId}]');
       return;
     }
 
-    // 4. Report 'received' phase ack
+    // 3. Report 'received' phase ack
     _log('向后端上报 [received] 回执...');
-    await _sendAck(
+    final receivedAckResult = await _sendAck(
       backendUrl: backendUrl,
       carToken: carToken,
       taskId: task.taskId,
       phase: TaskAckPhase.received,
     );
 
+    // If explicit rejection by backend (accepted == false or 4xx):
+    if (receivedAckResult.isExplicitlyRejected) {
+      _log('任务 [${task.taskId}] received 回执被后端明确拒绝 (${receivedAckResult.message ?? 'accepted=false'})，绝不拉起 Intent');
+      await storage.addProcessedTaskId(task.taskId);
+      return;
+    }
+
+    // If network uncertainty on received ack:
+    if (receivedAckResult.isNetworkError) {
+      _log('任务 [${task.taskId}] received 回执网络发送不确定 (${receivedAckResult.error})，不盲目拉起 Intent，持久化等待重试');
+      return;
+    }
+
+    if (!_isRunning || _loopGeneration != gen) {
+      _log('长轮询已停止，中止处理任务 [${task.taskId}]');
+      return;
+    }
+
+    // 4. Re-check latest task status via GET /tasks/{id}
+    _log('正在向后端 GET /tasks/${task.taskId} 复核最新任务状态与有效期...');
+    TaskModel freshTask;
+    try {
+      freshTask = await _client.getTask(
+        baseUrl: backendUrl,
+        taskId: task.taskId,
+        token: carToken,
+      );
+    } catch (e) {
+      _log('复核任务 [${task.taskId}] 最新状态网络失败 ($e)，不盲目拉起，持久化等待重试');
+      return;
+    }
+
+    // Validate fresh task status and expiry
+    final freshStatus = freshTask.status.toLowerCase();
+    if (freshStatus != 'queued' && freshStatus != 'received') {
+      _log('任务 [${task.taskId}] 服务端最新状态为 [$freshStatus]（非 queued/received），取消拉起导航');
+      await storage.addProcessedTaskId(task.taskId);
+      return;
+    }
+
+    if (freshTask.isExpired) {
+      _log('任务 [${task.taskId}] 服务端复核已过期 (${freshTask.expiresAt})，上报 failed 并取消拉起');
+      await _sendAck(
+        backendUrl: backendUrl,
+        carToken: carToken,
+        taskId: task.taskId,
+        phase: TaskAckPhase.failed,
+        errorCode: 'TASK_EXPIRED',
+        errorDetail: 'Task expired on fresh server check',
+      );
+      await storage.addProcessedTaskId(task.taskId);
+      return;
+    }
+
+    if (!_isRunning || _loopGeneration != gen) {
+      _log('长轮询已停止，中止打开 CAR NAVITIME');
+      return;
+    }
+
     // 5. Generate actual geo URI: geo:0,0?q=lat,lon
-    final geoUri = task.toGeoUri();
+    final geoUri = freshTask.toGeoUri();
     _status = PollerStatus.launchingNavigation;
-    _statusMessage = '正在拉起 CAR NAVITIME: $geoUri';
-    _log('调用系统 MethodChannel 拉起 CAR NAVITIME: $geoUri (指定包名: com.navitime.local.carnavitime)');
+    _statusMessage = '正在向系统发起打开 CAR NAVITIME 请求: $geoUri';
+    _log('调用系统 MethodChannel 发起打开 CAR NAVITIME 请求: $geoUri (指定包名: com.navitime.local.carnavitime)');
     notifyListeners();
 
     // 6. Invoke MethodChannel
@@ -232,37 +307,38 @@ class TaskPollerService extends ChangeNotifier {
 
       final success = res?['success'] == true;
       if (success) {
-        _log('CAR NAVITIME 成功拉起！上报 [launch_requested] 回执');
-        await storage.addProcessedTaskId(task.taskId);
-        await storage.addRecentTask(task);
+        // Requirement 4: Success log only states launch request initiated, does not claim navigation confirmed
+        _log('已向系统发起打开 CAR NAVITIME 请求，上报 [launch_requested] 回执');
+        await storage.addProcessedTaskId(freshTask.taskId);
+        await storage.addRecentTask(freshTask);
         await _sendAck(
           backendUrl: backendUrl,
           carToken: carToken,
-          taskId: task.taskId,
+          taskId: freshTask.taskId,
           phase: TaskAckPhase.launchRequested,
         );
-        _statusMessage = '导航拉起成功: ${task.title}';
+        _statusMessage = '已发起打开请求: ${freshTask.title}';
       } else {
         throw Exception('Native returned non-success response: $res');
       }
     } catch (e) {
-      _log('拉起 CAR NAVITIME 失败: $e，上报 [failed] 回执');
-      await storage.addProcessedTaskId(task.taskId);
+      _log('发起打开 CAR NAVITIME 请求失败: $e，上报 [failed] 回执');
+      await storage.addProcessedTaskId(freshTask.taskId);
       await _sendAck(
         backendUrl: backendUrl,
         carToken: carToken,
-        taskId: task.taskId,
+        taskId: freshTask.taskId,
         phase: TaskAckPhase.failed,
         errorCode: 'INTENT_LAUNCH_FAILED',
         errorDetail: e.toString(),
       );
-      _statusMessage = '拉起失败: $e';
+      _statusMessage = '发起打开请求失败: $e';
     }
 
     notifyListeners();
   }
 
-  Future<void> _sendAck({
+  Future<AckResult> _sendAck({
     required String backendUrl,
     required String carToken,
     required String taskId,
@@ -272,7 +348,7 @@ class TaskPollerService extends ChangeNotifier {
   }) async {
     final timestamp = DateTime.now().toUtc();
     try {
-      final ok = await _client.acknowledgeTask(
+      final result = await _client.acknowledgeTask(
         baseUrl: backendUrl,
         taskId: taskId,
         token: carToken,
@@ -281,15 +357,22 @@ class TaskPollerService extends ChangeNotifier {
         errorCode: errorCode,
         errorDetail: errorDetail,
       );
-      if (ok) {
+
+      if (result.isAccepted) {
         _log('回执上报成功: [${phase.value}] task=$taskId');
-        return;
+        return result;
       }
+
+      if (result.isExplicitlyRejected) {
+        _log('回执被服务端明确拒绝: [${phase.value}] task=$taskId msg=${result.message}');
+        return result;
+      }
+
+      _log('回执发送遇网络异常 (${result.error})，持久化至待发队列重试: [${phase.value}]');
     } catch (e) {
-      _log('回执即时发送失败 ($e)，持久化至本地待发队列重试: [${phase.value}]');
+      _log('回执发送异常 ($e)，持久化至待发队列重试: [${phase.value}]');
     }
 
-    // If ack failed or threw, persist as PendingAck for retry
     final pendingList = storage.pendingAcks;
     pendingList.add(PendingAck(
       taskId: taskId,
@@ -299,6 +382,7 @@ class TaskPollerService extends ChangeNotifier {
       errorDetail: errorDetail,
     ));
     await storage.savePendingAcks(pendingList);
+    return AckResult.networkError('Ack persisted for retry');
   }
 
   Future<void> _flushPendingAcks(String backendUrl, String carToken) async {
@@ -312,7 +396,7 @@ class TaskPollerService extends ChangeNotifier {
         continue;
       }
       try {
-        final ok = await _client.acknowledgeTask(
+        final result = await _client.acknowledgeTask(
           baseUrl: backendUrl,
           taskId: item.taskId,
           token: carToken,
@@ -321,8 +405,10 @@ class TaskPollerService extends ChangeNotifier {
           errorCode: item.errorCode,
           errorDetail: item.errorDetail,
         );
-        if (ok) {
+        if (result.isAccepted) {
           _log('重发补报回执成功: [${item.phase.value}] task=${item.taskId}');
+        } else if (result.isExplicitlyRejected) {
+          _log('重发补报回执被服务端拒绝 (${result.message})，舍弃: [${item.phase.value}]');
         } else {
           remaining.add(item.copyWithIncrementRetry());
         }

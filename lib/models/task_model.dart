@@ -25,8 +25,8 @@ class TaskModel {
   final double longitude;
   final String coordSystem;
   final String status;
-  final DateTime createdAt;
-  final DateTime expiresAt;
+  final DateTime? createdAt;
+  final DateTime? expiresAt;
   final int deliveryAttempts;
   final String? errorMessage;
 
@@ -45,7 +45,11 @@ class TaskModel {
     this.errorMessage,
   });
 
-  bool get isExpired => DateTime.now().toUtc().isAfter(expiresAt.toUtc());
+  /// Fail-closed: If expiresAt is null or unparseable, it is considered expired.
+  bool get isExpired {
+    if (expiresAt == null) return true;
+    return DateTime.now().toUtc().isAfter(expiresAt!.toUtc());
+  }
 
   /// Strict coordinate validation
   bool get hasValidCoordinates {
@@ -55,12 +59,59 @@ class TaskModel {
         longitude <= 180.0;
   }
 
+  /// Strict pre-execution check:
+  /// - task.taskId non-empty
+  /// - task.deviceId matches current device
+  /// - task.status is strictly queued or received
+  /// - task.coordSystem is strictly wgs84
+  /// - valid coordinates
+  /// - valid createdAt format
+  /// - valid expiresAt format and not expired (fail-closed)
+  String? validateForExecution({required String expectedDeviceId}) {
+    if (taskId.trim().isEmpty) {
+      return '任务ID为空 (Empty taskId)';
+    }
+    if (deviceId.trim() != expectedDeviceId.trim()) {
+      return '目标设备ID不匹配: 任务设备 $deviceId != 当前配置 $expectedDeviceId';
+    }
+    final normalizedStatus = status.toLowerCase();
+    if (normalizedStatus != 'queued' && normalizedStatus != 'received') {
+      return '任务状态非法: $status (仅允许 queued 或 received)';
+    }
+    if (coordSystem.trim().toLowerCase() != 'wgs84') {
+      return '不支持的坐标系: $coordSystem (仅支持 wgs84)';
+    }
+    if (!hasValidCoordinates) {
+      return '坐标非法: lat=$latitude, lon=$longitude';
+    }
+    if (createdAt == null) {
+      return '创建时间格式无效 (Invalid created_at)';
+    }
+    if (expiresAt == null) {
+      return '过期时间格式无效或缺失 (Fail closed: Invalid expires_at)';
+    }
+    if (DateTime.now().toUtc().isAfter(expiresAt!.toUtc())) {
+      return '任务已过期 (Task expired at ${expiresAt!.toIso8601String()})';
+    }
+    return null; // Valid!
+  }
+
   /// Generates the standard geo URI as required: geo:0,0?q=lat,lon
   String toGeoUri() {
     return 'geo:0,0?q=$latitude,$longitude';
   }
 
   factory TaskModel.fromJson(Map<String, dynamic> json) {
+    DateTime? parsedCreatedAt;
+    if (json['created_at'] != null && (json['created_at'] as String).isNotEmpty) {
+      parsedCreatedAt = DateTime.tryParse(json['created_at'] as String)?.toUtc();
+    }
+
+    DateTime? parsedExpiresAt;
+    if (json['expires_at'] != null && (json['expires_at'] as String).isNotEmpty) {
+      parsedExpiresAt = DateTime.tryParse(json['expires_at'] as String)?.toUtc();
+    }
+
     return TaskModel(
       taskId: json['task_id'] as String? ?? '',
       deviceId: json['device_id'] as String? ?? '',
@@ -70,10 +121,8 @@ class TaskModel {
       longitude: (json['longitude'] as num).toDouble(),
       coordSystem: json['coord_system'] as String? ?? 'wgs84',
       status: json['status'] as String? ?? 'queued',
-      createdAt: DateTime.tryParse(json['created_at'] as String? ?? '')?.toUtc() ??
-          DateTime.now().toUtc(),
-      expiresAt: DateTime.tryParse(json['expires_at'] as String? ?? '')?.toUtc() ??
-          DateTime.now().toUtc().add(const Duration(hours: 1)),
+      createdAt: parsedCreatedAt,
+      expiresAt: parsedExpiresAt,
       deliveryAttempts: json['delivery_attempts'] as int? ?? 0,
       errorMessage: json['error_message'] as String?,
     );
@@ -89,8 +138,8 @@ class TaskModel {
       'longitude': longitude,
       'coord_system': coordSystem,
       'status': status,
-      'created_at': createdAt.toIso8601String(),
-      'expires_at': expiresAt.toIso8601String(),
+      'created_at': createdAt?.toIso8601String(),
+      'expires_at': expiresAt?.toIso8601String(),
       'delivery_attempts': deliveryAttempts,
       'error_message': errorMessage,
     };

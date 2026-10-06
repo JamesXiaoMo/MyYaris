@@ -69,7 +69,7 @@ void main() {
       expect(invalidLon.hasValidCoordinates, isFalse);
     });
 
-    test('Validates expiration status properly', () {
+    test('Validates expiration status properly and fails closed', () {
       final notExpired = TaskModel(
         taskId: 't1',
         deviceId: 'c1',
@@ -93,6 +93,111 @@ void main() {
         expiresAt: DateTime.now().toUtc().subtract(const Duration(hours: 1)),
       );
       expect(expired.isExpired, isTrue);
+
+      // Fail-closed test: null expiresAt is immediately treated as expired
+      final nullExpires = TaskModel(
+        taskId: 't3',
+        deviceId: 'c1',
+        title: 'No Expiry',
+        latitude: 35.0,
+        longitude: 139.0,
+        status: 'queued',
+        createdAt: DateTime.now().toUtc(),
+        expiresAt: null,
+      );
+      expect(nullExpires.isExpired, isTrue);
+
+      // json with invalid/missing expires_at does NOT default to +1 hour
+      final jsonMissingExpiry = {
+        'task_id': 't4',
+        'device_id': 'c1',
+        'title': 'Missing Expiry',
+        'latitude': 35.0,
+        'longitude': 139.0,
+        'coord_system': 'wgs84',
+        'status': 'queued',
+        'created_at': '2026-10-06T10:00:00Z',
+        'expires_at': 'invalid_date',
+      };
+      final parsedMissing = TaskModel.fromJson(jsonMissingExpiry);
+      expect(parsedMissing.expiresAt, isNull);
+      expect(parsedMissing.isExpired, isTrue);
+    });
+
+    test('validateForExecution strictly verifies all required fields', () {
+      final base = TaskModel(
+        taskId: 'task_valid',
+        deviceId: 'car_p3pro',
+        title: 'Valid Destination',
+        latitude: 34.399133,
+        longitude: 132.711467,
+        coordSystem: 'wgs84',
+        status: 'queued',
+        createdAt: DateTime.now().toUtc().subtract(const Duration(minutes: 1)),
+        expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+      );
+
+      // Valid case
+      expect(base.validateForExecution(expectedDeviceId: 'car_p3pro'), isNull);
+
+      // DeviceId mismatch
+      expect(
+        base.validateForExecution(expectedDeviceId: 'other_device'),
+        contains('目标设备ID不匹配'),
+      );
+
+      // Empty taskId
+      final emptyTaskId = TaskModel(
+        taskId: '',
+        deviceId: 'car_p3pro',
+        title: 'Title',
+        latitude: 34.0,
+        longitude: 132.0,
+        status: 'queued',
+        createdAt: DateTime.now().toUtc(),
+        expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+      );
+      expect(emptyTaskId.validateForExecution(expectedDeviceId: 'car_p3pro'), contains('任务ID为空'));
+
+      // Status not queued or received (e.g. superseded, expired, failed)
+      final supersededTask = TaskModel(
+        taskId: 't_sup',
+        deviceId: 'car_p3pro',
+        title: 'Superseded',
+        latitude: 34.0,
+        longitude: 132.0,
+        status: 'superseded',
+        createdAt: DateTime.now().toUtc(),
+        expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+      );
+      expect(supersededTask.validateForExecution(expectedDeviceId: 'car_p3pro'), contains('任务状态非法'));
+
+      // Unsupported coordSystem
+      final gcj02Task = TaskModel(
+        taskId: 't_gcj',
+        deviceId: 'car_p3pro',
+        title: 'GCJ02',
+        latitude: 34.0,
+        longitude: 132.0,
+        coordSystem: 'gcj02',
+        status: 'queued',
+        createdAt: DateTime.now().toUtc(),
+        expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+      );
+      expect(gcj02Task.validateForExecution(expectedDeviceId: 'car_p3pro'), contains('不支持的坐标系'));
+
+      // Invalid coordinates
+      final outOfBoundsLat = TaskModel(
+        taskId: 't_lat',
+        deviceId: 'car_p3pro',
+        title: 'Bad Lat',
+        latitude: 100.0,
+        longitude: 132.0,
+        status: 'queued',
+        createdAt: DateTime.now().toUtc(),
+        expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+      );
+      expect(outOfBoundsLat.validateForExecution(expectedDeviceId: 'car_p3pro'), contains('坐标非法'));
     });
 
     test('PendingAck encodes and decodes list reliably', () {

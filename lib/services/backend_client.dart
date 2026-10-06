@@ -19,6 +19,48 @@ class BackendException implements Exception {
   String toString() => 'BackendException($statusCode): $message';
 }
 
+enum AckResultType {
+  accepted,
+  explicitlyRejected,
+  networkError,
+}
+
+class AckResult {
+  final AckResultType type;
+  final bool accepted;
+  final String? message;
+  final String? serverStatus;
+  final int? statusCode;
+  final Object? error;
+
+  const AckResult.accepted({
+    this.message,
+    this.serverStatus,
+    this.statusCode = 200,
+  })  : type = AckResultType.accepted,
+        accepted = true,
+        error = null;
+
+  const AckResult.rejected({
+    this.message,
+    this.serverStatus,
+    this.statusCode,
+  })  : type = AckResultType.explicitlyRejected,
+        accepted = false,
+        error = null;
+
+  const AckResult.networkError(this.error)
+      : type = AckResultType.networkError,
+        accepted = false,
+        message = null,
+        serverStatus = null,
+        statusCode = null;
+
+  bool get isAccepted => type == AckResultType.accepted;
+  bool get isExplicitlyRejected => type == AckResultType.explicitlyRejected;
+  bool get isNetworkError => type == AckResultType.networkError;
+}
+
 class BackendClient {
   final HttpClient _httpClient;
 
@@ -100,8 +142,39 @@ class BackendClient {
     throw BackendException(res.statusCode, 'Failed to fetch task: $responseBody');
   }
 
+  /// Re-check task status and expiration before launch
+  Future<TaskModel> getTask({
+    required String baseUrl,
+    required String taskId,
+    required String token,
+  }) async {
+    final base = _normalizeUrl(baseUrl);
+    final uri = Uri.parse('$base/tasks/$taskId');
+
+    final req = await _httpClient.getUrl(uri);
+    req.headers.set(HttpHeaders.acceptHeader, 'application/json');
+    if (token.isNotEmpty) {
+      req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+    }
+
+    final res = await req.close().timeout(const Duration(seconds: 12));
+    final responseBody = await utf8.decodeStream(res);
+
+    if (res.statusCode == 200) {
+      final json = jsonDecode(responseBody) as Map<String, dynamic>;
+      return TaskModel.fromJson(json);
+    }
+
+    if (res.statusCode == 401 || res.statusCode == 403) {
+      throw AuthException(res.statusCode, responseBody);
+    }
+
+    throw BackendException(res.statusCode, 'Failed to fetch task: $responseBody');
+  }
+
   /// Acknowledge task phase (received, launch_requested, failed)
-  Future<bool> acknowledgeTask({
+  /// Strictly requires accepted == true. Distinguishes explicit rejection from network uncertainty.
+  Future<AckResult> acknowledgeTask({
     required String baseUrl,
     required String taskId,
     required String token,
@@ -124,27 +197,58 @@ class BackendClient {
       payload['error_detail'] = errorDetail;
     }
 
-    final req = await _httpClient.postUrl(uri);
-    req.headers.set(HttpHeaders.contentTypeHeader, 'application/json');
-    req.headers.set(HttpHeaders.acceptHeader, 'application/json');
-    if (token.isNotEmpty) {
-      req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+    try {
+      final req = await _httpClient.postUrl(uri);
+      req.headers.set(HttpHeaders.contentTypeHeader, 'application/json');
+      req.headers.set(HttpHeaders.acceptHeader, 'application/json');
+      if (token.isNotEmpty) {
+        req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+      }
+
+      req.add(utf8.encode(jsonEncode(payload)));
+
+      final res = await req.close().timeout(const Duration(seconds: 15));
+      final responseBody = await utf8.decodeStream(res);
+
+      if (res.statusCode == 200) {
+        final json = jsonDecode(responseBody) as Map<String, dynamic>;
+        final isAccepted = json['accepted'] == true;
+        if (isAccepted) {
+          return AckResult.accepted(
+            message: json['message'] as String?,
+            serverStatus: json['status'] as String?,
+            statusCode: 200,
+          );
+        } else {
+          return AckResult.rejected(
+            message: json['message'] as String?,
+            serverStatus: json['status'] as String?,
+            statusCode: 200,
+          );
+        }
+      }
+
+      if (res.statusCode == 401 || res.statusCode == 403) {
+        throw AuthException(res.statusCode, responseBody);
+      }
+
+      if (res.statusCode == 400 ||
+          res.statusCode == 404 ||
+          res.statusCode == 409 ||
+          res.statusCode == 422) {
+        return AckResult.rejected(
+          message: responseBody,
+          statusCode: res.statusCode,
+        );
+      }
+
+      return AckResult.networkError(
+        BackendException(res.statusCode, 'Ack server error: $responseBody'),
+      );
+    } on AuthException {
+      rethrow;
+    } catch (e) {
+      return AckResult.networkError(e);
     }
-
-    req.add(utf8.encode(jsonEncode(payload)));
-
-    final res = await req.close().timeout(const Duration(seconds: 15));
-    final responseBody = await utf8.decodeStream(res);
-
-    if (res.statusCode == 200) {
-      final json = jsonDecode(responseBody) as Map<String, dynamic>;
-      return json['accepted'] == true || json.containsKey('status');
-    }
-
-    if (res.statusCode == 401 || res.statusCode == 403) {
-      throw AuthException(res.statusCode, responseBody);
-    }
-
-    throw BackendException(res.statusCode, 'Ack failed: $responseBody');
   }
 }
