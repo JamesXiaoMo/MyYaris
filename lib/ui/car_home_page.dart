@@ -521,13 +521,21 @@ class _CarHomePageState extends State<CarHomePage> {
                                 Container(
                                   padding: const EdgeInsets.all(6),
                                   decoration: BoxDecoration(
-                                    color: Colors.amber.withValues(alpha: 0.08),
+                                    color: Colors.green.withValues(alpha: 0.1),
                                     borderRadius: BorderRadius.circular(6),
-                                    border: Border.all(color: Colors.amber.withValues(alpha: 0.2)),
+                                    border: Border.all(color: Colors.green.withValues(alpha: 0.3)),
                                   ),
-                                  child: const Text(
-                                    '注：本轮以应用前台运行期间链路验证为主。跨 NAVITIME 后台持续驻留接收需车载系统特权保活，当前不作为后台常驻守护。',
-                                    style: TextStyle(color: Colors.amberAccent, fontSize: 10),
+                                  child: const Row(
+                                    children: [
+                                      Icon(Icons.check_circle_outline, color: Colors.greenAccent, size: 14),
+                                      SizedBox(width: 6),
+                                      Expanded(
+                                        child: Text(
+                                          '开机自启动与后台常驻已就绪 (Foreground Service & BootReceiver)，支持在后台及跨应用持续收取任务。',
+                                          style: TextStyle(color: Colors.greenAccent, fontSize: 10),
+                                        ),
+                                      ),
+                                    ],
                                   ),
                                 ),
                               ],

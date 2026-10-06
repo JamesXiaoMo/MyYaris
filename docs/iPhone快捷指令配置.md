@@ -172,3 +172,40 @@
    - 车机端（MyYaris App）必须在前台运行且已开启“长轮询接收”。
    - Android 系统在拉起外部地图（如 CAR NAVITIME）后，若系统杀后台或休眠进程，前台轮询可能中断。跨 App 后台持续保活需后续车载系统特权开发，当前版本未实现后台常驻保活，仅保证前台链路可靠执行。
    - 若车机离线或未在前台运行，任务将在服务端保留（默认 60 分钟有效），待车机上线后自动收取。
+
+## Plus Code 输入（2026-10-06）
+
+后端保留 `input_type: coords` 的经纬度接口，并新增 `input_type: plus_code`。
+快捷指令可添加“询问输入”（文本），提示“粘贴 Google Plus Code，可含城市和县”，将该变量填入 JSON 的 `plus_code`：
+
+```json
+{
+  "input_type": "plus_code",
+  "plus_code": "完整的 Google Plus Code",
+  "target_device_id": "car_p3pro"
+}
+```
+
+接口地址和 Authorization 与原来的坐标版相同。不能把 Plus Code 填到 `share_link` 的 `url` 字段。现有分享链接快捷指令仍只接收 URL。
+
+- 完整编码（加号前有 8 位）可离线解码。有效精度达到 10 位及以上时直接创建任务。
+- 支持 Google 复制的短编码＋城市＋县，如 `CPF8+Q7 东广岛市 广岛县`。Nominatim 查询城市参照并还原完整编码。日本市、县均匹配、4+2 短编码且还原结果唯一时直接发送；同名地区、只有城市或更短编码需确认。只有短编码时需要补充地区或参照坐标。不要把远离目的地的手机当前位置作为参照。
+- 显式提供参照坐标的短编码、城市匹配不明确的短编码和较粗的完整编码返回 `needs_clarification`。快捷指令应展示候选并经用户确认后调用 `/destinations/{request_id}/confirm`；不能把 HTTP 200 当作已发送成功。
+- 输出为 Plus Code 区域中心；编码有有限精度，不能保证完全恢复原始图钉坐标。
+
+短编码附参照的 JSON 格式：
+
+```json
+{
+  "input_type": "plus_code",
+  "plus_code": "CPX6+MJ",
+  "reference_coordinate": {
+    "latitude": 34.4,
+    "longitude": 132.7,
+    "coord_system": "wgs84"
+  },
+  "target_device_id": "car_p3pro"
+}
+```
+
+以上短编码与参照仅演示格式，请替换为实际目的地数据。
