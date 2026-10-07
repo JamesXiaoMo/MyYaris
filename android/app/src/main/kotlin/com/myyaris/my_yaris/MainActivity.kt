@@ -28,19 +28,31 @@ class MainActivity : FlutterActivity() {
             when (call.method) {
                 "launchCarNavitime" -> {
                     val geoUriString = call.argument<String>("geoUri")
+                    val title = call.argument<String>("title") ?: ""
                     if (geoUriString.isNullOrBlank()) {
                         result.error("INVALID_ARGUMENT", "geoUri parameter is required and cannot be empty", null)
                         return@setMethodCallHandler
                     }
                     try {
-                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(geoUriString)).apply {
-                            setPackage("com.navitime.local.carnavitime")
-                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        val intent = Intent(this, NavTransitionActivity::class.java).apply {
+                            putExtra(NavTransitionActivity.EXTRA_GEO_URI, geoUriString)
+                            putExtra(NavTransitionActivity.EXTRA_TITLE, title)
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
                         }
                         startActivity(intent)
-                        result.success(mapOf("success" to true, "mode" to "geo_uri", "uri" to geoUriString))
+                        overridePendingTransition(0, 0)
+                        result.success(mapOf("success" to true, "mode" to "transition_activity", "uri" to geoUriString))
                     } catch (e: Exception) {
-                        result.error("LAUNCH_FAILED", e.localizedMessage ?: "Failed to launch $geoUriString", null)
+                        try {
+                            val directIntent = Intent(Intent.ACTION_VIEW, Uri.parse(geoUriString)).apply {
+                                setPackage("com.navitime.local.carnavitime")
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            }
+                            startActivity(directIntent)
+                            result.success(mapOf("success" to true, "mode" to "geo_uri_direct", "uri" to geoUriString))
+                        } catch (ex: Exception) {
+                            result.error("LAUNCH_FAILED", ex.localizedMessage ?: "Failed to launch $geoUriString", null)
+                        }
                     }
                 }
                 "checkNavitimeInstalled" -> {

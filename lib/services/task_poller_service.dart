@@ -320,7 +320,10 @@ class TaskPollerService extends ChangeNotifier {
     try {
       final res = await _navChannel.invokeMethod<Map<dynamic, dynamic>>(
         'launchCarNavitime',
-        {'geoUri': geoUri},
+        {
+          'geoUri': geoUri,
+          'title': freshTask.title,
+        },
       );
 
       final success = res?['success'] == true;
