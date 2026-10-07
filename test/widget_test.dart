@@ -21,6 +21,14 @@ void main() {
     // Verify root widget exists and title is rendered
     expect(find.byType(MyYarisApp), findsOneWidget);
     expect(find.text('MyYaris 车机助手'), findsOneWidget);
-    expect(find.text('启用长轮询接收'), findsOneWidget);
+    expect(find.text('连接与调试 (后台与导航)'), findsOneWidget);
+    expect(find.text('当前播放信息与播控'), findsOneWidget);
+
+    // Tap to enter secondary debug & connection page
+    await tester.tap(find.text('连接与调试 (后台与导航)'));
+    await tester.pumpAndSettle();
+
+    // Verify secondary page contains connection poller controls
+    expect(find.text('启用轮询'), findsOneWidget);
   });
 }

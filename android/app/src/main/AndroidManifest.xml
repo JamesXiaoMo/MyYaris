@@ -18,6 +18,16 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
+        <service
+            android:name=".MediaControlNotificationListenerService"
+            android:label="MyYaris 音乐播控监听"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
         <receiver
             android:name=".BootReceiver"
             android:enabled="true"
@@ -80,9 +90,14 @@
             <data android:mimeType="text/plain"/>
         </intent>
         <package android:name="com.navitime.local.carnavitime"/>
+        <package android:name="com.netease.cloudmusic"/>
         <intent>
             <action android:name="android.intent.action.VIEW"/>
             <data android:scheme="geo"/>
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW"/>
+            <data android:scheme="orpheus"/>
         </intent>
     </queries>
 </manifest>
