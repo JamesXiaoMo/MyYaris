@@ -63,14 +63,82 @@ class AckResult {
 
 class BackendClient {
   final HttpClient _httpClient;
+  final Map<String, String> _fallbackDns;
 
-  BackendClient({HttpClient? httpClient})
-      : _httpClient = httpClient ??
-            HttpClient(
-              // Strict TLS verification: do NOT bypass certificate validation!
-              context: SecurityContext.defaultContext,
-            ) {
-    _httpClient.connectionTimeout = const Duration(seconds: 15);
+  /// Default authorized Tailnet hostname-to-IP fallback mappings.
+  /// Strictly maintains TLS SNI, host header, certificate chain, and hostname verification.
+  static const Map<String, String> defaultFallbackDns = {
+    'myyaris.example.com': '192.0.2.10',
+  };
+
+  BackendClient({
+    HttpClient? httpClient,
+    Map<String, String>? fallbackDns,
+  })  : _fallbackDns = fallbackDns ?? defaultFallbackDns,
+        _httpClient = httpClient ??
+            _createHttpClient(fallbackDns ?? defaultFallbackDns);
+
+  Map<String, String> get fallbackDns => Map.unmodifiable(_fallbackDns);
+
+  static HttpClient _createHttpClient(Map<String, String> fallbackDns) {
+    final client = HttpClient(
+      // Strict TLS verification: do NOT bypass certificate validation!
+      context: SecurityContext.defaultContext,
+    );
+    client.connectionTimeout = const Duration(seconds: 15);
+
+    if (fallbackDns.isNotEmpty) {
+      client.connectionFactory = (uri, proxyHost, proxyPort) {
+        final targetIp = fallbackDns[uri.host];
+        final connectHost = targetIp ?? uri.host;
+        final isHttps = uri.isScheme('https');
+        final port = uri.hasPort ? uri.port : (isHttps ? 443 : 80);
+
+        Socket? currentSocket;
+        bool isCancelled = false;
+        final completer = Completer<Socket>();
+
+        Socket.connect(connectHost, port, timeout: const Duration(seconds: 10)).then(
+          (plainSocket) {
+            if (isCancelled) {
+              plainSocket.destroy();
+              return;
+            }
+            currentSocket = plainSocket;
+            if (isHttps) {
+              SecureSocket.secure(
+                plainSocket,
+                host: uri.host, // Strict SNI and hostname check against target host!
+                context: SecurityContext.defaultContext,
+              ).then(
+                (secureSocket) {
+                  if (isCancelled) {
+                    secureSocket.destroy();
+                  } else {
+                    completer.complete(secureSocket);
+                  }
+                },
+                onError: (Object err, StackTrace st) {
+                  completer.completeError(err, st);
+                },
+              );
+            } else {
+              completer.complete(plainSocket);
+            }
+          },
+          onError: (Object err, StackTrace st) {
+            completer.completeError(err, st);
+          },
+        );
+
+        return Future.value(ConnectionTask.fromSocket(completer.future, () {
+          isCancelled = true;
+          currentSocket?.destroy();
+        }));
+      };
+    }
+
+    return client;
   }
 
   void close() {
