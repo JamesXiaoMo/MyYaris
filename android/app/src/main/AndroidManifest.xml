@@ -58,7 +58,7 @@
 
         <activity
             android:name=".NavTransitionActivity"
-            android:exported="true"
+            android:exported="false"
             android:launchMode="singleInstance"
             android:theme="@android:style/Theme.Black.NoTitleBar"
             android:excludeFromRecents="true" />
