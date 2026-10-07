@@ -201,6 +201,19 @@ class MainActivity : FlutterActivity() {
                         ?: stateExtras?.getInt("android.media.session.extra.SHUFFLE_MODE", -1)
                         ?: -1
 
+                    android.util.Log.i("MyYarisMusic", "=== 网易云 MediaSession 实时数据 ===")
+                    android.util.Log.i("MyYarisMusic", "Title: $title | Artist: $artist | Album: $album | State: $stateName($stateCode) | Actions: $actionsMask")
+                    android.util.Log.i("MyYarisMusic", "repeatMode: $repeatMode | shuffleMode: $shuffleMode")
+                    controller.extras?.keySet()?.forEach { k ->
+                        android.util.Log.i("MyYarisMusic", "Controller extra: $k = ${controller.extras?.get(k)}")
+                    }
+                    state?.extras?.keySet()?.forEach { k ->
+                        android.util.Log.i("MyYarisMusic", "State extra: $k = ${state?.extras?.get(k)}")
+                    }
+                    customActionsList.forEachIndexed { idx, item ->
+                        android.util.Log.i("MyYarisMusic", "CustomAction[$idx]: name=${item["name"]}, action=${item["action"]}, extras=${item["extras"]}")
+                    }
+
                     result.success(mapOf(
                         "hasPermission" to true,
                         "sessionFound" to true,

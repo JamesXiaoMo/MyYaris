@@ -163,29 +163,35 @@ class _CarHomePageState extends State<CarHomePage> {
           ],
         ),
         content: SizedBox(
-          width: 520,
+          width: 540,
+          height: 310,
           child: Column(
-            mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Container(
-                padding: const EdgeInsets.all(8),
+                padding: const EdgeInsets.all(6),
                 decoration: BoxDecoration(
                   color: Colors.black26,
                   borderRadius: BorderRadius.circular(6),
                 ),
-                child: const Text(
-                  '说明：Android 机制下，CustomAction 的显示名 (Name) 并不等于内部 Action ID。\n'
-                  '本界面直接读取 MediaSession 暴露的真实 action 标识与 extras，绝不使用伪代码。',
-                  style: TextStyle(color: Colors.white70, fontSize: 11),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        '底层 MediaSession 真实数据 • Actions 掩码: ${info.actionsMask} (标准位含PLAY/PAUSE/PREV/NEXT/SEEK_TO/PLAY_PAUSE)\n'
+                        '模式读取状态: repeatMode=${info.repeatMode == -1 ? "未暴露(-1)" : info.repeatMode} | shuffleMode=${info.shuffleMode == -1 ? "未暴露(-1)" : info.shuffleMode}',
+                        style: const TextStyle(color: Colors.white70, fontSize: 10),
+                      ),
+                    ),
+                  ],
                 ),
               ),
-              const SizedBox(height: 10),
-              Text(
-                '检测到的 CustomAction 数量: ${actions.length}',
-                style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold),
-              ),
               const SizedBox(height: 6),
+              Text(
+                '检测到的 CustomAction 列表 (${actions.length}项，直接呈现底层真实 action 标识):',
+                style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 4),
               if (actions.isEmpty)
                 Container(
                   padding: const EdgeInsets.all(10),
@@ -195,21 +201,20 @@ class _CarHomePageState extends State<CarHomePage> {
                     border: Border.all(color: Colors.red.withValues(alpha: 0.3)),
                   ),
                   child: const Text(
-                    '当前活跃会话未发现 CustomAction。\n可能原因：网易云音乐尚未在后台运行或已被系统休眠。请先打开网易云音乐播放一首歌曲。',
+                    '当前活跃会话未发现 CustomAction。\n可能原因：网易云音乐尚未在后台运行或已被系统休眠。',
                     style: TextStyle(color: Colors.redAccent, fontSize: 11),
                   ),
                 )
               else
-                Flexible(
+                Expanded(
                   child: ListView.builder(
-                    shrinkWrap: true,
                     itemCount: actions.length,
                     itemBuilder: (c, i) {
                       final a = actions[i];
                       final isPlayMode = a.name.contains('播放模式') || a.action.contains('MODE');
                       return Container(
-                        margin: const EdgeInsets.only(bottom: 6),
-                        padding: const EdgeInsets.all(8),
+                        margin: const EdgeInsets.only(bottom: 5),
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
                         decoration: BoxDecoration(
                           color: isPlayMode ? Colors.blue.withValues(alpha: 0.15) : Colors.black38,
                           borderRadius: BorderRadius.circular(6),
@@ -230,7 +235,7 @@ class _CarHomePageState extends State<CarHomePage> {
                                         style: TextStyle(
                                           color: isPlayMode ? Colors.lightBlueAccent : Colors.white,
                                           fontWeight: FontWeight.bold,
-                                          fontSize: 12,
+                                          fontSize: 11.5,
                                         ),
                                       ),
                                       if (isPlayMode) ...[
@@ -241,19 +246,19 @@ class _CarHomePageState extends State<CarHomePage> {
                                             color: Colors.blueAccent,
                                             borderRadius: BorderRadius.circular(3),
                                           ),
-                                          child: const Text('模式动作', style: TextStyle(color: Colors.white, fontSize: 9)),
+                                          child: const Text('模式动作', style: TextStyle(color: Colors.white, fontSize: 8.5)),
                                         ),
                                       ],
                                     ],
                                   ),
-                                  const SizedBox(height: 2),
+                                  const SizedBox(height: 1),
                                   Text(
-                                    '真实 Action ID: ${a.action.isEmpty ? "(未提供字符串ID)" : a.action}',
+                                    '真实 Action ID: ${a.action.isEmpty ? "(空字符)" : a.action}',
                                     style: const TextStyle(color: Colors.greenAccent, fontSize: 10, fontFamily: 'monospace'),
                                   ),
                                   if (a.extras.isNotEmpty)
                                     Text(
-                                      'Extras: ${a.extras}',
+                                      'Extras 键值: ${a.extras}',
                                       style: const TextStyle(color: Colors.white54, fontSize: 9),
                                     ),
                                 ],
@@ -261,7 +266,9 @@ class _CarHomePageState extends State<CarHomePage> {
                             ),
                             ElevatedButton(
                               style: ElevatedButton.styleFrom(
-                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                                minimumSize: Size.zero,
+                                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                                 backgroundColor: isPlayMode ? Colors.blueAccent : Colors.white12,
                               ),
                               onPressed: a.action.isEmpty
@@ -272,7 +279,7 @@ class _CarHomePageState extends State<CarHomePage> {
                                       _showActionResult(res['message']?.toString() ?? '动作已发送');
                                       await _refreshInfoQuietly();
                                     },
-                              child: const Text('测试此动作', style: TextStyle(fontSize: 11)),
+                              child: const Text('测试此动作', style: TextStyle(fontSize: 10)),
                             ),
                           ],
                         ),
