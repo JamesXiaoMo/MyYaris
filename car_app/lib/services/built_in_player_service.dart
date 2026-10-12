@@ -68,6 +68,18 @@ class BuiltInPlayerService {
     ),
   ];
 
+  LocalTrackItem? _activeRemoteTrack;
+  LocalTrackItem? get activeRemoteTrack => _activeRemoteTrack;
+
+  LocalTrackItem get currentTrack {
+    if (_activeRemoteTrack != null) return _activeRemoteTrack!;
+    final idx = _player.currentIndex ?? 0;
+    if (idx >= 0 && idx < tracks.length) {
+      return tracks[idx];
+    }
+    return tracks[0];
+  }
+
   Future<void> init() async {
     if (_isInitialized) return;
 
@@ -76,7 +88,7 @@ class BuiltInPlayerService {
       final session = await AudioSession.instance;
       await session.configure(const AudioSessionConfiguration.music());
 
-      // 2. Load audio sources with local and network items
+      // 2. Load audio sources with local offline items
       final audioSources = tracks.map<AudioSource>((t) {
         if (t.isLocal) {
           return AudioSource.asset(t.assetPath);
@@ -97,6 +109,33 @@ class BuiltInPlayerService {
     }
   }
 
+  /// Plays a remote network audio stream URL (e.g. from R9000P /api/v1/music/stream or netease stream)
+  Future<void> playRemoteStream(
+    String streamUrl, {
+    required String trackId,
+    required String title,
+    String artist = 'R9000P 媒体流',
+    Map<String, String>? headers,
+    Duration? initialPosition,
+  }) async {
+    if (!_isInitialized) await init();
+
+    _activeRemoteTrack = LocalTrackItem(
+      id: trackId,
+      title: title,
+      artist: artist,
+      assetPath: streamUrl,
+      isLocal: false,
+      durationDesc: '网络流式音频',
+      tag: '远程播控',
+    );
+
+    final uri = Uri.parse(streamUrl);
+    final source = AudioSource.uri(uri, headers: headers);
+    await _player.setAudioSource(source, initialPosition: initialPosition ?? Duration.zero);
+    await _player.play();
+  }
+
   Future<void> play() async {
     if (!_isInitialized) await init();
     await _player.play();
@@ -115,6 +154,7 @@ class BuiltInPlayerService {
   }
 
   Future<void> skipToNext() async {
+    _activeRemoteTrack = null;
     if (_player.hasNext) {
       await _player.seekToNext();
     } else {
@@ -123,6 +163,7 @@ class BuiltInPlayerService {
   }
 
   Future<void> skipToPrevious() async {
+    _activeRemoteTrack = null;
     if (_player.hasPrevious) {
       await _player.seekToPrevious();
     } else {
@@ -131,9 +172,36 @@ class BuiltInPlayerService {
   }
 
   Future<void> selectTrack(int index) async {
+    _activeRemoteTrack = null;
     if (index >= 0 && index < tracks.length) {
       await _player.seek(Duration.zero, index: index);
       await _player.play();
+    }
+  }
+
+  String get currentLoopModeString {
+    switch (_player.loopMode) {
+      case LoopMode.off:
+        return 'off';
+      case LoopMode.one:
+        return 'one';
+      case LoopMode.all:
+        return 'all';
+    }
+  }
+
+  Future<void> setLoopModeString(String mode) async {
+    switch (mode.toLowerCase().trim()) {
+      case 'one':
+        await _player.setLoopMode(LoopMode.one);
+        break;
+      case 'off':
+        await _player.setLoopMode(LoopMode.off);
+        break;
+      case 'all':
+      default:
+        await _player.setLoopMode(LoopMode.all);
+        break;
     }
   }
 
@@ -150,6 +218,10 @@ class BuiltInPlayerService {
         await _player.setLoopMode(LoopMode.off);
         break;
     }
+  }
+
+  Future<void> setShuffle(bool enabled) async {
+    await _player.setShuffleModeEnabled(enabled);
   }
 
   Future<void> toggleShuffle() async {

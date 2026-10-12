@@ -161,14 +161,11 @@ class _BuiltInPlayerPageState extends State<BuiltInPlayerPage> {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          // Current Track Banner
+          // Current Track Banner (supports both local WAV and remote stream)
           StreamBuilder<int?>(
             stream: _service.player.currentIndexStream,
             builder: (context, snapshot) {
-              final idx = snapshot.data ?? 0;
-              final currentTrack = (idx >= 0 && idx < _service.tracks.length)
-                  ? _service.tracks[idx]
-                  : _service.tracks.first;
+              final currentTrack = _service.currentTrack;
 
               return Container(
                 padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
@@ -549,6 +546,10 @@ class _BuiltInPlayerPageState extends State<BuiltInPlayerPage> {
                 Text(
                   '• 焦点与导航保护：已配置 AudioSession.music，实测低音量不抢占系统',
                   style: TextStyle(color: Colors.white70, fontSize: 9.5),
+                ),
+                Text(
+                  '• 远程播控支持：兼容 R9000P WebSocket (/api/v1/ws/music) 与 HTTP 206 流式接口',
+                  style: TextStyle(color: Colors.tealAccent, fontSize: 9.5),
                 ),
               ],
             ),

@@ -172,7 +172,8 @@ class BackendClient {
     }
   }
 
-  /// Long-poll next task for the given device ID
+  /// Long-poll next task for the given device ID.
+  /// Prioritizes standard V2 endpoint (/api/v1/tasks/poll), gracefully falling back to legacy endpoint.
   Future<TaskModel?> getNextTask({
     required String baseUrl,
     required String deviceId,
@@ -180,16 +181,28 @@ class BackendClient {
     int timeoutSeconds = 20,
   }) async {
     final base = _normalizeUrl(baseUrl);
-    final uri = Uri.parse('$base/devices/$deviceId/tasks/next?timeout=$timeoutSeconds');
+    final v2Uri = Uri.parse('$base/api/v1/tasks/poll?device_id=$deviceId&timeout=$timeoutSeconds');
 
-    final req = await _httpClient.getUrl(uri);
+    var req = await _httpClient.getUrl(v2Uri);
     req.headers.set(HttpHeaders.acceptHeader, 'application/json');
     if (token.isNotEmpty) {
       req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+      req.headers.set('X-Device-Token', token);
     }
 
-    // Set HTTP socket timeout slightly longer than long-poll timeout to allow response
-    final res = await req.close().timeout(Duration(seconds: timeoutSeconds + 10));
+    var res = await req.close().timeout(Duration(seconds: timeoutSeconds + 10));
+
+    // Fallback to legacy path if server does not have /api/v1 prefix yet
+    if (res.statusCode == 404) {
+      final legacyUri = Uri.parse('$base/devices/$deviceId/tasks/next?timeout=$timeoutSeconds');
+      req = await _httpClient.getUrl(legacyUri);
+      req.headers.set(HttpHeaders.acceptHeader, 'application/json');
+      if (token.isNotEmpty) {
+        req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+        req.headers.set('X-Device-Token', token);
+      }
+      res = await req.close().timeout(Duration(seconds: timeoutSeconds + 10));
+    }
 
     if (res.statusCode == 204) {
       // 204 No Content: Long poll timeout reached on server side, no task queued
@@ -217,15 +230,27 @@ class BackendClient {
     required String token,
   }) async {
     final base = _normalizeUrl(baseUrl);
-    final uri = Uri.parse('$base/tasks/$taskId');
+    final v2Uri = Uri.parse('$base/api/v1/tasks/$taskId');
 
-    final req = await _httpClient.getUrl(uri);
+    var req = await _httpClient.getUrl(v2Uri);
     req.headers.set(HttpHeaders.acceptHeader, 'application/json');
     if (token.isNotEmpty) {
       req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+      req.headers.set('X-Device-Token', token);
     }
 
-    final res = await req.close().timeout(const Duration(seconds: 12));
+    var res = await req.close().timeout(const Duration(seconds: 12));
+    if (res.statusCode == 404) {
+      final legacyUri = Uri.parse('$base/tasks/$taskId');
+      req = await _httpClient.getUrl(legacyUri);
+      req.headers.set(HttpHeaders.acceptHeader, 'application/json');
+      if (token.isNotEmpty) {
+        req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+        req.headers.set('X-Device-Token', token);
+      }
+      res = await req.close().timeout(const Duration(seconds: 12));
+    }
+
     final responseBody = await utf8.decodeStream(res);
 
     if (res.statusCode == 200) {
@@ -252,35 +277,57 @@ class BackendClient {
     String? errorDetail,
   }) async {
     final base = _normalizeUrl(baseUrl);
-    final uri = Uri.parse('$base/tasks/$taskId/ack');
+    final timestamp = deviceTimestamp ?? DateTime.now().toUtc();
+    final statusVal = phase == TaskAckPhase.launchRequested ? 'launched' : phase.value;
 
     final payload = <String, dynamic>{
       'phase': phase.value,
-      'device_timestamp': (deviceTimestamp ?? DateTime.now().toUtc()).toIso8601String(),
+      'status': statusVal,
+      'device_timestamp': timestamp.toIso8601String(),
+      'client_timestamp': timestamp.millisecondsSinceEpoch,
     };
     if (errorCode != null && errorCode.isNotEmpty) {
       payload['error_code'] = errorCode;
+      payload['error_message'] = errorDetail ?? errorCode;
     }
     if (errorDetail != null && errorDetail.isNotEmpty) {
       payload['error_detail'] = errorDetail;
+      payload['error_message'] = errorDetail;
     }
 
+    final v2Uri = Uri.parse('$base/api/v1/tasks/$taskId/ack');
+
     try {
-      final req = await _httpClient.postUrl(uri);
+      var req = await _httpClient.postUrl(v2Uri);
       req.headers.set(HttpHeaders.contentTypeHeader, 'application/json');
       req.headers.set(HttpHeaders.acceptHeader, 'application/json');
       if (token.isNotEmpty) {
         req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+        req.headers.set('X-Device-Token', token);
       }
-
       req.add(utf8.encode(jsonEncode(payload)));
 
-      final res = await req.close().timeout(const Duration(seconds: 15));
+      var res = await req.close().timeout(const Duration(seconds: 15));
+
+      // Fallback to legacy path if 404
+      if (res.statusCode == 404) {
+        final legacyUri = Uri.parse('$base/tasks/$taskId/ack');
+        req = await _httpClient.postUrl(legacyUri);
+        req.headers.set(HttpHeaders.contentTypeHeader, 'application/json');
+        req.headers.set(HttpHeaders.acceptHeader, 'application/json');
+        if (token.isNotEmpty) {
+          req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+          req.headers.set('X-Device-Token', token);
+        }
+        req.add(utf8.encode(jsonEncode(payload)));
+        res = await req.close().timeout(const Duration(seconds: 15));
+      }
+
       final responseBody = await utf8.decodeStream(res);
 
       if (res.statusCode == 200) {
         final json = jsonDecode(responseBody) as Map<String, dynamic>;
-        final isAccepted = json['accepted'] == true;
+        final isAccepted = json['accepted'] == true || json['status'] == 'ok' || json['code'] == 200;
         if (isAccepted) {
           return AckResult.accepted(
             message: json['message'] as String?,
@@ -317,6 +364,163 @@ class BackendClient {
       rethrow;
     } catch (e) {
       return AckResult.networkError(e);
+    }
+  }
+
+  // ==========================================
+  // Music & Media Streaming API Extensions
+  // ==========================================
+
+  /// Builds the HTTP Range streaming URL for local music library track
+  String buildLocalStreamUrl(String baseUrl, String trackId) {
+    final base = _normalizeUrl(baseUrl);
+    return '$base/api/v1/music/stream/$trackId';
+  }
+
+  /// Builds the HTTP Range streaming URL for NetEase Cloud Music proxied track
+  String buildNeteaseStreamUrl(String baseUrl, String songId) {
+    final base = _normalizeUrl(baseUrl);
+    return '$base/api/v1/music/netease/stream/$songId';
+  }
+
+  /// Fetches list of available tracks in local library
+  Future<List<Map<String, dynamic>>> getMusicTracks({
+    required String baseUrl,
+    required String token,
+  }) async {
+    final base = _normalizeUrl(baseUrl);
+    final uri = Uri.parse('$base/api/v1/music/tracks');
+
+    final req = await _httpClient.getUrl(uri);
+    req.headers.set(HttpHeaders.acceptHeader, 'application/json');
+    if (token.isNotEmpty) {
+      req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+      req.headers.set('X-Device-Token', token);
+    }
+
+    final res = await req.close().timeout(const Duration(seconds: 10));
+    final responseBody = await utf8.decodeStream(res);
+
+    if (res.statusCode == 200) {
+      final json = jsonDecode(responseBody);
+      if (json is List) {
+        return json.cast<Map<String, dynamic>>();
+      } else if (json is Map && json['tracks'] is List) {
+        return (json['tracks'] as List).cast<Map<String, dynamic>>();
+      }
+      return [];
+    }
+    throw BackendException(res.statusCode, 'Failed to fetch tracks: $responseBody');
+  }
+
+  /// Searches NetEase Cloud Music catalogue through R9000P proxy
+  Future<List<Map<String, dynamic>>> searchNeteaseMusic({
+    required String baseUrl,
+    required String token,
+    required String keyword,
+    int page = 1,
+    int limit = 20,
+  }) async {
+    final base = _normalizeUrl(baseUrl);
+    final encodedKw = Uri.encodeComponent(keyword);
+    final uri = Uri.parse('$base/api/v1/music/netease/search?keyword=$encodedKw&page=$page&limit=$limit');
+
+    final req = await _httpClient.getUrl(uri);
+    req.headers.set(HttpHeaders.acceptHeader, 'application/json');
+    if (token.isNotEmpty) {
+      req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+      req.headers.set('X-Device-Token', token);
+    }
+
+    final res = await req.close().timeout(const Duration(seconds: 12));
+    final responseBody = await utf8.decodeStream(res);
+
+    if (res.statusCode == 200) {
+      final json = jsonDecode(responseBody) as Map<String, dynamic>;
+      if (json['songs'] is List) {
+        return (json['songs'] as List).cast<Map<String, dynamic>>();
+      }
+      return [];
+    }
+    throw BackendException(res.statusCode, 'Search failed: $responseBody');
+  }
+
+  /// Fetches synchronized LRC lyric for NetEase track
+  Future<String?> getNeteaseLyric({
+    required String baseUrl,
+    required String token,
+    required String songId,
+  }) async {
+    final base = _normalizeUrl(baseUrl);
+    final uri = Uri.parse('$base/api/v1/music/netease/lyric?song_id=$songId');
+
+    final req = await _httpClient.getUrl(uri);
+    req.headers.set(HttpHeaders.acceptHeader, 'application/json');
+    if (token.isNotEmpty) {
+      req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+      req.headers.set('X-Device-Token', token);
+    }
+
+    final res = await req.close().timeout(const Duration(seconds: 10));
+    final responseBody = await utf8.decodeStream(res);
+
+    if (res.statusCode == 200) {
+      final json = jsonDecode(responseBody) as Map<String, dynamic>;
+      return json['lrc'] as String? ?? json['lyric'] as String?;
+    }
+    return null;
+  }
+
+  /// Polls for next pending music command from phone (Option B: HTTP polling fallback)
+  Future<Map<String, dynamic>?> pollMusicCommand({
+    required String baseUrl,
+    required String deviceId,
+    required String token,
+    int timeoutSeconds = 15,
+  }) async {
+    final base = _normalizeUrl(baseUrl);
+    final uri = Uri.parse('$base/api/v1/music/control/command/next?device_id=$deviceId&timeout=$timeoutSeconds');
+
+    final req = await _httpClient.getUrl(uri);
+    req.headers.set(HttpHeaders.acceptHeader, 'application/json');
+    if (token.isNotEmpty) {
+      req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+      req.headers.set('X-Device-Token', token);
+    }
+
+    final res = await req.close().timeout(Duration(seconds: timeoutSeconds + 10));
+    if (res.statusCode == 204) return null;
+
+    final responseBody = await utf8.decodeStream(res);
+    if (res.statusCode == 200) {
+      return jsonDecode(responseBody) as Map<String, dynamic>;
+    }
+    return null;
+  }
+
+  /// Reports current player status to backend (Option B: HTTP status report)
+  Future<bool> reportMusicStatus({
+    required String baseUrl,
+    required String token,
+    required Map<String, dynamic> status,
+  }) async {
+    final base = _normalizeUrl(baseUrl);
+    final uri = Uri.parse('$base/api/v1/music/control/status');
+
+    try {
+      final req = await _httpClient.postUrl(uri);
+      req.headers.set(HttpHeaders.contentTypeHeader, 'application/json');
+      req.headers.set(HttpHeaders.acceptHeader, 'application/json');
+      if (token.isNotEmpty) {
+        req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+        req.headers.set('X-Device-Token', token);
+      }
+      req.add(utf8.encode(jsonEncode(status)));
+
+      final res = await req.close().timeout(const Duration(seconds: 8));
+      return res.statusCode == 200;
+    } catch (_) {
+      return false;
     }
   }
 }
