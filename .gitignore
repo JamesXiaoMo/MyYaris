@@ -44,8 +44,9 @@ app.*.map.json
 /android/app/profile
 /android/app/release
 
-# Backend is versioned separately on R9000P.
+# Independent subprojects / repositories
 /backend/
+/ios_app/
 
 # Local credentials and signing material
 .env

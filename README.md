@@ -1,17 +1,20 @@
-# my_yaris
+# MyYaris 项目工作区
 
-A new Flutter project.
+MyYaris 是一套为丰田 Yaris 打造的车机互联、智能导航流转与媒体控制解决方案。
 
-## Getting Started
+## 目录分工与项目结构
 
-This project is a starting point for a Flutter application.
+工作区采用清晰的模块化与多端分工架构：
 
-A few resources to get you started if this is your first Flutter project:
+| 目录 | 仓库性质 | 职能说明 |
+| :--- | :--- | :--- |
+| **`car_app/`** | 主仓库跟踪 | **车机端 Flutter 应用程序**。运行于车机盒子（Ottocast P3 Pro / Android 13），包含 Android 原生保活、MediaSession 网易云播控、NAVITIME 导航自动流转与前端交互界面。 |
+| **`ios_app/`** | 独立 Git 仓库 | **未来 iPhone 客户端工程**。自用 iOS 客户端，包含移动端快捷指令联动与导航中继控制（主仓库忽略本目录以避免嵌套冲突）。 |
+| **`backend/`** | 独立 Git 仓库 | **云端/局域网后端服务**。部署于专用服务器，负责导航坐标分发、长轮询任务管理与设备状态同步。 |
+| **`docs/`** | 主仓库跟踪 | **设计规范与调研文档**。包含 UI 界面设计原型、架构图、SideStore 自动化签名流程及产品需求文档。 |
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+## 开发工作流指引
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+- **车机开发**：所有 Flutter / Android 命令需在 `car_app/` 目录下执行（例如 `cd car_app && flutter analyze` 或指定有效工作目录）。
+- **iOS 开发**：iOS 工程师在 `ios_app/` 独立仓库中进行环境初始化与应用开发。
+- **后端开发**：后端服务在 `backend/` 独立仓库中维护与部署。
