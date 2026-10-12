@@ -3,6 +3,7 @@ import '../services/music_service.dart';
 import '../services/storage_service.dart';
 import '../services/task_poller_service.dart';
 import 'connection_debug_page.dart';
+import 'built_in_player_page.dart';
 
 class CarHomePage extends StatefulWidget {
   final IStorageService storage;
@@ -500,33 +501,63 @@ class _CarHomePageState extends State<CarHomePage> {
                           ),
                         ],
                       ),
-                      // Prominent Secondary Page Entry Button
-                      ElevatedButton.icon(
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: const Color(0xFF232A38),
-                          foregroundColor: Colors.white,
-                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(8),
-                            side: const BorderSide(color: Colors.blueAccent, width: 1),
-                          ),
-                        ),
-                        icon: const Icon(Icons.tune, size: 16, color: Colors.blueAccent),
-                        label: const Text(
-                          '连接与调试 (后台与导航)',
-                          style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
-                        ),
-                        onPressed: () {
-                          Navigator.push(
-                            context,
-                            MaterialPageRoute(
-                              builder: (ctx) => ConnectionDebugPage(
-                                storage: widget.storage,
-                                poller: widget.poller,
+                      // Top Action Buttons (Built-in Player PoC & Debug Page)
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          ElevatedButton.icon(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFF162E2E),
+                              foregroundColor: Colors.tealAccent,
+                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(8),
+                                side: const BorderSide(color: Colors.tealAccent, width: 1),
                               ),
                             ),
-                          );
-                        },
+                            icon: const Icon(Icons.graphic_eq, size: 15, color: Colors.tealAccent),
+                            label: const Text(
+                              '内置播放器验证',
+                              style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold),
+                            ),
+                            onPressed: () {
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (ctx) => const BuiltInPlayerPage(),
+                                ),
+                              );
+                            },
+                          ),
+                          const SizedBox(width: 8),
+                          ElevatedButton.icon(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFF232A38),
+                              foregroundColor: Colors.white,
+                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(8),
+                                side: const BorderSide(color: Colors.blueAccent, width: 1),
+                              ),
+                            ),
+                            icon: const Icon(Icons.tune, size: 15, color: Colors.blueAccent),
+                            label: const Text(
+                              '连接与调试 (后台与导航)',
+                              style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold),
+                            ),
+                            onPressed: () {
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (ctx) => ConnectionDebugPage(
+                                    storage: widget.storage,
+                                    poller: widget.poller,
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
+                        ],
                       ),
                     ],
                   ),
