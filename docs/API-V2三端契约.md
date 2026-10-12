@@ -6,7 +6,7 @@
   2. **Vehicle App** (`car_app`)：Ottocast P3 Pro 车机播放与导航端
   3. **Backend** (`backend`)：R9000P 边缘中枢服务 (FastAPI / SQLite / Tailscale TLS)
 - **文档维护者**：后端团队 (端侧只读引用)
-- **基线日期**：2026-10-12
+- **基线日期**：2026-10-12 (V2.1 增强版)
 
 ---
 
@@ -31,8 +31,8 @@ def resolve_car_device_id(input_id: Optional[str] = None, fallback_id: Optional[
 
 ### 1.3 权限与隔离 (ACL Checks)
 - 车机 Token (`CAR_TOKEN`) 默认绑定设备 `car_p3pro`。
-- 车机请求 `/devices/{id}/tasks/next`、`/tasks/{id}/ack`、`/music/control/status` 或 `/music/control/command/next` 时，后端在比对 `user.device_id` 与目标 `device_id` 前进行别名归一化判断。
-- 当且仅当 `is_same_device(user.device_id, target_device_id)` 为 True 时放行，既消除了 `ottocast_p3_pro` 报 403 Forbidden 或 204 No Content 的设备陷阱，又严格保证了非本车设备的越权阻断。
+- 车机请求 `/devices/{id}/tasks/next`、`/tasks/{id}/ack`、`/music/control/status`、`/music/control/command/next` 或 `/music/control/command/{id}/ack` 时，后端在比对 `user.device_id` 与目标 `device_id` 前进行别名归一化判断。
+- 当且仅当 `is_same_device(user.device_id, target_device_id)` 为 True 时放行，既消除了 `ottocast_p3_pro` 报 403 Forbidden 或 204 No Content 的设备陷阱，又严格保证了跨设备越权的绝对阻断。
 
 ---
 
@@ -144,7 +144,7 @@ def resolve_car_device_id(input_id: Optional[str] = None, fallback_id: Optional[
   }
 }
 ```
-- **车机端解析**：`car_music_sync_service.dart` 可直接提取顶层 `msg["action"]` 与 `msg["params"]`，无需改动车机即可无缝执行！
+- **车机端解析**：`car_music_sync_service.dart` 可直接提取顶层 `msg["action"]` 与 `msg["params"]`，无缝执行。
 
 ### 3.3 车机状态上报校验与防清空保护 (Payload Validation)
 车机通过 WebSocket 发送 `{"type": "status_update", ...}` 时：
@@ -154,24 +154,155 @@ def resolve_car_device_id(input_id: Optional[str] = None, fallback_id: Optional[
 
 ---
 
-## 4. 播控指令多通道去重 (Command Deduplication)
+## 4. 播控命令全生命周期与车机执行确认契约 (Command Lifecycle & Acknowledgement)
 
-### 4.1 核心问题
-车机具备 WebSocket 实时连接与 HTTP 长轮询 (`/music/control/command/next`) 双通道。当车机网络不稳定或发生切换时，同一指令可能在两通道被重复拉取，导致“跳过两首歌”或“暂停后又播放”的异常。
+### 4.1 核心问题与设计原则
+1. **WS 发送成功 != 车机执行成功**：调用底层 TCP `ws.send_json` 成功仅代表数据已推入内核发送缓冲区，可能车机随后断网、Flutter 解析异常或播放器报错；绝不能用“发送成功”冒充“已消费/已执行”。
+2. **两阶段回执区分**：
+   - **服务端接入回执**：手机发起指令时，后端返回 `status: "dispatched"`（或 `"ok"`），表明服务端已入库并调度；
+   - **车机端执行回执**：车机真正完成操作后，回报 `received`、`applied`（或 `executed`）或 `failed`。
+3. **架构客观定性**：系统采用 **SQLite 持久化 + 单进程异步调度 + 至少一次投递 (At-Least-Once Delivery) + 幂等消费者 (Idempotent Consumer)**，不虚假声称不可达的分布式“Exactly-Once”。
 
-### 4.2 去重与派发保障机制
-1. **指令唯一定识**：所有指令均分配或携带 `command_id`。
-2. **WebSocket 优先实时送达**：
-   - 指令下发时，后端优先通过活动 WebSocket 尝试直接推送给目标车机。
-   - 若 WebSocket 成功送达（`delivered_count > 0`），后端记录该 `command_id` 为已送达状态，**不向 HTTP 长轮询队列重复塞入该指令**。
-3. **HTTP 长轮询延迟过滤**：
-   - 车机通过 HTTP 长轮询拉取下一条指令时，队列管理器自动跳过已被 WebSocket 成功消费的 `command_id`，防止双通道重复执行。
-4. **客户端重试幂等**：
-   - 手机端重复提交相同 `command_id` 的指令时，后端直接返回已调度确认（`MusicCommandResponse`），不再重新排队。
+### 4.2 状态机定义 (Command Lifecycle State Machine)
+```
+       [Phone 发起指令]
+              │
+              ▼
+           queued (后端入库，等待派发)
+              │
+      ┌───────┴───────┐
+      ▼ (WS推达)       ▼ (HTTP拉取)
+     sent            sent
+      │               │
+      ├───────────────┼───────────────┐
+      ▼               ▼               ▼
+   received        applied          failed (含 error_code / error_detail)
+      │               ▲
+      └───────────────┘ (最终执行完毕)
+      
+      *超时未处理: expires_at 到期后自动标记为 expired
+```
+
+| 状态 | 角色与时机 | 说明 |
+| :--- | :--- | :--- |
+| `queued` | 后端刚接收 | 已入库持久化，进入调度队列 |
+| `sent` | 后端完成投递 | 已通过 WebSocket 发出或已由车机 HTTP 长轮询取出 |
+| `received` | 车机确认收到 | 车机端已解析报文并排队交给音频引擎 |
+| `applied` / `executed` | 车机执行成功 | 音频服务真正完成播放/暂停/Seek/音量切换 |
+| `failed` | 车机执行失败 | 解码失败、网络超时或非法音频源，携带错误详情 |
+| `expired` | 后端判定超时 | 指令在有效期内未被执行，不再向车机重放 |
+
+### 4.3 幂等性与冲突校验 (Idempotency & Conflict Rules)
+所有指令必须具备唯一的 `command_id`（由客户端传入或服务端派发）：
+1. **完全幂等重试**：
+   - 若收到相同 `command_id`，且 `device_id`、`action` 与 `params` 完全一致：
+   - 服务端直接返回现有指令记录（HTTP 200），不重新入库、不重复执行，消除手机弱网重发抖动。
+2. **载荷冲突拦截 (Payload Conflict)**：
+   - 若相同 `command_id` 携带了不同的 `action` 或不同的 `params`：
+   - 后端立即拒绝并返回 **HTTP 409 Conflict**：`Command ID already exists with different action or parameters`。
+3. **跨设备防撞库与防越权 (Cross-Device Collision)**：
+   - 若相同 `command_id` 尝试派发给不同的设备：
+   - 后端立即拒绝并返回 **HTTP 409 Conflict**：`Command ID already exists for another device`。
+4. **车机回执隔离**：
+   - 车机只能确认目标为自身 `device_id` 的指令；跨设备回执一律返回 **HTTP 403 Forbidden**。
+
+### 4.4 有效期与过期防重放 (TTL & Stale Command Suppression)
+为防止车辆长达数分钟进出地库或断网重连后，突发重放过期的 Seek、音量或切歌指令：
+- **瞬态指令短 TTL**：`seek`、`set_volume` 默认有效期 **20 秒**；
+- **普通指令标准 TTL**：`play_track`、`pause`、`resume` 等默认有效期 **60 秒**（客户端可通过 `expires_in_seconds` 显式设置 5~300 秒）；
+- **过期即丢弃**：HTTP 长轮询与 WS 派发前均检查 `expires_at`；一旦过期，指令就地标记为 `expired`，绝不下发给车机。
+
+### 4.5 断线恢复与备用通道最小重投规则 (Fallback Recovery)
+- 指令经由 WebSocket 发出后，**不会从 HTTP 备用队列中抹除**，而是保留在调度管理器中；
+- 若车机在 WebSocket 保持连接且 3 秒内未回执，或者 WebSocket 发生断开：
+- 车机降级触发 `GET /api/v1/music/control/command/next` 时，该待确认指令将被安全取出并交付车机；
+- 车机端依据 `command_id` 幂等消费：若先前已执行过则直接补发 ACK，若未执行过则执行后回报，彻底解决断线丢指令问题。
 
 ---
 
-## 5. 9 大标准播控 Action 与参数字典
+## 5. 新增车机确认接口与报文规范 (Acknowledgement API & Messages)
+
+### 5.1 HTTP 车机回执接口
+- **路径**：`POST /api/v1/music/control/command/{command_id}/ack`
+- **鉴权**：`Authorization: Bearer <CAR_TOKEN>` 或 `X-Device-Token`
+- **请求体** (`MusicCommandAckRequest`)：
+  ```json
+  {
+    "status": "applied",          // received | applied | failed
+    "error_code": null,           // 失败时传入，例如 "TRACK_DECODE_ERROR"
+    "error_detail": null,         // 失败详情，例如 "Audio track 404 not found"
+    "device_timestamp": "2026-10-12T14:00:02Z"
+  }
+  ```
+- **响应体** (`MusicCommandAckResponse`)：
+  ```json
+  {
+    "command_id": "cmd_music_abc123",
+    "status": "applied",
+    "accepted": true,
+    "message": "Command acknowledged as applied"
+  }
+  ```
+
+### 5.2 HTTP 指令状态查询接口
+- **路径**：`GET /api/v1/music/control/command/{command_id}`
+- **鉴权**：手机 Token、车机 Token 或 Admin Token
+- **响应体** (`MusicCommandDetailResponse`)：
+  ```json
+  {
+    "command_id": "cmd_music_abc123",
+    "device_id": "car_p3pro",
+    "action": "play_track",
+    "params": { "track_id": "123" },
+    "status": "applied",
+    "sender_role": "phone",
+    "dispatched_channel": "ws",
+    "delivery_attempts": 1,
+    "created_at": "2026-10-12T14:00:00Z",
+    "expires_at": "2026-10-12T14:01:00Z",
+    "sent_at": "2026-10-12T14:00:00.1Z",
+    "acknowledged_at": "2026-10-12T14:00:00.6Z",
+    "error_code": null,
+    "error_detail": null
+  }
+  ```
+
+### 5.3 WebSocket 车机执行回执报文
+车机连接 `/api/v1/ws/music` 并在执行后上报：
+```json
+{
+  "type": "command_ack",
+  "command_id": "cmd_music_abc123",
+  "status": "applied",
+  "error_code": null,
+  "error_detail": null
+}
+```
+
+### 5.4 WebSocket 手机端执行状态广播
+当车机完成确认（无论是通过 WS 还是 HTTP 回执），后端向该车辆的所有在线手机客户端广播：
+```json
+{
+  "type": "command_status",
+  "timestamp": "2026-10-12T14:00:02Z",
+  "command_id": "cmd_music_abc123",
+  "device_id": "car_p3pro",
+  "status": "applied",
+  "error_code": null,
+  "error_detail": null,
+  "data": {
+    "command_id": "cmd_music_abc123",
+    "device_id": "car_p3pro",
+    "status": "applied",
+    "error_code": null,
+    "error_detail": null
+  }
+}
+```
+
+---
+
+## 6. 9 大标准播控 Action 与参数字典
 
 | Action | 支持别名 | 关键参数 (`params`) | 说明 |
 | :--- | :--- | :--- | :--- |
@@ -181,18 +312,19 @@ def resolve_car_device_id(input_id: Optional[str] = None, fallback_id: Optional[
 | `stop` | - | - | 停止播放并重置进度 |
 | `next` | - | - | 下一首 |
 | `prev` | `previous` | - | 上一首 |
-| `seek` | - | `seek_ms` / `seek_position_ms` / `position_ms` (单位毫秒) | 跳转指定播放进度 |
+| `seek` | - | `seek_ms` / `seek_position_ms` / `position_ms` (单位毫秒) | 跳转指定播放进度（短 TTL 保护） |
 | `set_loop` | `set_loop_mode` | `loop_mode`: `"all"` \| `"one"` \| `"off"` | 设置循环模式 |
 | `set_shuffle` | - | `shuffle`: `true` \| `false` | 设置随机播放开关 |
-| `set_volume` | - | `volume`: `0.0` ~ `1.0` (浮点数) | 设置车机软件播放音量 |
+| `set_volume` | - | `volume`: `0.0` ~ `1.0` (浮点数) | 设置车机软件播放音量（短 TTL 保护） |
 
 ---
 
-## 6. 端侧开发与联调检查清单 (Checklist)
+## 7. 端侧工程师实施对齐指引 (Alignment Guide)
 
-1. [x] **后端设备别名归一化**：已全局应用 `resolve_car_device_id`，车机无论传 `car_p3pro` 还是 `ottocast_p3_pro` 均可正常轮询任务与回执。
-2. [x] **两阶段导航分离**：`POST /api/v1/destinations/resolve` 仅做计算不创建任务，`POST /api/v1/tasks/destination` 正式派发。
-3. [x] **WS 双信封支持**：状态广播同时具备 `data` 字典与顶层字段，指令下发具备顶层 `action`/`params` 与 `data` 结构。
-4. [x] **状态防清空**：空状态报文与无效数据不污染数据库持久化快照。
-5. [x] **指令通道去重**：`command_id` 追踪确保 WebSocket 与 HTTP 长轮询不双发。
-6. [x] **所有回归测试自动化验证**：89 项基准测试 + 5 项契约专用集成测试全部通过。
+1. **车机端 (`car_app`) 后续对齐任务**：
+   - 在 `car_music_sync_service.dart` 执行完 `handleCommand` 之后，除上报 `sendCurrentStatus()` 外，增加发送 WS `command_ack`：
+     `_webSocket?.add(jsonEncode({'type': 'command_ack', 'command_id': msg['command_id'], 'status': 'applied'}));`
+   - 若执行异常，上报 `status: 'failed'` 与对应 `error_code`。
+2. **手机端 (`ios_app`) 后续对齐任务**：
+   - 现有的 `command_ack` 是即时提交成功握手；
+   - 可在 `consumeRealtime` 监听 `type == 'command_status'`，根据 `applied` 或 `failed` 刷新 UI 状态与弹窗报错。
