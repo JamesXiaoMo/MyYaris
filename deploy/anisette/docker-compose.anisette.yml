@@ -1,0 +1,14 @@
+services:
+  anisette-server:
+    image: dadoum/anisette-v3-server:latest
+    container_name: anisette-server
+    restart: always
+    ports:
+      - "127.0.0.1:6969:6969"
+    environment:
+      - TZ=Asia/Tokyo
+    volumes:
+      - anisette-data:/home/Alcoholic/.config/anisette-v3
+
+volumes:
+  anisette-data:
