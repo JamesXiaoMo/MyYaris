@@ -194,17 +194,24 @@ def resolve_car_device_id(input_id: Optional[str] = None, fallback_id: Optional[
 
 ### 4.3 幂等性与冲突校验 (Idempotency & Conflict Rules)
 所有指令必须具备唯一的 `command_id`（由客户端传入或服务端派发）：
-1. **完全幂等重试**：
-   - 若收到相同 `command_id`，且 `device_id`、`action` 与 `params` 完全一致：
-   - 服务端直接返回现有指令记录（HTTP 200），不重新入库、不重复执行，消除手机弱网重发抖动。
+1. **HTTP/WS 双入口交叉幂等**：
+   - 无论指令首发来自 HTTP 还是 WebSocket，均由 SQLite 主键（`UNIQUE(command_id)`）和并发隔离事务保障唯一性。
+   - **WebSocket 入口重复提交**：若收到相同 `command_id` 且 payload 一致，WS 仅向手机返回 `{type: "command_ack", command_id: "...", status: "<status>", duplicate: true}`，**绝不向车机二次下发、绝不重复入队**。
+   - **HTTP 入口重复提交**：若收到相同 `command_id` 且 payload 一致，返回 HTTP 200 OK 既有记录，不重新入库、不重复执行，消除手机弱网重发抖动。
 2. **载荷冲突拦截 (Payload Conflict)**：
    - 若相同 `command_id` 携带了不同的 `action` 或不同的 `params`：
-   - 后端立即拒绝并返回 **HTTP 409 Conflict**：`Command ID already exists with different action or parameters`。
+   - HTTP 入口返回 **HTTP 409 Conflict**；
+   - WebSocket 入口向手机返回 `{type: "command_ack", status: "conflict", error: "Command ID already exists with different action or parameters."}`。
 3. **跨设备防撞库与防越权 (Cross-Device Collision)**：
    - 若相同 `command_id` 尝试派发给不同的设备：
    - 后端立即拒绝并返回 **HTTP 409 Conflict**：`Command ID already exists for another device`。
-4. **车机回执隔离**：
+4. **车机回执隔离与终态防回退**：
    - 车机只能确认目标为自身 `device_id` 的指令；跨设备回执一律返回 **HTTP 403 Forbidden**。
+   - **终态保护 (Terminal State Protection)**：`applied` 与 `failed` 为终态。一旦记录进入终态，不可被后续的 `received`、`failed` 或 `applied` 篡改或状态回退，重复 ACK 幂等安全。
+   - **`received` 非执行终态**：`received` 仅代表车机已接收报文，绝不能视作执行完成，不触发完成移除。
+5. **并发去重责任边界**：
+   - 服务端实施至少一次投递（At-least-once），不在发送时过早剔除备用队列；
+   - 车机端负责基于 `command_id` 进行幂等去重（若通过 WS 与 HTTP 双通道均收到同一 `command_id`，车机只执行一次并上报 `applied` 执行回执）。
 
 ### 4.4 有效期与过期防重放 (TTL & Stale Command Suppression)
 为防止车辆长达数分钟进出地库或断网重连后，突发重放过期的 Seek、音量或切歌指令：
@@ -212,11 +219,13 @@ def resolve_car_device_id(input_id: Optional[str] = None, fallback_id: Optional[
 - **普通指令标准 TTL**：`play_track`、`pause`、`resume` 等默认有效期 **60 秒**（客户端可通过 `expires_in_seconds` 显式设置 5~300 秒）；
 - **过期即丢弃**：HTTP 长轮询与 WS 派发前均检查 `expires_at`；一旦过期，指令就地标记为 `expired`，绝不下发给车机。
 
-### 4.5 断线恢复与备用通道最小重投规则 (Fallback Recovery)
-- 指令经由 WebSocket 发出后，**不会从 HTTP 备用队列中抹除**，而是保留在调度管理器中；
+### 4.5 断线恢复与服务端进程重启恢复 (Recovery & Restart Resilience)
+- **双通道容灾**：指令经由 WebSocket 发出后，**不会从 HTTP 备用队列中抹除**，保留在调度管理器中；
 - 若车机在 WebSocket 保持连接且 3 秒内未回执，或者 WebSocket 发生断开：
-- 车机降级触发 `GET /api/v1/music/control/command/next` 时，该待确认指令将被安全取出并交付车机；
-- 车机端依据 `command_id` 幂等消费：若先前已执行过则直接补发 ACK，若未执行过则执行后回报，彻底解决断线丢指令问题。
+  - 车机降级触发 `GET /api/v1/music/control/command/next` 时，该待确认指令将被安全取出并交付车机；
+- **进程重启/实例重建恢复 (Process Restart Recovery)**：
+  - 服务端重启或 `MusicCommandQueueManager` 实例重建时，从 SQLite 恢复未确认（`queued`/`sent`/`received`）且未过期的待派发指令，同时预载最近的已终态指令 ID 防止重放；
+  - 重启后车机发起的 HTTP 轮询能够无缝消费重启前未确认的指令，彻底杜绝单机内存易失导致指令丢失。
 
 ---
 
