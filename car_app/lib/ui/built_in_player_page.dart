@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
 import '../services/built_in_player_service.dart';
+import '../services/car_music_sync_service.dart';
 
 class BuiltInPlayerPage extends StatefulWidget {
   const BuiltInPlayerPage({super.key});
@@ -65,6 +66,48 @@ class _BuiltInPlayerPageState extends State<BuiltInPlayerPage> {
           ],
         ),
         actions: [
+          ValueListenableBuilder<MusicSyncMode>(
+            valueListenable: CarMusicSyncService().syncModeNotifier,
+            builder: (context, mode, _) {
+              Color badgeColor;
+              String badgeText;
+              switch (mode) {
+                case MusicSyncMode.websocket:
+                  badgeColor = Colors.greenAccent;
+                  badgeText = 'WS播控';
+                  break;
+                case MusicSyncMode.httpPolling:
+                  badgeColor = Colors.amberAccent;
+                  badgeText = 'HTTP轮询';
+                  break;
+                case MusicSyncMode.disconnected:
+                  badgeColor = Colors.grey;
+                  badgeText = '播控未连';
+                  break;
+              }
+              return Container(
+                margin: const EdgeInsets.only(right: 8),
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: badgeColor.withValues(alpha: 0.15),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: badgeColor.withValues(alpha: 0.5), width: 1),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: 6,
+                      height: 6,
+                      decoration: BoxDecoration(color: badgeColor, shape: BoxShape.circle),
+                    ),
+                    const SizedBox(width: 5),
+                    Text(badgeText, style: TextStyle(color: badgeColor, fontSize: 11, fontWeight: FontWeight.bold)),
+                  ],
+                ),
+              );
+            },
+          ),
           StreamBuilder<PlayerState>(
             stream: _service.player.playerStateStream,
             builder: (context, snapshot) {

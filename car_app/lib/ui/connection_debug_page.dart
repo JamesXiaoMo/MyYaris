@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../services/backend_client.dart';
+import '../services/car_music_sync_service.dart';
 import '../services/storage_service.dart';
 import '../services/task_poller_service.dart';
 
@@ -49,6 +50,14 @@ class _ConnectionDebugPageState extends State<ConnectionDebugPage> {
     await widget.storage.setBackendUrl(newUrl);
     await widget.storage.setDeviceId(newDeviceId);
     await widget.storage.setCarToken(newToken);
+
+    if (newUrl.isNotEmpty) {
+      CarMusicSyncService().start(
+        baseUrl: newUrl,
+        deviceId: newDeviceId,
+        token: newToken,
+      );
+    }
 
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(

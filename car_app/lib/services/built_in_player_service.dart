@@ -70,10 +70,12 @@ class BuiltInPlayerService {
 
   LocalTrackItem? _activeRemoteTrack;
   LocalTrackItem? get activeRemoteTrack => _activeRemoteTrack;
+  final ValueNotifier<LocalTrackItem?> activeRemoteTrackNotifier = ValueNotifier(null);
+  int _selectedTrackIndex = 0;
 
   LocalTrackItem get currentTrack {
     if (_activeRemoteTrack != null) return _activeRemoteTrack!;
-    final idx = _player.currentIndex ?? 0;
+    final idx = _player.currentIndex ?? _selectedTrackIndex;
     if (idx >= 0 && idx < tracks.length) {
       return tracks[idx];
     }
@@ -87,6 +89,37 @@ class BuiltInPlayerService {
       // 1. Configure audio session for car audio focus & ducking
       final session = await AudioSession.instance;
       await session.configure(const AudioSessionConfiguration.music());
+
+      // Listen to audio focus interruptions (e.g. NAVITIME voice guidance ducking or pause)
+      session.interruptionEventStream.listen((event) {
+        debugPrint('[BuiltInPlayer] Audio focus interruption event: begin=${event.begin}, type=${event.type}');
+        if (event.begin) {
+          switch (event.type) {
+            case AudioInterruptionType.duck:
+              debugPrint('[BuiltInPlayer] Audio focus ducking: lowering volume from $_currentVolume to ${_currentVolume * 0.5}');
+              _player.setVolume((_currentVolume * 0.5).clamp(0.0, 1.0));
+              break;
+            case AudioInterruptionType.pause:
+            case AudioInterruptionType.unknown:
+              debugPrint('[BuiltInPlayer] Audio focus pause interruption.');
+              _player.pause();
+              break;
+          }
+        } else {
+          switch (event.type) {
+            case AudioInterruptionType.duck:
+              debugPrint('[BuiltInPlayer] Audio focus unduck: restoring volume to $_currentVolume');
+              _player.setVolume(_currentVolume);
+              break;
+            case AudioInterruptionType.pause:
+              debugPrint('[BuiltInPlayer] Audio focus restored: resuming playback');
+              _player.play();
+              break;
+            case AudioInterruptionType.unknown:
+              break;
+          }
+        }
+      });
 
       // 2. Load audio sources with local offline items
       final audioSources = tracks.map<AudioSource>((t) {
@@ -129,16 +162,17 @@ class BuiltInPlayerService {
       durationDesc: '网络流式音频',
       tag: '远程播控',
     );
+    activeRemoteTrackNotifier.value = _activeRemoteTrack;
 
     final uri = Uri.parse(streamUrl);
     final source = AudioSource.uri(uri, headers: headers);
     await _player.setAudioSource(source, initialPosition: initialPosition ?? Duration.zero);
-    await _player.play();
+    unawaited(_player.play());
   }
 
   Future<void> play() async {
     if (!_isInitialized) await init();
-    await _player.play();
+    unawaited(_player.play());
   }
 
   Future<void> pause() async {
@@ -155,6 +189,8 @@ class BuiltInPlayerService {
 
   Future<void> skipToNext() async {
     _activeRemoteTrack = null;
+    activeRemoteTrackNotifier.value = null;
+    _selectedTrackIndex = (_selectedTrackIndex + 1) % tracks.length;
     if (_player.hasNext) {
       await _player.seekToNext();
     } else {
@@ -164,6 +200,8 @@ class BuiltInPlayerService {
 
   Future<void> skipToPrevious() async {
     _activeRemoteTrack = null;
+    activeRemoteTrackNotifier.value = null;
+    _selectedTrackIndex = (_selectedTrackIndex - 1 + tracks.length) % tracks.length;
     if (_player.hasPrevious) {
       await _player.seekToPrevious();
     } else {
@@ -173,9 +211,11 @@ class BuiltInPlayerService {
 
   Future<void> selectTrack(int index) async {
     _activeRemoteTrack = null;
+    activeRemoteTrackNotifier.value = null;
     if (index >= 0 && index < tracks.length) {
+      _selectedTrackIndex = index;
       await _player.seek(Duration.zero, index: index);
-      await _player.play();
+      unawaited(_player.play());
     }
   }
 
@@ -193,9 +233,11 @@ class BuiltInPlayerService {
   Future<void> setLoopModeString(String mode) async {
     switch (mode.toLowerCase().trim()) {
       case 'one':
+      case 'single':
         await _player.setLoopMode(LoopMode.one);
         break;
       case 'off':
+      case 'none':
         await _player.setLoopMode(LoopMode.off);
         break;
       case 'all':

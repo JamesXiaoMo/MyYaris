@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import '../models/task_model.dart';
 
 class AuthException implements Exception {
@@ -522,5 +523,76 @@ class BackendClient {
     } catch (_) {
       return false;
     }
+  }
+
+  /// Reports command execution acknowledgement via HTTP fallback (POST /api/v1/music/control/command/{command_id}/ack)
+  Future<bool> ackMusicCommand({
+    required String baseUrl,
+    required String token,
+    required String commandId,
+    required String status,
+    String? errorCode,
+    String? errorDetail,
+  }) async {
+    final base = _normalizeUrl(baseUrl);
+    final uri = Uri.parse('$base/api/v1/music/control/command/$commandId/ack');
+
+    try {
+      final req = await _httpClient.postUrl(uri);
+      req.headers.set(HttpHeaders.contentTypeHeader, 'application/json');
+      req.headers.set(HttpHeaders.acceptHeader, 'application/json');
+      if (token.isNotEmpty) {
+        req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+        req.headers.set('X-Device-Token', token);
+      }
+      final payload = {
+        'status': status,
+        'error_code': errorCode,
+        'error_detail': errorDetail,
+        'device_timestamp': DateTime.now().toUtc().toIso8601String(),
+      };
+      req.add(utf8.encode(jsonEncode(payload)));
+
+      final res = await req.close().timeout(const Duration(seconds: 8));
+      return res.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Connects to a WebSocket endpoint using the configured HttpClient with DNS fallback and strict TLS verification
+  Future<WebSocket> connectWebSocket(
+    Uri uri, {
+    Map<String, dynamic>? headers,
+    Duration timeout = const Duration(seconds: 10),
+  }) async {
+    final isSecure = uri.scheme == 'wss';
+    final httpScheme = isSecure ? 'https' : 'http';
+    final httpUri = uri.replace(scheme: httpScheme);
+
+    final req = await _httpClient.openUrl('GET', httpUri).timeout(timeout);
+    req.headers.set(HttpHeaders.connectionHeader, 'Upgrade');
+    req.headers.set('Upgrade', 'websocket');
+    req.headers.set('Sec-WebSocket-Version', '13');
+
+    final rng = math.Random();
+    final keyBytes = List<int>.generate(16, (_) => rng.nextInt(256));
+    final secKey = base64.encode(keyBytes);
+    req.headers.set('Sec-WebSocket-Key', secKey);
+
+    if (headers != null) {
+      headers.forEach((k, v) {
+        req.headers.set(k, v.toString());
+      });
+    }
+
+    final resp = await req.close().timeout(timeout);
+    if (resp.statusCode != 101) {
+      final body = await utf8.decodeStream(resp);
+      throw WebSocketException('WebSocket handshake failed with status ${resp.statusCode}: $body');
+    }
+
+    final socket = await resp.detachSocket();
+    return WebSocket.fromUpgradedSocket(socket, serverSide: false);
   }
 }

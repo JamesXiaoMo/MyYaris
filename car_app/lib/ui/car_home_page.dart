@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../services/car_music_sync_service.dart';
 import '../services/music_service.dart';
 import '../services/storage_service.dart';
 import '../services/task_poller_service.dart';
@@ -33,6 +34,15 @@ class _CarHomePageState extends State<CarHomePage> {
     // Maintain poller running state across navigation
     if (widget.storage.isPollingEnabled && !widget.poller.isRunning) {
       widget.poller.start();
+    }
+    if (widget.storage.backendUrl.isNotEmpty &&
+        !widget.storage.backendUrl.contains('mock') &&
+        !CarMusicSyncService().isRunning) {
+      CarMusicSyncService().start(
+        baseUrl: widget.storage.backendUrl,
+        deviceId: widget.storage.deviceId,
+        token: widget.storage.carToken,
+      );
     }
     _checkPermissionAndRefreshInfo();
   }
@@ -505,6 +515,51 @@ class _CarHomePageState extends State<CarHomePage> {
                       Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
+                          ValueListenableBuilder<MusicSyncMode>(
+                            valueListenable: CarMusicSyncService().syncModeNotifier,
+                            builder: (context, mode, _) {
+                              Color badgeColor;
+                              String badgeText;
+                              switch (mode) {
+                                case MusicSyncMode.websocket:
+                                  badgeColor = Colors.greenAccent;
+                                  badgeText = 'WS播控';
+                                  break;
+                                case MusicSyncMode.httpPolling:
+                                  badgeColor = Colors.amberAccent;
+                                  badgeText = 'HTTP播控';
+                                  break;
+                                case MusicSyncMode.disconnected:
+                                  badgeColor = Colors.grey;
+                                  badgeText = '播控离线';
+                                  break;
+                              }
+                              return Container(
+                                margin: const EdgeInsets.only(right: 6),
+                                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 5),
+                                decoration: BoxDecoration(
+                                  color: badgeColor.withValues(alpha: 0.15),
+                                  borderRadius: BorderRadius.circular(6),
+                                  border: Border.all(color: badgeColor.withValues(alpha: 0.4), width: 1),
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Container(
+                                      width: 6,
+                                      height: 6,
+                                      decoration: BoxDecoration(color: badgeColor, shape: BoxShape.circle),
+                                    ),
+                                    const SizedBox(width: 4),
+                                    Text(
+                                      badgeText,
+                                      style: TextStyle(color: badgeColor, fontSize: 10, fontWeight: FontWeight.bold),
+                                    ),
+                                  ],
+                                ),
+                              );
+                            },
+                          ),
                           ElevatedButton.icon(
                             style: ElevatedButton.styleFrom(
                               backgroundColor: const Color(0xFF162E2E),

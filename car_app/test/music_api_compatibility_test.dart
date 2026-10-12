@@ -56,7 +56,13 @@ void main() {
       await playerService.setLoopModeString('one');
       expect(playerService.currentLoopModeString, 'one');
 
+      await playerService.setLoopModeString('single');
+      expect(playerService.currentLoopModeString, 'one');
+
       await playerService.setLoopModeString('off');
+      expect(playerService.currentLoopModeString, 'off');
+
+      await playerService.setLoopModeString('none');
       expect(playerService.currentLoopModeString, 'off');
 
       await playerService.setLoopModeString('all');
@@ -80,46 +86,139 @@ void main() {
     });
   });
 
-  group('CarMusicSyncService Remote Command Dispatching Tests', () {
+  group('CarMusicSyncService Remote Command Dispatching & Envelope Tests', () {
     late CarMusicSyncService syncService;
 
     setUp(() {
       syncService = CarMusicSyncService();
     });
 
-    test('handleCommand dispatches pause and resume cleanly', () async {
+    test('handleCommand unwraps {"type": "music_command", "data": {...}} envelope', () async {
+      await syncService.handleCommand({
+        'type': 'music_command',
+        'timestamp': '2026-10-12T12:00:00Z',
+        'data': {
+          'command_id': 'cmd_ws_001',
+          'action': 'set_volume',
+          'params': {'volume': 0.22},
+        },
+      });
+      expect(BuiltInPlayerService().currentVolume, 0.22);
+      expect(syncService.lastCommandNotifier.value, contains('set_volume'));
+    });
+
+    test('handleCommand handles direct root command payload (HTTP long poll fallback)', () async {
+      await syncService.handleCommand({
+        'command_id': 'cmd_http_002',
+        'action': 'set_volume',
+        'params': {'volume': 0.18},
+      });
+      expect(BuiltInPlayerService().currentVolume, 0.18);
+    });
+
+    test('handleCommand deduplicates identical command_id across channels', () async {
+      // First invocation executes command
+      await syncService.handleCommand({
+        'command_id': 'cmd_dup_test',
+        'action': 'set_volume',
+        'params': {'volume': 0.12},
+      });
+      expect(BuiltInPlayerService().currentVolume, 0.12);
+
+      // Manually set volume to 0.20
+      await BuiltInPlayerService().setVolume(0.20);
+      expect(BuiltInPlayerService().currentVolume, 0.20);
+
+      // Second invocation with same command_id is ignored (volume should remain 0.20)
+      await syncService.handleCommand({
+        'command_id': 'cmd_dup_test',
+        'action': 'set_volume',
+        'params': {'volume': 0.12},
+      });
+      expect(BuiltInPlayerService().currentVolume, 0.20);
+    });
+
+    test('handleCommand drops stale expired command when expires_at is past', () async {
+      await BuiltInPlayerService().setVolume(0.20);
+      expect(BuiltInPlayerService().currentVolume, 0.20);
+
+      final expiredTime = DateTime.now().toUtc().subtract(const Duration(minutes: 5)).toIso8601String();
+      await syncService.handleCommand({
+        'command_id': 'cmd_expired_001',
+        'action': 'set_volume',
+        'expires_at': expiredTime,
+        'params': {'volume': 0.05},
+      });
+
+      // Volume should not change to 0.05 because command expired
+      expect(BuiltInPlayerService().currentVolume, 0.20);
+    });
+
+    test('handleCommand cleanly rejects empty action without crashing', () async {
+      syncService.lastCommandNotifier.value = '初始状态';
+      await syncService.handleCommand({
+        'command_id': 'cmd_empty',
+        'action': '',
+      });
+      expect(syncService.lastCommandNotifier.value, '初始状态');
+
+      await syncService.handleCommand({
+        'data': {'action': '   '},
+      });
+      expect(syncService.lastCommandNotifier.value, '初始状态');
+    });
+
+    test('handleCommand supports all 9 music actions', () async {
+      // 1. play_track with local track id
+      await syncService.handleCommand({
+        'action': 'play_track',
+        'params': {'track_id': 'local_2'},
+      });
+      expect(BuiltInPlayerService().currentTrack.id, 'local_2');
+
+      // 2. pause
       await syncService.handleCommand({'action': 'pause'});
       expect(syncService.lastCommandNotifier.value, contains('pause'));
 
+      // 3. resume
       await syncService.handleCommand({'action': 'resume'});
       expect(syncService.lastCommandNotifier.value, contains('resume'));
-    });
 
-    test('handleCommand dispatches set_volume cleanly', () async {
-      await syncService.handleCommand({
-        'action': 'set_volume',
-        'params': {'volume': 0.35},
-      });
-      expect(BuiltInPlayerService().currentVolume, 0.35);
-    });
+      // 4. next
+      await syncService.handleCommand({'action': 'next'});
+      expect(syncService.lastCommandNotifier.value, contains('next'));
 
-    test('handleCommand dispatches set_loop_mode cleanly', () async {
-      await syncService.handleCommand({
-        'action': 'set_loop',
-        'params': {'loop_mode': 'one'},
-      });
-      expect(BuiltInPlayerService().currentLoopModeString, 'one');
-    });
+      // 5. prev
+      await syncService.handleCommand({'action': 'prev'});
+      expect(syncService.lastCommandNotifier.value, contains('prev'));
 
-    test('handleCommand dispatches seek and stop cleanly', () async {
+      // 6. seek
       await syncService.handleCommand({
         'action': 'seek',
-        'params': {'seek_ms': 500},
+        'params': {'position_ms': 1200},
       });
       expect(syncService.lastCommandNotifier.value, contains('seek'));
 
-      await syncService.handleCommand({'action': 'stop'});
-      expect(syncService.lastCommandNotifier.value, contains('stop'));
+      // 7. set_loop
+      await syncService.handleCommand({
+        'action': 'set_loop',
+        'params': {'mode': 'single'},
+      });
+      expect(BuiltInPlayerService().currentLoopModeString, 'one');
+
+      // 8. set_shuffle
+      await syncService.handleCommand({
+        'action': 'set_shuffle',
+        'params': {'shuffle': true},
+      });
+      expect(syncService.lastCommandNotifier.value, contains('set_shuffle'));
+
+      // 9. set_volume
+      await syncService.handleCommand({
+        'action': 'set_volume',
+        'params': {'volume': 0.25},
+      });
+      expect(BuiltInPlayerService().currentVolume, 0.25);
     });
   });
 }

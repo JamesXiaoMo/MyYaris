@@ -7,6 +7,7 @@
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:my_yaris/main.dart';
+import 'package:my_yaris/services/car_music_sync_service.dart';
 import 'package:my_yaris/services/task_poller_service.dart';
 import 'mock_storage_service.dart';
 
@@ -14,6 +15,11 @@ void main() {
   testWidgets('MyYarisApp smoke test', (WidgetTester tester) async {
     final mockStorage = MockStorageService();
     final poller = TaskPollerService(storage: mockStorage);
+
+    addTearDown(() {
+      poller.stop();
+      CarMusicSyncService().stop();
+    });
 
     // Build our app and trigger a frame.
     await tester.pumpWidget(MyYarisApp(storage: mockStorage, poller: poller));
@@ -30,5 +36,9 @@ void main() {
 
     // Verify secondary page contains connection poller controls
     expect(find.text('启用轮询'), findsOneWidget);
+
+    // Explicitly stop background services before invariant verification
+    poller.stop();
+    CarMusicSyncService().stop();
   });
 }
