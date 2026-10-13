@@ -80,6 +80,7 @@ class BackendClient {
             _createHttpClient(fallbackDns ?? defaultFallbackDns);
 
   Map<String, String> get fallbackDns => Map.unmodifiable(_fallbackDns);
+  HttpClient get httpClient => _httpClient;
 
   static HttpClient _createHttpClient(Map<String, String> fallbackDns) {
     final client = HttpClient(

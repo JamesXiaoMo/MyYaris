@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'backend_client.dart';
 import 'built_in_player_service.dart';
+import 'in_app_audio_stream_proxy.dart';
 
 enum MusicSyncMode {
   disconnected,
@@ -73,6 +74,12 @@ class CarMusicSyncService {
     _token = token.trim();
     _backendClient = backendClient ?? BackendClient();
     _isRunning = true;
+
+    InAppAudioStreamProxy().configure(
+      backendClient: _backendClient,
+      defaultToken: _token,
+    );
+    unawaited(InAppAudioStreamProxy().start());
 
     _listenToPlayerChanges();
     _connectWebSocket();

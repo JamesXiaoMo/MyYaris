@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:audio_session/audio_session.dart';
 import 'package:flutter/foundation.dart';
 import 'package:just_audio/just_audio.dart';
+import 'in_app_audio_stream_proxy.dart';
 
 class LocalTrackItem {
   final String id;
@@ -134,6 +135,13 @@ class BuiltInPlayerService {
       await _player.setVolume(_currentVolume);
       await _player.setLoopMode(LoopMode.all);
 
+      // 3. Start in-app loopback proxy for ExoPlayer network requests
+      try {
+        await InAppAudioStreamProxy().start();
+      } catch (e) {
+        debugPrint('[BuiltInPlayer] InAppAudioStreamProxy start note: $e');
+      }
+
       _isInitialized = true;
       debugPrint('[BuiltInPlayer] Initialized successfully with ${tracks.length} tracks.');
     } catch (e) {
@@ -164,7 +172,13 @@ class BuiltInPlayerService {
     );
     activeRemoteTrackNotifier.value = _activeRemoteTrack;
 
-    final uri = Uri.parse(streamUrl);
+    final token = headers?['X-Device-Token'] ??
+        headers?['Authorization']?.replaceAll('Bearer ', '');
+    final resolvedUrl = InAppAudioStreamProxy().resolveStreamUrl(
+      streamUrl,
+      token: token,
+    );
+    final uri = Uri.parse(resolvedUrl);
     final source = AudioSource.uri(uri, headers: headers);
     await _player.setAudioSource(source, initialPosition: initialPosition ?? Duration.zero);
     unawaited(_player.play());
