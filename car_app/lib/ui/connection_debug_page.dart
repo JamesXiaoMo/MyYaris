@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import '../services/backend_client.dart';
 import '../services/car_music_sync_service.dart';
 import '../services/storage_service.dart';
+import '../services/system_ui_service.dart';
 import '../services/task_poller_service.dart';
 
 class ConnectionDebugPage extends StatefulWidget {
@@ -25,6 +26,7 @@ class _ConnectionDebugPageState extends State<ConnectionDebugPage> {
 
   bool _isTestingConnection = false;
   String? _testResultNotice;
+  late bool _isFullscreen;
 
   @override
   void initState() {
@@ -32,6 +34,13 @@ class _ConnectionDebugPageState extends State<ConnectionDebugPage> {
     _urlController = TextEditingController(text: widget.storage.backendUrl);
     _deviceIdController = TextEditingController(text: widget.storage.deviceId);
     _tokenController = TextEditingController(text: widget.storage.carToken);
+    _isFullscreen = widget.storage.isFullscreenEnabled;
+  }
+
+  Future<void> _toggleFullscreen(bool value) async {
+    setState(() => _isFullscreen = value);
+    await widget.storage.setFullscreenEnabled(value);
+    await SystemUiService.setFullscreen(value);
   }
 
   @override
@@ -188,6 +197,58 @@ class _ConnectionDebugPageState extends State<ConnectionDebugPage> {
                           ),
                         ],
                       ),
+                      const Divider(color: Colors.white24, height: 20),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                        decoration: BoxDecoration(
+                          color: Colors.white.withValues(alpha: 0.05),
+                          borderRadius: BorderRadius.circular(6),
+                          border: Border.all(color: Colors.white12),
+                        ),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Row(
+                              children: [
+                                Icon(
+                                  _isFullscreen ? Icons.fullscreen : Icons.fullscreen_exit,
+                                  color: Colors.blueAccent,
+                                  size: 20,
+                                ),
+                                const SizedBox(width: 8),
+                                Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    const Text(
+                                      '全屏显示 (沉浸模式)',
+                                      style: TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      _isFullscreen
+                                          ? '已开启：隐藏系统状态栏，屏幕手势可临时呼出'
+                                          : '已关闭：恢复系统标准状态栏显示',
+                                      style: const TextStyle(color: Colors.white54, fontSize: 9.5),
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            ),
+                            Switch(
+                              value: _isFullscreen,
+                              activeThumbColor: Colors.blueAccent,
+                              onChanged: (val) async {
+                                setDialogState(() => _isFullscreen = val);
+                                await _toggleFullscreen(val);
+                              },
+                            ),
+                          ],
+                        ),
+                      ),
                       if (_testResultNotice != null) ...[
                         const SizedBox(height: 10),
                         Text(
@@ -306,6 +367,15 @@ class _ConnectionDebugPageState extends State<ConnectionDebugPage> {
               ],
             ),
             actions: [
+              IconButton(
+                tooltip: _isFullscreen ? '退出全屏' : '全屏显示',
+                onPressed: () => _toggleFullscreen(!_isFullscreen),
+                icon: Icon(
+                  _isFullscreen ? Icons.fullscreen_exit : Icons.fullscreen,
+                  color: Colors.white70,
+                  size: 20,
+                ),
+              ),
               IconButton(
                 tooltip: '连接参数配置',
                 onPressed: _showConfigDialog,

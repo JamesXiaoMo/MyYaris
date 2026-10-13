@@ -10,6 +10,9 @@ import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import com.ryanheise.audioservice.AudioServiceActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -17,19 +20,67 @@ import io.flutter.plugin.common.MethodChannel
 class MainActivity : AudioServiceActivity() {
     private val navChannelName = "com.myyaris.my_yaris/navigation"
     private val musicChannelName = "com.myyaris.my_yaris/music"
+    private val systemUiChannelName = "com.myyaris.my_yaris/system_ui"
+    private var isFullscreenConfigured: Boolean = true
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        try {
+            val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+            isFullscreenConfigured = prefs.getBoolean("flutter.myyaris_fullscreen_enabled", true)
+            applyFullscreen(isFullscreenConfigured)
+        } catch (_: Exception) {}
+
         // Ensure Foreground Service is started to keep process alive in background
         try {
             KeepAliveService.start(this)
         } catch (_: Exception) {}
     }
 
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && isFullscreenConfigured) {
+            applyFullscreen(true)
+        }
+    }
+
+    private fun applyFullscreen(enabled: Boolean) {
+        isFullscreenConfigured = enabled
+        runOnUiThread {
+            try {
+                WindowCompat.setDecorFitsSystemWindows(window, !enabled)
+                val controller = WindowCompat.getInsetsController(window, window.decorView)
+                if (enabled) {
+                    controller.hide(WindowInsetsCompat.Type.systemBars())
+                    controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                } else {
+                    controller.show(WindowInsetsCompat.Type.systemBars())
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         setupNavigationChannel(flutterEngine)
         setupMusicChannel(flutterEngine)
+        setupSystemUiChannel(flutterEngine)
+    }
+
+    private fun setupSystemUiChannel(flutterEngine: FlutterEngine) {
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, systemUiChannelName).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "setFullscreen" -> {
+                    val enabled = call.argument<Boolean>("enabled") ?: true
+                    applyFullscreen(enabled)
+                    result.success(true)
+                }
+                "isFullscreen" -> {
+                    result.success(isFullscreenConfigured)
+                }
+                else -> result.notImplemented()
+            }
+        }
     }
 
     private fun setupNavigationChannel(flutterEngine: FlutterEngine) {

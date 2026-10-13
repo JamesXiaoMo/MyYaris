@@ -33,6 +33,12 @@ class MockStorageService implements IStorageService {
   @override
   Future<void> setPollingEnabled(bool enabled) async => _pollingEnabled = enabled;
 
+  bool _fullscreenEnabled = true;
+  @override
+  bool get isFullscreenEnabled => _fullscreenEnabled;
+  @override
+  Future<void> setFullscreenEnabled(bool enabled) async => _fullscreenEnabled = enabled;
+
   @override
   Set<String> get processedTaskIds => Set.from(_processedIds);
   @override

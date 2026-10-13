@@ -16,6 +16,8 @@ abstract class IStorageService {
   Future<void> addProcessedTaskId(String taskId);
   List<PendingAck> get pendingAcks;
   Future<void> savePendingAcks(List<PendingAck> acks);
+  bool get isFullscreenEnabled;
+  Future<void> setFullscreenEnabled(bool enabled);
   List<TaskModel> get recentTasks;
   Future<void> addRecentTask(TaskModel task);
   Future<void> clearRecentTasks();
@@ -26,6 +28,7 @@ class SharedPreferencesStorageService implements IStorageService {
   static const String _keyDeviceId = 'myyaris_device_id';
   static const String _keyCarToken = 'myyaris_car_token';
   static const String _keyPollingEnabled = 'myyaris_polling_enabled';
+  static const String _keyFullscreenEnabled = 'myyaris_fullscreen_enabled';
   static const String _keyProcessedTaskIds = 'myyaris_processed_task_ids';
   static const String _keyPendingAcks = 'myyaris_pending_acks';
   static const String _keyRecentTasks = 'myyaris_recent_tasks';
@@ -81,6 +84,15 @@ class SharedPreferencesStorageService implements IStorageService {
   @override
   Future<void> setPollingEnabled(bool enabled) async {
     await _prefs.setBool(_keyPollingEnabled, enabled);
+  }
+
+  @override
+  bool get isFullscreenEnabled =>
+      _prefs.getBool(_keyFullscreenEnabled) ?? true;
+
+  @override
+  Future<void> setFullscreenEnabled(bool enabled) async {
+    await _prefs.setBool(_keyFullscreenEnabled, enabled);
   }
 
   @override
