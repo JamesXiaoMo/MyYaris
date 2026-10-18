@@ -19,6 +19,9 @@ paths = subprocess.check_output(['git', '-C', str(root), 'ls-files', '-z']).deco
 findings = []
 for name in filter(None, paths):
     p = root / name
+    if '.private' in Path(name).parts:
+        findings.append((name, 0, 'private local backup/evidence directory'))
+        continue
     if not p.is_file():
         continue
     if p.name == '.env' or p.suffix.lower() in {'.p12', '.mobileprovision', '.keystore', '.jks', '.db', '.sqlite'}:
