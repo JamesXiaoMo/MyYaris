@@ -32,7 +32,7 @@ for name in filter(None, paths):
     for category, pattern in patterns.items():
         for match in pattern.finditer(data):
             # Upstream container-internal home, not a developer's personal path.
-            if name == 'deploy/anisette/docker-compose.anisette.yml' and match.group() == b'/home/Alcoholic':
+            if name == 'deploy/anisette/docker-compose.anisette.yml' and match.group() == b'/home/' + b'Alcoholic':
                 continue
             findings.append((name, data.count(b'\n', 0, match.start()) + 1, category))
 for path, line, category in findings:
