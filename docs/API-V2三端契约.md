@@ -179,7 +179,7 @@ def resolve_car_device_id(input_id: Optional[str] = None, fallback_id: Optional[
    received        applied          failed (含 error_code / error_detail)
       │               ▲
       └───────────────┘ (最终执行完毕)
-      
+
       *超时未处理: expires_at 到期后自动标记为 expired
 ```
 

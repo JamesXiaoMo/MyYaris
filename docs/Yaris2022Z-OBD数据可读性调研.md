@@ -1,8 +1,8 @@
 # 日本 2022 款丰田 Yaris Z 混动 OBD-II 数据可读性与车机系统架构调研报告
 
-> **调研对象**：日本本土版 2022 年款丰田 Yaris（ヤリス）Z 混动版（1.5L HYBRID）  
-> **硬件配件**：Veepeak OBDCheck BLE+ 蓝牙 4.0 双模 OBD2 扫描器（Amazon ASIN: `B07VP1NHHX`）  
-> **宿主系统**：Ottocast P3 Pro 车机盒子（Android 13 / arm64）+ Flutter `car_app`  
+> **调研对象**：日本本土版 2022 年款丰田 Yaris（ヤリス）Z 混动版（1.5L HYBRID）
+> **硬件配件**：Veepeak OBDCheck BLE+ 蓝牙 4.0 双模 OBD2 扫描器（Amazon ASIN: `B07VP1NHHX`）
+> **宿主系统**：Ottocast P3 Pro 车机盒子（Android 13 / arm64）+ Flutter `car_app`
 > **报告性质**：**只读技术调研与架构可行性论证**（不连接实车、不写 ECU、不清除 DTC、不执行任何主动控制）
 
 ---
@@ -325,19 +325,19 @@ AT DP       --> 查看实际识别协议，预期输出: "ISO 15765-4 (CAN 11/50
 
 ## 6. 官方来源链接与权威参考
 
-1. **Amazon 日本商品详情（ASIN: B07VP1NHHX）**：  
-   `https://www.amazon.co.jp/dp/B07VP1NHHX`  
+1. **Amazon 日本商品详情（ASIN: B07VP1NHHX）**：
+   `https://www.amazon.co.jp/dp/B07VP1NHHX`
    （商品标题明确记载为 Veepeak OBDCheck BLE+，支持 iOS/Android 与 BimmerCode 官方推荐）
-2. **Veepeak 官方产品规格与手册（Veepeak Official Support）**：  
-   `https://www.veepeak.com/product/obdcheck-ble-plus/`  
+2. **Veepeak 官方产品规格与手册（Veepeak Official Support）**：
+   `https://www.veepeak.com/product/obdcheck-ble-plus/`
    （规格页明确记载支持 ELM327 v2.2 指令集，Android 推荐蓝牙设置配对 PIN 1234/0000）
-3. **丰田汽车（日本）官方 2022 年 8 月版 Yaris 主要诸元表（Toyota Japan Official Specs）**：  
-   `https://toyota.jp/pages/contents/yaris/001_p_001/4.0/pdf/spec/yaris_spec_202208.pdf`  
+3. **丰田汽车（日本）官方 2022 年 8 月版 Yaris 主要诸元表（Toyota Japan Official Specs）**：
+   `https://toyota.jp/pages/contents/yaris/001_p_001/4.0/pdf/spec/yaris_spec_202208.pdf`
    （第 1 页记载型式 6AA-MXPH10/15 与 M15A-FXE，电机 1NM/1MM，动力用主电池明确记载「リチウムイオン電池 4.3 Ah」）
-4. **Dr. Prius 官方支持车型清单（PriusApp Official Compatibility）**：  
-   `https://priusapp.com`  
+4. **Dr. Prius 官方支持车型清单（PriusApp Official Compatibility）**：
+   `https://priusapp.com`
    （官方列表涵盖 Prius/Aqua 等，经核对未列入 2022 款 Yaris XP210/MXPH10）
-5. **Car Scanner ELM OBD2 官方文档**：  
+5. **Car Scanner ELM OBD2 官方文档**：
    `https://www.carscanner.info`
 
 ---

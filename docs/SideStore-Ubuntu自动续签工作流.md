@@ -6,10 +6,10 @@
 
 ## 1. 可直接打开的流程图
 
-- [中文流程图 PNG](assets/SideStore-Ubuntu自动续签工作流.png)，1800 × 3290 像素。
+- 中文流程图 PNG（文件保留于本机，不随源码发布），1800 × 3290 像素。
 - [矢量流程图 SVG](assets/SideStore-Ubuntu自动续签工作流.svg)，可在浏览器放大。
 
-![SideStore＋Ubuntu R9000P 自动续签泳道图](assets/SideStore-Ubuntu自动续签工作流.png)
+（SideStore＋Ubuntu R9000P 自动续签泳道图：验证图保留于本机，不随源码发布）
 
 按上到下阅读：**首次准备 → 到期前续签 → 失败／到期恢复**。四条泳道分别表示 Ubuntu、iPhone、Apple 和 Mac。橙色是 Ubuntu 辅助操作，蓝色是手机执行，绿色是 Apple 授权，紫色是 Mac 构建，黄色是条件／待实测项。图中步骤是逻辑顺序，不是对工具内部请求次数或协议时序的精确描述。
 

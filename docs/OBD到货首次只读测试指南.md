@@ -1,8 +1,8 @@
 # 2022 款日本 Yaris Z 混动 OBD 模块（Veepeak BLE+）到货首次只读测试指南
 
-> **适用场景**：收到 Amazon 日本商品（ASIN: `B07VP1NHHX`，Veepeak OBDCheck BLE+）后的首次实车只读验证  
-> **测试对象**：2022 款日本本土版丰田 Yaris（ヤリス）Z 混动（1.5L HYBRID / M15A-FXE）  
-> **推荐软件**：**Car Scanner ELM OBD2**（推荐先使用官方免费基础功能进行首次连接与只读验证）  
+> **适用场景**：收到 Amazon 日本商品（ASIN: `B07VP1NHHX`，Veepeak OBDCheck BLE+）后的首次实车只读验证
+> **测试对象**：2022 款日本本土版丰田 Yaris（ヤリス）Z 混动（1.5L HYBRID / M15A-FXE）
+> **推荐软件**：**Car Scanner ELM OBD2**（推荐先使用官方免费基础功能进行首次连接与只读验证）
 > **核心原则**：**只读遥测、不写 ECU、不执行清码（No Mode 04）、驻车安全第一**
 
 ---

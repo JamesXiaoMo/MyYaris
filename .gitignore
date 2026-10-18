@@ -55,3 +55,6 @@ app.*.map.json
 *.jks
 *.keystore
 key.properties
+
+# Private local artifacts; never publish
+.private/
