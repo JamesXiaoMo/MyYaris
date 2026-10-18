@@ -5,6 +5,9 @@ import '../services/storage_service.dart';
 import '../services/task_poller_service.dart';
 import 'connection_debug_page.dart';
 import 'built_in_player_page.dart';
+import 'obd_dashboard_page.dart';
+import '../models/obd_telemetry.dart';
+import '../services/car_obd_service.dart';
 
 class CarHomePage extends StatefulWidget {
   final IStorageService storage;
@@ -560,6 +563,67 @@ class _CarHomePageState extends State<CarHomePage> {
                               );
                             },
                           ),
+                          ValueListenableBuilder<ObdTelemetry>(
+                            valueListenable: CarObdService().telemetryNotifier,
+                            builder: (context, tel, _) {
+                              final isReady = tel.status == ObdConnectionStatus.ready;
+                              final color = isReady ? Colors.tealAccent : Colors.grey;
+                              final text = isReady
+                                  ? (tel.batterySoc != null
+                                      ? 'OBD: ${tel.batterySoc!.toStringAsFixed(0)}%电'
+                                      : 'OBD在线')
+                                  : 'OBD离线';
+                              return Container(
+                                margin: const EdgeInsets.only(right: 6),
+                                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 5),
+                                decoration: BoxDecoration(
+                                  color: color.withValues(alpha: 0.15),
+                                  borderRadius: BorderRadius.circular(6),
+                                  border: Border.all(color: color.withValues(alpha: 0.4), width: 1),
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Container(
+                                      width: 6,
+                                      height: 6,
+                                      decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+                                    ),
+                                    const SizedBox(width: 4),
+                                    Text(
+                                      text,
+                                      style: TextStyle(color: color, fontSize: 10, fontWeight: FontWeight.bold),
+                                    ),
+                                  ],
+                                ),
+                              );
+                            },
+                          ),
+                          ElevatedButton.icon(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFF1B2A22),
+                              foregroundColor: Colors.greenAccent,
+                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(8),
+                                side: const BorderSide(color: Colors.greenAccent, width: 1),
+                              ),
+                            ),
+                            icon: const Icon(Icons.electric_car, size: 15, color: Colors.greenAccent),
+                            label: const Text(
+                              'OBD 混动车况',
+                              style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold),
+                            ),
+                            onPressed: () {
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (ctx) => const ObdDashboardPage(),
+                                ),
+                              );
+                            },
+                          ),
+                          const SizedBox(width: 8),
                           ElevatedButton.icon(
                             style: ElevatedButton.styleFrom(
                               backgroundColor: const Color(0xFF162E2E),
