@@ -342,16 +342,18 @@ def resolve_car_device_id(input_id: Optional[str] = None, fallback_id: Optional[
 
 ## 8. 行驶页单层收藏文件夹与分类收藏协同契约 (V2.2 扩展)
 
-详细规范见 [`docs/收藏夹API契约.md`](file:///path/to/user/Desktop/MyYaris/docs/收藏夹API契约.md)。核心接口摘要如下：
+详细规范见 [`docs/收藏夹API契约.md`](file:///path/to/user/Desktop/MyYaris/docs/收藏夹API契约.md)。核心接口与可靠性边界摘要如下：
 
 1. **单层文件夹 CRUD (`/api/v1/favorite-folders`，兼容别名 `/api/v1/favorites/folders`)**：
-   - `GET /api/v1/favorite-folders`：分页返回当前登录账号的文件夹列表（含每个文件夹的 `favorite_count`、分页 `has_more` 及未分类总数 `uncategorized_count`）；
-   - `POST /api/v1/favorite-folders`：创建文件夹（`name` 去空白后 1~64 字符，同账号内重名返回 `409 Conflict`）；
-   - `PATCH / PUT /api/v1/favorite-folders/{folder_id}`：重命名文件夹；
+   - `GET /api/v1/favorite-folders`：分页返回当前登录账号的文件夹列表（含每个文件夹的 `favorite_count`、分页 `has_more` 及未分类总数 `uncategorized_count`），采用 `ORDER BY <sort_by> ASC/DESC, id ASC/DESC` 二级稳定排序；
+   - `POST /api/v1/favorite-folders`：创建文件夹（`name` 去空白后 1~64 字符；同账号作用域内通过 SQLite 唯一索引 `uq_favorite_folders_scope_name_norm (owner_scope, name_norm)` 及 `IntegrityError -> 409 Conflict` 事务回滚映射保障并发重名拦截）；
+   - `PATCH / PUT /api/v1/favorite-folders/{folder_id}`：重命名文件夹（含并发重名 `409 Conflict` 保护）；
    - `DELETE /api/v1/favorite-folders/{folder_id}`：**同一数据库事务内将其下地址的 `folder_id` 置为 `NULL`（回到未分类）后删除文件夹**，严禁级联删除用户地址，返回 `moved_to_uncategorized_count`。
 2. **收藏地址归类与筛选 (`/api/v1/favorites`)**：
-   - `GET /api/v1/favorites`：支持 `folder_id=<fld_id>`（按文件夹筛选）、`uncategorized=true` 或 `folder_id=uncategorized`（筛选未分类 `folder_id IS NULL`）、省略参数（返回当前账号全部地址），响应包含 `folder_id`、`folder_name` 与 `has_more`；
-   - `POST /api/v1/favorites`：支持可选 `folder_id`；
+   - `GET /api/v1/favorites`：支持 `folder_id=<fld_id>`（按文件夹筛选，不存在或越权返回 `404`）、`uncategorized=true` 或 `folder_id=uncategorized`（筛选未分类 `folder_id IS NULL`）、省略参数（返回当前账号全部地址）；同时传 `uncategorized=true` 与具体 `folder_id=fld_xxx` 返回 `422`；采用 `<sort_by> + id` 二级稳定排序；
+   - `POST /api/v1/favorites`：支持可选 `folder_id`；**本接口无 `idempotency_key`，客户端超时严禁盲目自动重试**（防重复创建）；
    - `PATCH / PUT /api/v1/favorites/{favorite_id}`：未传 `folder_id` 时保持原归属不变；传 `"folder_id": "fld_xxx"` 移动到目标文件夹；传 `"folder_id": null` 或 `""` 移回未分类；
-   - **跨账号严格隔离**：禁止任何跨账号（含管理员跨用户、账号与 Legacy 池之间）的文件夹或地址引用。
+   - **重复 `DELETE` 处理**：重复删除同一文件夹或地址返回 `404 Not Found`，客户端收到 `404` 时应视为已删除并刷新列表；
+   - **新旧表约束说明**：新库建表 `favorites.folder_id` 含 `REFERENCES favorite_folders(id) ON DELETE SET NULL`；既有生产库通过 `ALTER TABLE favorites ADD COLUMN folder_id VARCHAR(64)` 迁移，不带底层 `REFERENCES` 外键约束，由应用层单事务 `UPDATE + DELETE`、写入归属校验与读取孤儿自愈提供等价保证。
+
 

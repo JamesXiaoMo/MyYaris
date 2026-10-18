@@ -51,7 +51,9 @@ iOS App 第二页「行驶」提供底部收藏抽屉，支持车主将常用地
 | `id` | String(64) | 是 | 自动生成 | 主键，格式 `fld_[12位十六进制]` | `"fld_9a8b7c6d5e4f"` |
 | `user_id` | String(64) | 否 | 当前账号ID | 外键关联 `users.id (ON DELETE CASCADE)`；Legacy 模式为 `null` | `"usr_123456"` |
 | `is_legacy` | Boolean | 是 | `false` | 是否属于过渡期 Legacy Token 池 | `false` |
-| `name` | String(64) | 是 | 无 | 文件夹名称，`strip()` 去空白后长度 `1..64`，同账号内大小写不敏感唯一 | `"日常通勤"` |
+| `owner_scope` | String(64) | 是 | 作用域键 | 内部唯一作用域键：登录账号为 `"user:<user_id>"`，Legacy 池为 `"__legacy__"` | `"user:usr_123456"` |
+| `name` | String(64) | 是 | 无 | 文件夹展示名称，`strip()` 去空白后长度 `1..64` | `"日常通勤"` |
+| `name_norm` | String(64) | 是 | 归一化名称 | 内部小写归一化名称 `lower(trim(name))`，与 `owner_scope` 组成数据库级唯一约束 `uq_favorite_folders_scope_name_norm` | `"日常通勤"` |
 | `favorite_count` | Integer | 是 | `0` | 响应计算字段：当前文件夹下的收藏地址数量 | `3` |
 | `created_at` | DateTime | 是 | UTC 当前时间 | 创建时间（ISO 8601 字符串格式返回） | `"2026-10-18T12:00:00+00:00"` |
 | `updated_at` | DateTime | 是 | UTC 当前时间 | 更新时间（ISO 8601 字符串格式返回） | `"2026-10-18T12:00:00+00:00"` |
@@ -61,7 +63,7 @@ iOS App 第二页「行驶」提供底部收藏抽屉，支持车主将常用地
 | 字段名 | 类型 | 必填 | 默认值 | 约束说明 | 示例 |
 | :--- | :--- | :---: | :--- | :--- | :--- |
 | `id` | String(64) | 是 | 自动生成 | 主键，格式 `fav_[12位十六进制]` | `"fav_a1b2c3d4e5f6"` |
-| `folder_id` | String(64) | 否 | `null` | 所属文件夹 ID（外键 `favorite_folders.id ON DELETE SET NULL`），`null` 表示未分类 | `"fld_9a8b7c6d5e4f"` |
+| `folder_id` | String(64) | 否 | `null` | 所属文件夹 ID（新库建表含 `REFERENCES favorite_folders(id) ON DELETE SET NULL`；既有库经 `ALTER TABLE ADD COLUMN` 迁移无底层 `REFERENCES` 约束，由应用层原子事务保障），`null` 表示未分类 | `"fld_9a8b7c6d5e4f"` |
 | `folder_name` | String(64) | 否 | `null` | 响应冗余字段：所属文件夹名称，未分类时为 `null` | `"日常通勤"` |
 | `name` | String(128) | 否 | `null` | 可选自定义名称/标签（如“家”、“公司”） | `"公司"` |
 | `address` | String(512) | 是 | 无 | 详细地址文本，去除前后空格后非空 | `"北京市海淀区中关村南大街1号"` |
@@ -83,10 +85,12 @@ iOS App 第二页「行驶」提供底部收藏抽屉，支持车主将常用地
   | 参数名 | 类型 | 必填 | 默认值 | 说明 |
   | :--- | :--- | :---: | :--- | :--- |
   | `limit` | Integer | 否 | 50 | 分页每页数量 (1 ~ 100) |
-  | `offset` | Integer | 否 | 0 | 偏移量 ($\ge 0$) |
+  | `offset` | Integer | 否 | 0 | 偏移量 ($\ge 0$)；当 `offset >= total` 时返回 `items: []`、`has_more: false` |
   | `sort_by` | String | 否 | `"created_at"` | 排序字段：`"created_at"` \| `"updated_at"` \| `"name"` |
   | `order` | String | 否 | `"asc"` | 排序方向：`"asc"` \| `"desc"` |
   | `search` | String | 否 | `null` | 文件夹名称关键字模糊搜索 |
+- **分页稳定次序与二级 `id` 排序说明**：
+  - 后端固定采用二级稳定排序：`ORDER BY <sort_by> ASC, id ASC`（或 `ORDER BY <sort_by> DESC, id DESC`），确保相同时间戳或相同名称下跨页翻页不漏项、不重项。
 - **成功响应 (`200 OK`)**：
 ```json
 {
@@ -115,9 +119,9 @@ iOS App 第二页「行驶」提供底部收藏抽屉，支持车主将常用地
   "name": "日常通勤"
 }
 ```
-- **校验与错误码**：
+- **校验、数据库唯一约束与并发冲突映射**：
   - 自动去除首尾空白；若为空白或长度超过 64 字符，返回 `HTTP 422 Unprocessable Entity`；
-  - 若当前账号下已存在同名文件夹（忽略大小写），返回 `HTTP 409 Conflict`；
+  - 同账号作用域内名称唯一性由「应用层预检 + SQLite 唯一索引 `uq_favorite_folders_scope_name_norm (owner_scope, name_norm)` / `uq_favorite_folders_user_expr` + `IntegrityError` 事务回滚并映射为 `HTTP 409 Conflict`」双重保障，彻底防止并发请求绕过重名校验；
 - **成功响应 (`201 Created`)**：返回新建的 `FavoriteFolderResponse` 对象。
 
 ### 4.3 重命名文件夹 (Rename Favorite Folder)
@@ -128,7 +132,7 @@ iOS App 第二页「行驶」提供底部收藏抽屉，支持车主将常用地
   "name": "周末出游"
 }
 ```
-- **错误码**：同账号重名返回 `HTTP 409 Conflict`；不存在或非当前账号所有返回 `HTTP 404 Not Found`。
+- **错误码**：同账号重名（含并发重命名触发数据库唯一约束 `IntegrityError`）返回 `HTTP 409 Conflict`；不存在或非当前账号所有返回 `HTTP 404 Not Found`。
 
 ### 4.4 删除文件夹 (Delete Favorite Folder — 地址自动归回未分类)
 - **请求方式 & 路径**：`DELETE /api/v1/favorite-folders/{folder_id}`（或 `DELETE /api/v1/favorites/folders/{folder_id}`）
@@ -155,12 +159,16 @@ iOS App 第二页「行驶」提供底部收藏抽屉，支持车主将常用地
   | 参数名 | 类型 | 必填 | 默认值 | 说明 |
   | :--- | :--- | :---: | :--- | :--- |
   | `limit` | Integer | 否 | 50 | 分页每页数量 (1 ~ 100) |
-  | `offset` | Integer | 否 | 0 | 偏移量 ($\ge 0$) |
+  | `offset` | Integer | 否 | 0 | 偏移量 ($\ge 0$)；当 `offset >= total` 时返回 `items: []`、`has_more: false` |
   | `sort_by` | String | 否 | `"created_at"` | `"created_at"` \| `"updated_at"` \| `"name"` |
   | `order` | String | 否 | `"desc"` | `"desc"` \| `"asc"` |
   | `search` | String | 否 | `null` | 关键字模糊搜索（匹配 `name` 或 `address`） |
-  | `folder_id` | String | 否 | `null` | 传入具体 `fld_xxx` 筛选该文件夹内地址；传入 `"uncategorized"` / `"null"` 筛选未分类地址；不传则返回全部 |
+  | `folder_id` | String | 否 | `null` | 传入具体 `fld_xxx` 筛选该文件夹内地址；传入 `"uncategorized"` / `"null"` / `"none"` 筛选未分类地址；不传则返回全部 |
   | `uncategorized` | Boolean | 否 | `null` | 传 `true` 仅返回未分类地址（`folder_id IS NULL`）；传 `false` 仅返回已分类地址 |
+- **分页稳定次序与冲突筛选规则**：
+  - **二级 `id` 稳定排序**：固定采用 `ORDER BY <sort_by> DESC/ASC, id DESC/ASC`；
+  - **冲突筛选拒绝 (`422`)**：若同时传入 `uncategorized=true` 与具体文件夹 `folder_id=fld_xxx`，属于语义冲突，直接返回 `HTTP 422 Unprocessable Entity`；
+  - **不存在或跨账号文件夹筛选 (`404`)**：若传入的 `folder_id` 不存在或不属于当前登录账号，返回 `HTTP 404 Not Found`。
 - **成功响应 (`200 OK`)**：
 ```json
 {
@@ -215,10 +223,44 @@ iOS App 第二页「行驶」提供底部收藏抽屉，支持车主将常用地
 
 ---
 
-## 6. 数据库持久化与幂等迁移说明
+## 6. 全量错误码与客户端重试/幂等语义规范
 
-1. **表结构与启动迁移 (`run_db_migrations`)**：
-   - 新增 `favorite_folders` 表；
-   - 在既有 `favorites` 表上幂等检测并执行 `ALTER TABLE favorites ADD COLUMN folder_id VARCHAR(64)`，同时建立 `ix_favorites_folder_id` 与 `ix_favorite_folders_user_id` 索引；
-   - 既有未归类地址的 `folder_id` 自动保持为 `NULL`（未分类），100% 无损兼容历史数据。
+### 6.1 统一错误状态码表
+
+| HTTP 状态码 | 触发场景 | 客户端处理建议 |
+| :--- | :--- | :--- |
+| **`401 Unauthorized`** | 未携带会话/Token、Token 为空或登录会话已过期/注销 | 引导用户重新登录或刷新鉴权态 |
+| **`403 Forbidden`** | 1. 车机角色 (`car`) 调用收藏夹/文件夹接口；<br>2. Cookie 鉴权写操作 (`POST`/`PATCH`/`PUT`/`DELETE`) 缺失或携带无效 `X-CSRF-Token` | 停止自动重试；检查当前角色或补齐 CSRF Token |
+| **`404 Not Found`** | 1. 目标 `favorite_id` 或 `folder_id` 不存在或已被删除；<br>2. 跨账号（含管理员跨用户、账号与 Legacy 池互引）访问或归类引用 | 若为删除操作或按文件夹筛选报 `404`，客户端应回退至「全部/未分类」视图并重新拉取列表 |
+| **`409 Conflict`** | 新建或重命名文件夹时，规范化名称 `lower(trim(name))` 在当前账号作用域内已存在（含并发请求触发 SQLite 唯一约束 `IntegrityError`） | 提示用户“该文件夹名称已存在”，并可刷新文件夹列表 |
+| **`422 Unprocessable Entity`** | 1. 地址或文件夹名为空/纯空白，或文件夹名超过 64 字符；<br>2. 经纬度越界或非有限数值，或 `coord_system != "wgs84"`；<br>3. `GET /api/v1/favorites` 同时传入 `uncategorized=true` 与具体 `folder_id=fld_xxx` | 修正表单输入或查询参数，禁止原样重试 |
+
+### 6.2 客户端重试与幂等边界规范
+1. **重复 `DELETE` 与 `404` 刷新处理**：
+   - `DELETE /api/v1/favorite-folders/{folder_id}` 与 `DELETE /api/v1/favorites/{favorite_id}` 首次成功删除返回 `200 OK`；
+   - 若首次请求在服务端提交成功后因网络抖动超时，客户端再次发起 `DELETE` 将收到 `404 Not Found`；
+   - **客户端规范**：删除请求收到 `200 OK` 或重试收到 `404 Not Found` 时，均应视为目标记录已不存在，立即刷新文件夹列表（`GET /api/v1/favorite-folders`）与收藏地址列表（`GET /api/v1/favorites`），避免 UI 卡在已删除文件夹上。
+2. **`POST` 超时严禁盲目自动重试**：
+   - **`POST /api/v1/favorites`（无 `idempotency_key`）**：当前接口未设幂等键（`idempotency_key`），也不对相同坐标/地址做唯一性拦截（允许用户收藏同一大厦的不同备注项）。因此**当 `POST /api/v1/favorites` 发生网络超时或连接中断时，客户端严禁静默盲目重试**，否则可能产生重复收藏项；超时后应先拉取列表确认或提示用户手动重试。
+   - **`POST /api/v1/favorite-folders`**：受数据库级 `(owner_scope, name_norm)` 唯一索引保护，若首次请求已落库而响应超时，重试同名请求将稳定返回 `409 Conflict`，客户端收到 `409` 后直接刷新文件夹列表即可对齐服务端状态。
+3. **`PATCH / PUT` 幂等性**：
+   - 更新地址或重命名文件夹为按字段覆盖操作，相同 Payload 重复提交具有状态幂等性。
+
+---
+
+## 7. 数据库持久化、新旧表约束差异与幂等迁移说明
+
+1. **新表创建 vs 既有表 `ALTER TABLE` 迁移的底层约束差异（如实声明）**：
+   - **全新初始化的数据库（`Base.metadata.create_all`）**：`favorites` 表建表 DDL 包含 `folder_id VARCHAR(64) REFERENCES favorite_folders(id) ON DELETE SET NULL` 外键声明；`favorite_folders` 表包含 `UniqueConstraint("owner_scope", "name_norm", name="uq_favorite_folders_scope_name_norm")`。
+   - **既有数据库增量迁移（如 R9000P 生产库 `run_db_migrations`）**：
+     - 对既有的 `favorites` 表，SQLite 通过 `ALTER TABLE favorites ADD COLUMN folder_id VARCHAR(64)` 新增列；受 SQLite `ALTER TABLE ADD COLUMN` 语法特性决定，该增量列**在底层表结构上不附带 `REFERENCES favorite_folders(id)` 外键约束**（避免重建整表带来生产数据风险）。
+     - 对 `favorite_folders` 表，迁移脚本幂等补齐 `owner_scope` 与 `name_norm` 列、回填既有数据，并创建两个数据库级唯一索引：`uq_favorite_folders_scope_name_norm ON favorite_folders (owner_scope, name_norm)` 与表达式唯一索引 `uq_favorite_folders_user_expr ON favorite_folders (coalesce(user_id, '__legacy__'), is_legacy, lower(trim(name)))`。
+2. **应用层原子事务与读取兜底保护**：
+   - 鉴于增量迁移后的 `favorites.folder_id` 不依赖底层 SQLite 外键级联，后端在应用层实施了完整闭环保护：
+     1. **写入强校验**：`POST / PATCH / PUT /api/v1/favorites` 写入非空 `folder_id` 前，強制通过 `_get_owned_folder_or_404` 校验目标文件夹存在且归属同一账号作用域；
+     2. **删除文件夹单事务归回未分类**：`DELETE /api/v1/favorite-folders/{folder_id}` 在**同一个 SQLAlchemy 事务**内先执行 `UPDATE favorites SET folder_id = NULL, updated_at = :now WHERE folder_id = :folder_id`，再执行 `DELETE FROM favorite_folders WHERE id = :folder_id`，统一 `db.commit()`；
+     3. **读取孤儿引用自愈**：`_to_favorite_response` 序列化时若发现 `row.folder` 为空或作用域不一致，自动将响应中的 `folder_id` 与 `folder_name` 归一化为 `null`。
+3. **生产数据零破坏保障**：
+   - 迁移全程仅做幂等 `CREATE TABLE IF NOT EXISTS`、`ALTER TABLE ADD COLUMN`、`UPDATE` 空值回填与 `CREATE [UNIQUE] INDEX IF NOT EXISTS`，绝不执行 `DROP TABLE` 或清空既有用户与收藏数据。
+
 
