@@ -337,3 +337,21 @@ def resolve_car_device_id(input_id: Optional[str] = None, fallback_id: Optional[
 2. **手机端 (`ios_app`) 后续对齐任务**：
    - 现有的 `command_ack` 是即时提交成功握手；
    - 可在 `consumeRealtime` 监听 `type == 'command_status'`，根据 `applied` 或 `failed` 刷新 UI 状态与弹窗报错。
+
+---
+
+## 8. 行驶页单层收藏文件夹与分类收藏协同契约 (V2.2 扩展)
+
+详细规范见 [`docs/收藏夹API契约.md`](file:///path/to/user/Desktop/MyYaris/docs/收藏夹API契约.md)。核心接口摘要如下：
+
+1. **单层文件夹 CRUD (`/api/v1/favorite-folders`，兼容别名 `/api/v1/favorites/folders`)**：
+   - `GET /api/v1/favorite-folders`：分页返回当前登录账号的文件夹列表（含每个文件夹的 `favorite_count`、分页 `has_more` 及未分类总数 `uncategorized_count`）；
+   - `POST /api/v1/favorite-folders`：创建文件夹（`name` 去空白后 1~64 字符，同账号内重名返回 `409 Conflict`）；
+   - `PATCH / PUT /api/v1/favorite-folders/{folder_id}`：重命名文件夹；
+   - `DELETE /api/v1/favorite-folders/{folder_id}`：**同一数据库事务内将其下地址的 `folder_id` 置为 `NULL`（回到未分类）后删除文件夹**，严禁级联删除用户地址，返回 `moved_to_uncategorized_count`。
+2. **收藏地址归类与筛选 (`/api/v1/favorites`)**：
+   - `GET /api/v1/favorites`：支持 `folder_id=<fld_id>`（按文件夹筛选）、`uncategorized=true` 或 `folder_id=uncategorized`（筛选未分类 `folder_id IS NULL`）、省略参数（返回当前账号全部地址），响应包含 `folder_id`、`folder_name` 与 `has_more`；
+   - `POST /api/v1/favorites`：支持可选 `folder_id`；
+   - `PATCH / PUT /api/v1/favorites/{favorite_id}`：未传 `folder_id` 时保持原归属不变；传 `"folder_id": "fld_xxx"` 移动到目标文件夹；传 `"folder_id": null` 或 `""` 移回未分类；
+   - **跨账号严格隔离**：禁止任何跨账号（含管理员跨用户、账号与 Legacy 池之间）的文件夹或地址引用。
+
