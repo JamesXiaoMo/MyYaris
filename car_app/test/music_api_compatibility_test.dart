@@ -30,13 +30,13 @@ void main() {
     });
 
     test('buildLocalStreamUrl constructs standard V2 HTTP 206 stream URL', () {
-      final url = client.buildLocalStreamUrl('http://192.0.2.10:8000', 'track_42');
-      expect(url, 'http://192.0.2.10:8000/api/v1/music/stream/track_42');
+      final url = client.buildLocalStreamUrl('http://192.0.2.1:8000', 'track_42');
+      expect(url, 'http://192.0.2.1:8000/api/v1/music/stream/track_42');
     });
 
     test('buildNeteaseStreamUrl constructs standard V2 NetEase stream URL', () {
-      final url = client.buildNeteaseStreamUrl('http://192.0.2.10:8000', '1901371647');
-      expect(url, 'http://192.0.2.10:8000/api/v1/music/netease/stream/1901371647');
+      final url = client.buildNeteaseStreamUrl('http://192.0.2.1:8000', '1901371647');
+      expect(url, 'http://192.0.2.1:8000/api/v1/music/netease/stream/1901371647');
     });
 
     test('buildLocalStreamUrl handles trailing slashes in baseUrl gracefully', () {

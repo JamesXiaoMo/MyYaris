@@ -66,11 +66,31 @@ class BackendClient {
   final HttpClient _httpClient;
   final Map<String, String> _fallbackDns;
 
-  /// Default authorized Tailnet hostname-to-IP fallback mappings.
+  /// Default authorized hostname-to-IP fallback mappings.
   /// Strictly maintains TLS SNI, host header, certificate chain, and hostname verification.
-  static const Map<String, String> defaultFallbackDns = {
-    'myyaris.example.com': '192.0.2.10',
-  };
+  /// Configurable at build-time via --dart-define:
+  ///   --dart-define=MYYARIS_FALLBACK_DNS_JSON='{"host.example.com":"192.0.2.1"}'
+  ///   --dart-define=MYYARIS_FALLBACK_DNS_HOST=host.example.com --dart-define=MYYARIS_FALLBACK_DNS_IP=192.0.2.1
+  /// Defaults to an empty map so no private IPs or hostnames are hardcoded in source.
+  static Map<String, String> get defaultFallbackDns => parseFallbackDnsFromEnvironment();
+
+  static Map<String, String> parseFallbackDnsFromEnvironment() {
+    const jsonStr = String.fromEnvironment('MYYARIS_FALLBACK_DNS_JSON', defaultValue: '');
+    if (jsonStr.isNotEmpty) {
+      try {
+        final decoded = json.decode(jsonStr);
+        if (decoded is Map) {
+          return decoded.map((k, v) => MapEntry(k.toString().trim(), v.toString().trim()));
+        }
+      } catch (_) {}
+    }
+    const host = String.fromEnvironment('MYYARIS_FALLBACK_DNS_HOST', defaultValue: '');
+    const ip = String.fromEnvironment('MYYARIS_FALLBACK_DNS_IP', defaultValue: '');
+    if (host.isNotEmpty && ip.isNotEmpty) {
+      return {host.trim(): ip.trim()};
+    }
+    return const {};
+  }
 
   BackendClient({
     HttpClient? httpClient,

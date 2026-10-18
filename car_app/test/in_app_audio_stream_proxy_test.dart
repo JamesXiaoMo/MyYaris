@@ -62,7 +62,7 @@ void main() {
       // 2. Setup proxy with mock backend client routing to mock upstream server
       mockBackendClient = BackendClient(
         fallbackDns: {
-          'myyaris.example.com': '127.0.0.1',
+          'mock-stream-node.ts.net': '127.0.0.1',
         },
       );
 
@@ -91,7 +91,7 @@ void main() {
       expect(proxy.resolveStreamUrl('http://127.0.0.1:8000/test'), 'http://127.0.0.1:8000/test');
 
       // Tailnet stream URL is converted to loopback proxy URL
-      const originalUrl = 'https://myyaris.example.com/api/v1/music/netease/stream/1830260053';
+      const originalUrl = 'https://mock-stream-node.ts.net/api/v1/music/netease/stream/1830260053';
       final resolved = proxy.resolveStreamUrl(originalUrl, token: 'car-secret-token');
 
       expect(resolved.startsWith('http://127.0.0.1:${proxy.port}/stream?'), isTrue);
@@ -102,7 +102,7 @@ void main() {
 
     test('Proxy streams HTTP 206 Partial Content with Range forwarding to client', () async {
       final client = HttpClient();
-      final upstreamUrl = 'https://myyaris.example.com:${mockUpstreamServer.port}/api/v1/music/netease/stream/1830260053';
+      final upstreamUrl = 'http://mock-stream-node.ts.net:${mockUpstreamServer.port}/api/v1/music/netease/stream/1830260053';
       final proxyUrl = proxy.resolveStreamUrl(upstreamUrl, token: 'custom-car-token');
 
       final req = await client.getUrl(Uri.parse(proxyUrl));
@@ -127,7 +127,7 @@ void main() {
 
     test('Proxy handles HEAD requests and converts to safe metadata queries', () async {
       final client = HttpClient();
-      final upstreamUrl = 'https://myyaris.example.com:${mockUpstreamServer.port}/api/v1/music/netease/stream/1830260053';
+      final upstreamUrl = 'http://mock-stream-node.ts.net:${mockUpstreamServer.port}/api/v1/music/netease/stream/1830260053';
       final proxyUrl = proxy.resolveStreamUrl(upstreamUrl);
 
       final req = await client.headUrl(Uri.parse(proxyUrl));

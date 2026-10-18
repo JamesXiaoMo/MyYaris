@@ -2,7 +2,9 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:my_yaris/services/backend_client.dart';
+import 'package:my_yaris/services/storage_service.dart';
 
 // Test CA Certificate (Self-signed Root CA: CN=TestRootCA)
 const String testCaCertPem = '''
@@ -156,12 +158,9 @@ Um0jfcV66OcI1vJ/pW6Xu5bq2z7Br0aV2j60M0cEus2vK6T2beEneVx2scqkd5hP
 
 void main() {
   group('BackendClient DNS Fallback & Strict TLS Verification (Hermetic Local Tests)', () {
-    test('Default fallback DNS mapping contains authorized backend host', () {
+    test('Default fallback DNS mapping defaults to empty when unconfigured', () {
       final client = BackendClient();
-      expect(
-        client.fallbackDns['myyaris.example.com'],
-        '192.0.2.10',
-      );
+      expect(client.fallbackDns, isEmpty);
       client.close();
     });
 
@@ -169,8 +168,13 @@ void main() {
       final customMap = {'myyaris.example.com': '192.0.2.10'};
       final client = BackendClient(fallbackDns: customMap);
       expect(client.fallbackDns['myyaris.example.com'], '192.0.2.10');
-      expect(client.fallbackDns.containsKey('myyaris.example.com'), false);
+      expect(client.fallbackDns.containsKey('other.example.com'), false);
       client.close();
+    });
+
+    test('parseFallbackDnsFromEnvironment handles empty/null gracefully', () {
+      final parsed = BackendClient.parseFallbackDnsFromEnvironment();
+      expect(parsed, isA<Map<String, String>>());
     });
 
     test('Hermetic Test: Valid Host & Trusted CA via IP fallback succeeds with 200 OK', () async {
@@ -394,18 +398,52 @@ void main() {
     });
 
     test('Live Backend Connectivity (Conditional: skipped when network unavailable)', () async {
+      const liveUrl = String.fromEnvironment('MYYARIS_LIVE_TEST_URL', defaultValue: '');
+      if (liveUrl.isEmpty) {
+        markTestSkipped('Live test URL not configured. Set --dart-define=MYYARIS_LIVE_TEST_URL=https://... to run.');
+        return;
+      }
       final client = BackendClient();
       try {
-        final ok = await client.checkHealth('https://myyaris.example.com');
-        // If on Tailscale network, it will be true; if offline, ok is false
-        // This test documents the live state without breaking offline test runners.
+        final ok = await client.checkHealth(liveUrl);
         expect(ok, isTrue);
       } catch (e) {
-        // Explicitly report offline condition
-        markTestSkipped('Remote Tailscale backend not reachable in current offline test runner context.');
+        markTestSkipped('Remote backend not reachable in current offline test runner context: $e');
       } finally {
         client.close();
       }
+    });
+  });
+
+  group('Configuration Compatibility & Existing Persistence Validation', () {
+    test('Default defaultBackendUrl points to RFC 2606 example domain', () {
+      expect(
+        SharedPreferencesStorageService.defaultBackendUrl,
+        'https://backend.example.com',
+      );
+    });
+
+    test('Existing persisted backend URL in SharedPreferences takes priority over default', () async {
+      SharedPreferences.setMockInitialValues({
+        'myyaris_backend_url': 'https://custom-existing-server.tailscale.net',
+      });
+      final storage = await SharedPreferencesStorageService.create();
+      expect(storage.backendUrl, 'https://custom-existing-server.tailscale.net');
+    });
+
+    test('SharedPreferencesStorageService persists and retrieves fallback DNS mapping', () async {
+      SharedPreferences.setMockInitialValues({});
+      final storage = await SharedPreferencesStorageService.create();
+      expect(storage.fallbackDns, isEmpty);
+
+      final mapping = {'node1.test': '192.0.2.1', 'node2.test': '198.51.100.2'};
+      await storage.setFallbackDns(mapping);
+
+      expect(storage.fallbackDns, mapping);
+
+      // Verify across fresh storage instance reading the same SharedPreferences
+      final freshStorage = await SharedPreferencesStorageService.create();
+      expect(freshStorage.fallbackDns, mapping);
     });
   });
 }

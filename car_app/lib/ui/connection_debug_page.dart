@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import '../services/backend_client.dart';
 import '../services/car_music_sync_service.dart';
@@ -23,6 +24,7 @@ class _ConnectionDebugPageState extends State<ConnectionDebugPage> {
   late final TextEditingController _urlController;
   late final TextEditingController _deviceIdController;
   late final TextEditingController _tokenController;
+  late final TextEditingController _fallbackDnsController;
 
   bool _isTestingConnection = false;
   String? _testResultNotice;
@@ -34,6 +36,9 @@ class _ConnectionDebugPageState extends State<ConnectionDebugPage> {
     _urlController = TextEditingController(text: widget.storage.backendUrl);
     _deviceIdController = TextEditingController(text: widget.storage.deviceId);
     _tokenController = TextEditingController(text: widget.storage.carToken);
+    final dnsMap = widget.storage.fallbackDns;
+    final dnsText = dnsMap.entries.map((e) => '${e.key}=${e.value}').join(', ');
+    _fallbackDnsController = TextEditingController(text: dnsText);
     _isFullscreen = widget.storage.isFullscreenEnabled;
   }
 
@@ -48,6 +53,7 @@ class _ConnectionDebugPageState extends State<ConnectionDebugPage> {
     _urlController.dispose();
     _deviceIdController.dispose();
     _tokenController.dispose();
+    _fallbackDnsController.dispose();
     super.dispose();
   }
 
@@ -55,23 +61,48 @@ class _ConnectionDebugPageState extends State<ConnectionDebugPage> {
     final newUrl = _urlController.text.trim();
     final newDeviceId = _deviceIdController.text.trim();
     final newToken = _tokenController.text.trim();
+    final rawDns = _fallbackDnsController.text.trim();
+
+    final newDns = <String, String>{};
+    if (rawDns.isNotEmpty) {
+      if (rawDns.startsWith('{') && rawDns.endsWith('}')) {
+        try {
+          final decoded = json.decode(rawDns);
+          if (decoded is Map) {
+            for (final entry in decoded.entries) {
+              newDns[entry.key.toString().trim()] = entry.value.toString().trim();
+            }
+          }
+        } catch (_) {}
+      } else {
+        final pairs = rawDns.split(RegExp(r'[,;\n]'));
+        for (final pair in pairs) {
+          final parts = pair.split(RegExp(r'[:=]'));
+          if (parts.length == 2 && parts[0].trim().isNotEmpty && parts[1].trim().isNotEmpty) {
+            newDns[parts[0].trim()] = parts[1].trim();
+          }
+        }
+      }
+    }
 
     await widget.storage.setBackendUrl(newUrl);
     await widget.storage.setDeviceId(newDeviceId);
     await widget.storage.setCarToken(newToken);
+    await widget.storage.setFallbackDns(newDns);
 
     if (newUrl.isNotEmpty) {
       CarMusicSyncService().start(
         baseUrl: newUrl,
         deviceId: newDeviceId,
         token: newToken,
+        fallbackDns: newDns,
       );
     }
 
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('配置已保存 (令牌仅在车机本地运行时加密保存，未硬编码至源码)'),
+          content: Text('配置已保存 (令牌与网络映射仅在本地运行时保存，未硬编码至源码)'),
           duration: Duration(seconds: 2),
         ),
       );
@@ -84,7 +115,7 @@ class _ConnectionDebugPageState extends State<ConnectionDebugPage> {
       _testResultNotice = null;
     });
 
-    final client = BackendClient();
+    final client = BackendClient(fallbackDns: widget.storage.fallbackDns);
     final url = _urlController.text.trim();
     final ok = await client.checkHealth(url);
     client.close();
@@ -124,7 +155,7 @@ class _ConnectionDebugPageState extends State<ConnectionDebugPage> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       const Text(
-                        'HTTPS 后端地址 (R9000P Tailscale):',
+                        'HTTPS 后端地址 (Tailscale / 本地服务):',
                         style: TextStyle(color: Colors.white70, fontSize: 11),
                       ),
                       const SizedBox(height: 2),
@@ -132,7 +163,25 @@ class _ConnectionDebugPageState extends State<ConnectionDebugPage> {
                         controller: _urlController,
                         style: const TextStyle(color: Colors.white, fontSize: 12),
                         decoration: InputDecoration(
-                          hintText: 'https://myyaris.example.com',
+                          hintText: 'https://backend.example.com',
+                          filled: true,
+                          isDense: true,
+                          fillColor: Colors.black26,
+                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(6)),
+                          contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      const Text(
+                        '后端 IP 映射 (可选 DNS Fallback, 格式 host=ip 或 JSON):',
+                        style: TextStyle(color: Colors.white70, fontSize: 11),
+                      ),
+                      const SizedBox(height: 2),
+                      TextField(
+                        controller: _fallbackDnsController,
+                        style: const TextStyle(color: Colors.white, fontSize: 12),
+                        decoration: InputDecoration(
+                          hintText: '如: your-node.ts.net=192.0.2.10',
                           filled: true,
                           isDense: true,
                           fillColor: Colors.black26,

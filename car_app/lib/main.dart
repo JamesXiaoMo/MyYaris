@@ -47,6 +47,7 @@ void main() async {
       baseUrl: storage.backendUrl,
       deviceId: storage.deviceId,
       token: storage.carToken,
+      fallbackDns: storage.fallbackDns,
     );
   }
 

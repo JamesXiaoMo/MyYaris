@@ -45,6 +45,7 @@ class _CarHomePageState extends State<CarHomePage> {
         baseUrl: widget.storage.backendUrl,
         deviceId: widget.storage.deviceId,
         token: widget.storage.carToken,
+        fallbackDns: widget.storage.fallbackDns,
       );
     }
     _checkPermissionAndRefreshInfo();
@@ -515,9 +516,13 @@ class _CarHomePageState extends State<CarHomePage> {
                         ],
                       ),
                       // Top Action Buttons (Built-in Player PoC & Debug Page)
-                      Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
+                      Expanded(
+                        child: SingleChildScrollView(
+                          scrollDirection: Axis.horizontal,
+                          reverse: true,
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
                           ValueListenableBuilder<MusicSyncMode>(
                             valueListenable: CarMusicSyncService().syncModeNotifier,
                             builder: (context, mode, _) {
@@ -678,6 +683,8 @@ class _CarHomePageState extends State<CarHomePage> {
                           ),
                         ],
                       ),
+                    ),
+                  ),
                     ],
                   ),
                   const SizedBox(height: 6),

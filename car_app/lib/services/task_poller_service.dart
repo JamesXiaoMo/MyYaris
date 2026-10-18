@@ -34,7 +34,11 @@ class TaskPollerService extends ChangeNotifier {
   TaskPollerService({
     required this.storage,
     BackendClient? client,
-  })  : _client = client ?? BackendClient();
+  })  : _client = client ??
+            BackendClient(
+              fallbackDns:
+                  storage.fallbackDns.isNotEmpty ? storage.fallbackDns : null,
+            );
 
   PollerStatus get status => _status;
   String get statusMessage => _statusMessage;

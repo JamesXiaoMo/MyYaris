@@ -1,11 +1,14 @@
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/task_model.dart';
+import 'backend_client.dart';
 
 abstract class IStorageService {
   Future<void> init();
   String get backendUrl;
   Future<void> setBackendUrl(String url);
+  Map<String, String> get fallbackDns;
+  Future<void> setFallbackDns(Map<String, String> mapping);
   String get deviceId;
   Future<void> setDeviceId(String id);
   String get carToken;
@@ -25,6 +28,7 @@ abstract class IStorageService {
 
 class SharedPreferencesStorageService implements IStorageService {
   static const String _keyBackendUrl = 'myyaris_backend_url';
+  static const String _keyFallbackDns = 'myyaris_fallback_dns';
   static const String _keyDeviceId = 'myyaris_device_id';
   static const String _keyCarToken = 'myyaris_car_token';
   static const String _keyPollingEnabled = 'myyaris_polling_enabled';
@@ -33,8 +37,13 @@ class SharedPreferencesStorageService implements IStorageService {
   static const String _keyPendingAcks = 'myyaris_pending_acks';
   static const String _keyRecentTasks = 'myyaris_recent_tasks';
 
-  static const String defaultBackendUrl =
-      'https://myyaris.example.com';
+  /// Default backend URL can be configured at compile time via:
+  /// `--dart-define=MYYARIS_DEFAULT_BACKEND_URL=https://...`
+  /// Defaults to an RFC 2606 reserved example domain so no private URLs are baked into the repository.
+  static const String defaultBackendUrl = String.fromEnvironment(
+    'MYYARIS_DEFAULT_BACKEND_URL',
+    defaultValue: 'https://backend.example.com',
+  );
   static const String defaultDeviceId = 'car_p3pro';
 
   final SharedPreferences _prefs;
@@ -58,6 +67,25 @@ class SharedPreferencesStorageService implements IStorageService {
   @override
   Future<void> setBackendUrl(String url) async {
     await _prefs.setString(_keyBackendUrl, url.trim());
+  }
+
+  @override
+  Map<String, String> get fallbackDns {
+    final raw = _prefs.getString(_keyFallbackDns);
+    if (raw != null && raw.isNotEmpty) {
+      try {
+        final decoded = json.decode(raw);
+        if (decoded is Map) {
+          return decoded.map((k, v) => MapEntry(k.toString().trim(), v.toString().trim()));
+        }
+      } catch (_) {}
+    }
+    return BackendClient.defaultFallbackDns;
+  }
+
+  @override
+  Future<void> setFallbackDns(Map<String, String> mapping) async {
+    await _prefs.setString(_keyFallbackDns, json.encode(mapping));
   }
 
   @override

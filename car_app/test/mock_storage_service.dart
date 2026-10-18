@@ -2,7 +2,8 @@ import 'package:my_yaris/models/task_model.dart';
 import 'package:my_yaris/services/storage_service.dart';
 
 class MockStorageService implements IStorageService {
-  String _url = 'https://mock.backend.ts.net';
+  String _url = 'https://mock.backend.example.com';
+  Map<String, String> _fallbackDns = {};
   String _deviceId = 'car_p3pro';
   String _carToken = 'test-token';
   bool _pollingEnabled = false;
@@ -17,6 +18,12 @@ class MockStorageService implements IStorageService {
   String get backendUrl => _url;
   @override
   Future<void> setBackendUrl(String url) async => _url = url;
+
+  @override
+  Map<String, String> get fallbackDns => Map.unmodifiable(_fallbackDns);
+  @override
+  Future<void> setFallbackDns(Map<String, String> mapping) async =>
+      _fallbackDns = Map.from(mapping);
 
   @override
   String get deviceId => _deviceId;

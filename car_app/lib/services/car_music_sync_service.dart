@@ -63,6 +63,7 @@ class CarMusicSyncService {
     required String deviceId,
     required String token,
     BackendClient? backendClient,
+    Map<String, String>? fallbackDns,
   }) {
     if (_isRunning) stop();
 
@@ -72,7 +73,12 @@ class CarMusicSyncService {
     }
     _deviceId = deviceId.trim();
     _token = token.trim();
-    _backendClient = backendClient ?? BackendClient();
+    _backendClient = backendClient ??
+        BackendClient(
+          fallbackDns: (fallbackDns != null && fallbackDns.isNotEmpty)
+              ? fallbackDns
+              : null,
+        );
     _isRunning = true;
 
     InAppAudioStreamProxy().configure(
