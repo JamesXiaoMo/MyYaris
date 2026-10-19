@@ -385,22 +385,29 @@ def resolve_car_device_id(input_id: Optional[str] = None, fallback_id: Optional[
 ### 6.1 播控 Action 枚举
 | Action | 支持别名 | 关键参数 (`params`) | 说明 |
 | :--- | :--- | :--- | :--- |
-| `play_track` | `play` | `track_id`, `stream_url`, `title`, `artist`, `seek_ms` / `seek_position_ms`, `loop_mode`, `shuffle` | 播放指定音轨（媒体流为相对路径 `/api/v1/music/netease/stream/{id}`） |
-| `set_playback_mode` | - | `mode` (`list_loop` \| `shuffle` \| `intelligence` \| `single_loop`), `seed_track_id`, `expected_queue_id`, `expected_queue_version` | 显式切换播放模式（需车机 `queue_v2` 能力门禁） |
-| `switch_queue` | - | `source` (`netease_favorite` \| `netease_intelligence` \| `single_track`), `start_index`, `start_track_id` | 显式切换播放队列源（需车机 `queue_v2` 能力门禁） |
+| `play_track` | `play` | `song_id`, `track_id`, `stream_url`, `title`, `artist`, `seek_position_ms` | 播放指定音轨。若曲目为当前激活队列（如喜欢歌单）成员，保持当前队列与 `source` 并更新 `queue_index`；若为非列表单曲，准备临时 `single_track` 队列 |
+| `set_playback_mode` | - | `mode` (`list_loop` \| `shuffle` \| `intelligence` \| `single_loop`), `seed_song_id`, `expected_queue_id`, `expected_queue_version` | 显式切换播放模式（限 Owner/Admin，需车机 `queue_v2` 能力门禁） |
+| `switch_queue` | - | `source` (`netease_favorite` \| `netease_intelligence` \| `single_track`), `start_index`, `start_track_id` | 显式切换播放队列源（限 Owner/Admin，需车机 `queue_v2` 能力门禁） |
 | `pause` | - | - | 暂停当前播放 |
-| `resume` | - | - | 恢复播放 |
+| `resume` | - | - | 恢复播放。若无活跃队列且歌单初始化失败，显式返回 409 Conflict，不创建或派发指令 |
 | `stop` | - | - | 停止播放并重置进度 |
 | `next` | - | - | 下一首（由车机端基于全量元数据独立维持循环） |
 | `prev` | `previous` | - | 上一首 |
-| `seek` | - | `seek_ms` / `seek_position_ms` / `position_ms` (单位毫秒) | 跳转指定播放进度（短 TTL 20s 保护） |
+| `seek` | - | `seek_position_ms` / `seek_ms` / `position_ms` (单位毫秒) | 跳转指定播放进度（参数冲突返回 422 `SEEK_PARAMETER_CONFLICT`，缺失返回 422 `SEEK_PARAMETER_REQUIRED`，负数返回 422 `INVALID_SEEK_POSITION`；短 TTL 20s 保护） |
 | `set_loop` | `set_loop_mode` | `loop_mode`: `"all"` \| `"one"` \| `"off"` | 设置循环模式（向后兼容映射） |
 | `set_shuffle` | - | `shuffle`: `true` \| `false` | 设置随机播放开关（向后兼容映射） |
 | `set_volume` | - | `volume`: `0.0` ~ `1.0` (浮点数) | 设置车机软件播放音量（短 TTL 20s 保护） |
 
+> **播控同构与状态机保证**：
+> 1. **HTTP 与 WebSocket 同构**：HTTP POST `/music/control/command` 与 WebSocket `type: command` 共享统一处理函数，100% 同构执行 Owner 权限门禁、Seek 参数校验、能力门禁与幂等性检查；
+> 2. **准备态与应用态解耦**：播控指令生成阶段仅向服务端注册准备态快照 (`_pending_queues`)，绝不覆盖当前活跃队列；仅当车机真正执行完成并上报 `applied` ACK 时才正式提升为 `_active_queues`；车机失败/超时抛弃 pending 快照，迟到 ACK 无法覆盖较新队列。
+
 ### 6.2 全量播放队列不可变快照分页 (`GET /api/v1/music/queue`)
-- **纯读无副作用**：纯读幂等查询，Query 带 `?source=...` 不激活或改变当前播放队列；
-- **不可变快照版本绑定**：分页携带 `(queue_id, queue_version)`；若版本发生变更，服务端返回 `409 Conflict` (`QUEUE_VERSION_CONFLICT`)，车机丢弃脏数据重新从第 0 页拉取；
+- **权限与资源隔离**：严格要求 **Owner 或绑定车机**（`require_owner_or_car`）。Admin 或过渡期 Legacy Phone Token 可访问；车机硬件仅限拉取属于自身 `device_id` 的队列快照；普通注册用户（即使具备车机控制权限）**一律返回 HTTP 403 Forbidden**；未鉴权返回 HTTP 401；
+- **纯读无副作用**：纯读幂等查询，Query 带 `?source=...` 绝不激活或改变当前播放队列；
+- **不可变快照版本绑定**：分页必须携带 `(queue_id, queue_version)`；若版本发生变更，服务端返回 `409 Conflict` (`QUEUE_VERSION_CONFLICT`)，车机丢弃脏数据重新从第 0 页拉取；
+- **单调递增水位**：`queue_version` 采用毫秒精度单调递增，重启或缓存清理后依然保持严格递增且不碰撞；
+- **单指令原子状态流转**：发送 `play_track` / `set_playback_mode` / `switch_queue` 时服务端注入 `queue_id`/`queue_version` 并更新 `requested_mode`；仅当车机真正上报 `applied` ACK 时，DB 状态中的 `applied_mode` 与 `queue_source` 方正式提交；
 - **Opaque 脱敏队列 ID**：喜欢歌单 `q_fav_<hash>`，心动队列 `q_intel_<hash>`，单曲队列 `q_single_<hash>`；
 - **标准错误码**：`EMPTY_PLAYLIST` (喜欢歌单为0首)、`QUEUE_NOT_READY` (队列尚未就绪)、`INTELLIGENCE_AUTH_INVALID` (上游网易云凭证无效)、`CAPABILITY_NOT_SUPPORTED` (车机未声明 `queue_v2` 能力)。
 
