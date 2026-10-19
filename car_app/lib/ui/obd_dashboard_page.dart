@@ -306,6 +306,23 @@ class _ObdDashboardPageState extends State<ObdDashboardPage> {
                       label: const Text('断开', style: TextStyle(fontSize: 12)),
                       onPressed: () => _obd.disconnect(),
                     ),
+                  if (isConnected) ...[
+                    const SizedBox(width: 6),
+                    ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF162534),
+                        foregroundColor: Colors.lightBlueAccent,
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(6),
+                          side: const BorderSide(color: Colors.lightBlueAccent, width: 1),
+                        ),
+                      ),
+                      icon: const Icon(Icons.speed, size: 15, color: Colors.lightBlueAccent),
+                      label: const Text('读标准PID', style: TextStyle(fontSize: 11)),
+                      onPressed: () => _obd.verifyStandardPidsExplicitly(),
+                    ),
+                  ],
                   const SizedBox(width: 8),
                   ElevatedButton.icon(
                     style: ElevatedButton.styleFrom(
@@ -400,20 +417,51 @@ class _ObdDashboardPageState extends State<ObdDashboardPage> {
                               ],
                             ),
                           ),
-                          // 快捷指令按钮栏
+                          // 快捷指令按钮栏 (以标准只读为主)
                           Wrap(
                             spacing: 6,
                             runSpacing: 4,
                             children: [
+                              _buildQuickBtn('0100', 'CAN探针'),
                               _buildQuickBtn('010D', '车速'),
                               _buildQuickBtn('010C', '转速'),
                               _buildQuickBtn('0105', '水温'),
                               _buildQuickBtn('ATRV', '12V电压'),
-                              _buildQuickBtn('ATSH7E2', '切混动'),
-                              _buildQuickBtn('21C3', '混动遥测'),
-                              _buildQuickBtn('21C4', '升压遥测'),
-                              _buildQuickBtn('ATSH7DF', '切广播'),
+                              _buildQuickBtn('ATI', '芯片信息'),
                             ],
+                          ),
+                          Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                            child: Row(
+                              children: [
+                                ValueListenableBuilder<bool>(
+                                  valueListenable: _obd.enableProprietaryPollingNotifier,
+                                  builder: (ctx, enabled, _) {
+                                    return Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Checkbox(
+                                          value: enabled,
+                                          visualDensity: VisualDensity.compact,
+                                          activeColor: Colors.amberAccent,
+                                          onChanged: (val) {
+                                            if (val == true) {
+                                              _showEnableProprietaryWarning(ctx);
+                                            } else {
+                                              _obd.setProprietaryPolling(false);
+                                            }
+                                          },
+                                        ),
+                                        const Text(
+                                          '启用私有PID探测 (21C3未经验证)',
+                                          style: TextStyle(color: Colors.amberAccent, fontSize: 10),
+                                        ),
+                                      ],
+                                    );
+                                  },
+                                ),
+                              ],
+                            ),
                           ),
                           const Divider(color: Colors.white12, height: 1),
                           // 滚动终端日志
@@ -539,6 +587,40 @@ class _ObdDashboardPageState extends State<ObdDashboardPage> {
     }
   }
 
+  void _showEnableProprietaryWarning(BuildContext context) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E222B),
+        title: const Row(
+          children: [
+            Icon(Icons.warning_amber_rounded, color: Colors.amberAccent, size: 20),
+            SizedBox(width: 8),
+            Text('试验性私有 PID 探测确认', style: TextStyle(color: Colors.white, fontSize: 15)),
+          ],
+        ),
+        content: const Text(
+          '安全提示：\n\n21C3 / 21C4 等私有指令未经当前实车通信验证。\n\n盲测非标准 UDS 指令可能返回异常数据或引起仪表提示。默认已严格关闭。\n\n是否仍要显式开启私有探测？',
+          style: TextStyle(color: Colors.white70, fontSize: 12),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消 (推荐保持关闭)'),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.amber.shade900),
+            onPressed: () {
+              Navigator.pop(ctx);
+              _obd.setProprietaryPolling(true);
+            },
+            child: const Text('确认开启探测', style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+  }
+
   // 1. 混动电池高压核心视图
   Widget _buildHybridBatteryCard(ObdTelemetry tel) {
     final soc = tel.batterySoc;
@@ -569,11 +651,29 @@ class _ObdDashboardPageState extends State<ObdDashboardPage> {
                   ),
                 ],
               ),
-              if (tel.lastUpdated != null)
-                Text(
-                  '更新: ${tel.lastUpdated!.toIso8601String().substring(11, 19)}',
-                  style: const TextStyle(color: Colors.white38, fontSize: 10),
-                ),
+              ValueListenableBuilder<bool>(
+                valueListenable: _obd.enableProprietaryPollingNotifier,
+                builder: (ctx, enabled, _) {
+                  return Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: (enabled ? Colors.orange : Colors.grey).withValues(alpha: 0.15),
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(
+                        color: (enabled ? Colors.orangeAccent : Colors.white30),
+                        width: 1,
+                      ),
+                    ),
+                    child: Text(
+                      enabled ? '⚠️ 私有探测开启 (未经验证)' : '私有协议未验证 (默认关闭保护车辆)',
+                      style: TextStyle(
+                        color: enabled ? Colors.orangeAccent : Colors.white60,
+                        fontSize: 9.5,
+                      ),
+                    ),
+                  );
+                },
+              ),
             ],
           ),
           const SizedBox(height: 10),

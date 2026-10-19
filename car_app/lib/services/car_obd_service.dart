@@ -26,6 +26,22 @@ class CarObdService {
   final ValueNotifier<ObdDeepScanReport?> lastDeepScanReportNotifier =
       ValueNotifier<ObdDeepScanReport?>(null);
 
+  /// 车辆标准 CAN 总线是否已有效响应 (例如 PID 0100 返回 4100)
+  bool canBusReady = false;
+  final ValueNotifier<bool> canBusReadyNotifier = ValueNotifier<bool>(false);
+
+  /// 是否开启未验证的丰田私有协议轮询 (Mode 21/22/ATSH7E2 等)
+  /// 严格默认关闭！只有用户显式确认启用时才会尝试
+  bool enableProprietaryPolling = false;
+  final ValueNotifier<bool> enableProprietaryPollingNotifier =
+      ValueNotifier<bool>(false);
+
+  /// 是否开启标准 OBD (Mode 01) 周期轮询 (车速/转速/水温)
+  /// 需在确认 PID 0100 有效响应后开启
+  bool enableStandardPolling = false;
+  final ValueNotifier<bool> enableStandardPollingNotifier =
+      ValueNotifier<bool>(false);
+
   bool _isDeepScanning = false;
   bool _cancelDeepScanRequested = false;
 
@@ -189,13 +205,21 @@ class CarObdService {
       await prefs.setString(_prefLastDeviceAddress, device.remoteId.str);
       await prefs.setString(_prefLastDeviceName, deviceName);
 
+      final statusMsg = canBusReady
+          ? 'OBD 适配器与车辆标准 CAN 已联机'
+          : 'OBD 适配器已握手 (车辆 ECU 未响应/NO DATA)';
+
       _updateStatus(
         ObdConnectionStatus.ready,
-        message: 'OBD 适配器就绪，开始实时采集',
+        message: statusMsg,
         deviceName: deviceName,
         deviceId: device.remoteId.str,
       );
-      log('🎉 OBD2 适配器已成功锁定 ISO 15765-4 CAN 协议并进入就绪态');
+      if (canBusReady) {
+        log('🎉 适配器与车辆 CAN 总线联机完成');
+      } else {
+        log('ℹ️ 适配器已握手；车辆 ECU 尚未响应，未执行私有与混动探测');
+      }
 
       _startPolling();
       return true;
@@ -255,9 +279,13 @@ class CarObdService {
       log('0100 测试应答: $resp');
 
       if (resp.contains('4100') || resp.contains('41 00')) {
-        log('🎉 车辆 ECU 已成功响应 PID 0100，CAN 总线已联机');
+        canBusReady = true;
+        canBusReadyNotifier.value = true;
+        log('🎉 车辆 ECU 已成功响应 PID 0100，标准 CAN 总线已联机');
       } else {
-        log('ℹ️ 车辆 ECU 当前未应答 (车辆可能处于 OFF/ACC 档位)，适配器保持监听等待切入 READY');
+        canBusReady = false;
+        canBusReadyNotifier.value = false;
+        log('ℹ️ 车辆 ECU 未响应 PID 0100 (应答: $resp)，适配器保持监听，等待车辆通电');
       }
 
       // 只要适配器能响应 AT 指令 (ATE0/ATI/ATRV 正常返回非 ERROR)，即认定适配器链路正常
@@ -275,8 +303,8 @@ class CarObdService {
   void _startPolling() {
     _pollingTimer?.cancel();
     _pollCycleCount = 0;
-    // 每 1.2 秒触发一次调度轮询
-    _pollingTimer = Timer.periodic(const Duration(milliseconds: 1200), (timer) {
+    // 基础安全轮询周期 2.5 秒
+    _pollingTimer = Timer.periodic(const Duration(milliseconds: 2500), (timer) {
       _pollCycle();
     });
   }
@@ -287,35 +315,80 @@ class CarObdService {
     _pollCycleCount++;
 
     try {
-      // ---------------------------------------------------------------------
-      // Tier 1: 高频队列 (每次轮询都查: 车速、转速、冷却液水温)
-      // ---------------------------------------------------------------------
-      await _queryStandardEngineTier1();
-
-      // ---------------------------------------------------------------------
-      // Tier 2: 混动动力电池与电驱系统 (每 2 次循环约 2.4s 查一次)
-      // ---------------------------------------------------------------------
-      if (_pollCycleCount % 2 == 0) {
-        await _queryToyotaHybridTier2();
+      // 基础安全轮询: 仅读取适配器 12V 蓄电池引脚电压 (引脚16独立 ADC 测量，不向车辆发送任何 CAN 诊断报文)
+      final atrv = await sendRawCommand('ATRV');
+      final battV = _parseAtRv(atrv);
+      if (battV != null) {
+        _updateTelemetry((t) => t.copyWith(
+              aux12vVoltage: battV,
+              lastUpdated: DateTime.now(),
+            ));
       }
 
-      // ---------------------------------------------------------------------
-      // Tier 3: 发动机高级指标与整车状态 (每 5 次循环约 6s 查一次)
-      // ---------------------------------------------------------------------
-      if (_pollCycleCount % 5 == 0) {
-        await _queryToyotaEngineAndAuxTier3();
+      // 仅当车辆 CAN 总线已明确就绪 (PID 0100 有效响应) 且用户显式启用标准轮询时，才读取标准 Mode 01 PID
+      if (canBusReady && enableStandardPolling) {
+        await _queryStandardEngineTier1();
       }
 
-      // ---------------------------------------------------------------------
-      // Tier 4: 低频/静态数据 (每 25 次循环约 30s 查一次: 里程、油位)
-      // ---------------------------------------------------------------------
-      if (_pollCycleCount % 25 == 0) {
-        await _queryLowFrequencyTier4();
+      // 未经验证的私有 Mode 21/22 指令严格默认完全关闭！绝不在普通连接中自动发送
+      if (enableProprietaryPolling) {
+        if (_pollCycleCount % 2 == 0) {
+          await _queryToyotaHybridTier2();
+        }
+        if (_pollCycleCount % 5 == 0) {
+          await _queryToyotaEngineAndAuxTier3();
+        }
+        if (_pollCycleCount % 25 == 0) {
+          await _queryLowFrequencyTier4();
+        }
       }
     } catch (e) {
       log('轮询周期发生异常: $e');
     } finally {
       _isPollingBusy = false;
+    }
+  }
+
+  /// 显式单次验证标准 Mode 01 PID (0100, 010D, 010C, 0105)
+  Future<void> verifyStandardPidsExplicitly() async {
+    if (!isConnected) {
+      log('⚠️ 适配器未连接，无法执行标准 PID 验证');
+      return;
+    }
+    log('🔬 [显式验证] 正在发送标准 OBD 0100 指令探测车辆 CAN 总线...');
+    final resp0100 = await sendRawCommand('0100');
+    log('🔬 [显式验证] 0100 应答: $resp0100');
+
+    if (resp0100.contains('4100') || resp0100.contains('41 00')) {
+      canBusReady = true;
+      canBusReadyNotifier.value = true;
+      log('✅ 车辆 ECU 确认支持 Mode 01 标准协议，开始采集单次标准车况...');
+      await _queryStandardEngineTier1();
+      log('✅ 标准车况 (车速/转速/水温) 读取完成');
+    } else {
+      canBusReady = false;
+      canBusReadyNotifier.value = false;
+      log('❌ 车辆 ECU 未应答标准 0100 (应答: $resp0100)，请确保车辆电源处于 ON 档');
+    }
+  }
+
+  void setProprietaryPolling(bool enable) {
+    enableProprietaryPolling = enable;
+    enableProprietaryPollingNotifier.value = enable;
+    if (enable) {
+      log('⚠️ 用户已显式启用试验性私有 PID 轮询 (Mode 21/22，解码未经验证)');
+    } else {
+      log('🔒 已关闭试验性私有 PID 轮询');
+    }
+  }
+
+  void setStandardPolling(bool enable) {
+    enableStandardPolling = enable;
+    enableStandardPollingNotifier.value = enable;
+    if (enable) {
+      log('🟢 用户已显式启用标准 Mode 01 周期轮询');
+    } else {
+      log('⚪ 已关闭标准 Mode 01 周期轮询');
     }
   }
 
@@ -687,6 +760,8 @@ class CarObdService {
       _connectedDevice = null;
     }
 
+    canBusReady = false;
+    canBusReadyNotifier.value = false;
     _updateStatus(ObdConnectionStatus.disconnected, message: '未连接设备');
   }
 
@@ -1199,6 +1274,9 @@ class CarObdService {
 
   @visibleForTesting
   double? parsePercent(String resp) => _parsePercent(resp);
+
+  @visibleForTesting
+  Future<void> pollCycleForTesting() => _pollCycle();
 
   void dispose() {
     disconnect();

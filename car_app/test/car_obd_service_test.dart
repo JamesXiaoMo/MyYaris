@@ -218,4 +218,36 @@ void main() {
       expect(p!, closeTo(50.19, 0.1));
     });
   });
+
+  group('CarObdService Safety & Proprietary Polling Default Isolation Tests', () {
+    test('Default configuration strictly disables unverified proprietary & standard auto polling', () {
+      final obd = CarObdService();
+      // 必须严格默认关闭私有协议轮询，严禁盲发 21C3/21C4 等指令
+      expect(obd.enableProprietaryPolling, isFalse);
+      expect(obd.enableProprietaryPollingNotifier.value, isFalse);
+
+      // 标准轮询也默认关闭，等待显式确认或 0100 响应
+      expect(obd.enableStandardPolling, isFalse);
+      expect(obd.enableStandardPollingNotifier.value, isFalse);
+
+      // CAN 总线就绪状态初始为 false
+      expect(obd.canBusReady, isFalse);
+      expect(obd.canBusReadyNotifier.value, isFalse);
+
+      // 验证切换私有探测开关
+      obd.setProprietaryPolling(true);
+      expect(obd.enableProprietaryPolling, isTrue);
+      expect(obd.enableProprietaryPollingNotifier.value, isTrue);
+
+      obd.setProprietaryPolling(false);
+      expect(obd.enableProprietaryPolling, isFalse);
+      expect(obd.enableProprietaryPollingNotifier.value, isFalse);
+
+      // 验证断开连接时重置 CAN 状态
+      obd.canBusReady = true;
+      obd.disconnect();
+      expect(obd.canBusReady, isFalse);
+      expect(obd.canBusReadyNotifier.value, isFalse);
+    });
+  });
 }
