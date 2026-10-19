@@ -67,15 +67,19 @@ def resolve_car_device_id(input_id: Optional[str] = None, fallback_id: Optional[
   }
   ```
 - **行为约束与契约保障**：
-  - **支持类型**：解析经纬度文本、主流地图分享短链、Plus Code（全码离线解码 / 短码必须提供显式 WGS84 参考坐标离线恢复）或在线 POI。
+  - **支持类型与输入校验**：
+    - 解析经纬度文本、主流地图分享短链、Plus Code（全码离线解码 / 短码必须提供显式 WGS84 参考坐标离线恢复）或在线 POI。
+    - **非空与空白防御**：`raw_input` 严禁为空字符串或纯空白字符；传入空白内容时服务端直接返回 `HTTP 422 Unprocessable Entity`（`detail: "输入内容不能为空。"`），断言不产生任何 `ParseRequest` 或 `Task` 数据库副作用。
   - **Open Location Code 区域中心声明**：Open Location Code (Plus Code) 表示的是地球表面分级网格区域，解码出的经纬度为**该网格单元的几何中心坐标 (`latitudeCenter`, `longitudeCenter`)，绝非建筑物大门或出入口的精确图钉坐标**。
   - **短 Plus Code 严格约束与拒绝猜测**：
     - 短码在 `/api/v1/destinations/resolve` 流程中**必须显式提供合法的 WGS84 参考坐标 (`coord_system: "wgs84"`)**；
     - 若未传 `reference_coordinate`（即使文本中附带城市名称），服务端**断然拒绝并返回 `HTTP 422 Unprocessable Entity`**，严禁调用外部地理编码服务猜测，杜绝虚假经纬度 `(0.0, 0.0)` 兜底；
     - 参照坐标非 `wgs84` 或经纬度越界同样返回 `422`。
-  - **确认状态语义 (`needs_confirmation: true`)**：
+  - **Purpose 契约与确认状态语义**：
+    - `purpose` 字段支持 `"favorite_preview"`（默认值）与 `"navigation"`。
     - 短码经参照坐标还原、全码粗粒度编码（编码长度 < 10）以及产生多个候选的检索结果，服务端固定返回 `needs_confirmation: true` 与 `status: "needs_clarification"` 及澄清提示 `clarification_question`；
-    - **确认仅用于客户端前端确认后保存至收藏夹**：为收藏预览用途 (`purpose="favorite_preview"`) 创建的解析记录，**严禁调用旧版 `POST /destinations/{id}/confirm` 创建车机导航任务**（直接返回 `HTTP 400 Bad Request`）；
+    - **统一预览防派发安全保护**：为收藏预览用途（默认 `purpose="favorite_preview"`）创建的解析记录，**统一严禁用于派发车机导航任务**——无论是调用单候选直接派发接口 `POST /api/v1/tasks/destination` 还是多候选确认派发接口 `POST /destinations/{id}/confirm`，服务端均严格拦截并返回 `HTTP 400 Bad Request`，杜绝误触派发；
+    - **iOS 真实导航派发流程**：当用户在 iOS 主界面或地图分享直接发起真实车机导航时，客户端必须显式传入 `"purpose": "navigation"`；当解析状态为 `"resolved"` 时，方可通过 `POST /api/v1/tasks/destination` 或 `POST /destinations/{id}/confirm` 正常生成 `Task`。
   - **严禁提前创建任务 (Zero Eager Task)**：解析阶段 `auto_create_task=False` 始终生效，`tasks` 表不产生任何新增记录（`parse_request.task_id = None`）。
   - **多候选完整透传**：多候选时，响应中的 `candidates` 数组返回全量候选列表，客户端不可将首个候选误判为唯一确定地点。
   - **响应结构 (`200 OK`)**：
@@ -108,9 +112,13 @@ def resolve_car_device_id(input_id: Optional[str] = None, fallback_id: Optional[
 ### 2.2 正式派发阶段 (Phase 2: Formal Dispatch)
 - **单候选/直接派发**：`POST /api/v1/tasks/destination`
   - 请求体：`{"destination_id": "...", "target_device_id": "...", "expires_in_seconds": 3600}`
+  - 拦截与门禁：
+    - 若该解析记录为收藏预览用途（`purpose="favorite_preview"`），**严格拒绝并返回 `HTTP 400 Bad Request`**；
+    - 若该解析记录状态为 `needs_clarification`，**严格拒绝并返回 `HTTP 400 Bad Request`**（要求客户端先二次澄清或确认目标）；
   - 行为：创建状态为 `queued` 的正式 `Task`，将 `target_device_id` 归一化并写入 `Task.device_id`。
 - **多候选确认派发**：`POST /destinations/{id}/confirm`
   - 请求体：`{"candidate_id": "...", "target_device_id": "..."}`
+  - 拦截与门禁：若目标记录为收藏预览用途（`purpose="favorite_preview"`），**同样严格拒绝并返回 `HTTP 400 Bad Request`**。
   - 行为：将选定的候选点生成任务，并更新请求关联。
 - **幂等与设备重指派**：
   - 若该 `request_id` 已存在未领取的初始任务（状态为 `queued` 或 `received`），而用户再次提交了不同的 `target_device_id`，后端自动更新 `existing_task.device_id` 为新目标，避免旧任务滞留或重复创建。
