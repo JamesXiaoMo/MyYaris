@@ -46,3 +46,4 @@ android/app/release
 *.keystore
 key.properties
 local.properties
+just_audio_cache/

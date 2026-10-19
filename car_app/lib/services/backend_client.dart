@@ -601,7 +601,7 @@ class BackendClient {
     required String token,
     required String requestId,
     required int seedSongId,
-    required int playlistId,
+    int? playlistId,
     int batchIndex = 0,
     int count = 30,
   }) async {
@@ -614,13 +614,15 @@ class BackendClient {
       req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
       req.headers.set('X-Device-Token', token);
     }
-    final payload = {
+    final payload = <String, dynamic>{
       'request_id': requestId,
       'seed_song_id': seedSongId,
-      'playlist_id': playlistId,
       'batch_index': batchIndex,
       'count': count,
     };
+    if (playlistId != null && playlistId > 0) {
+      payload['playlist_id'] = playlistId;
+    }
     req.add(utf8.encode(jsonEncode(payload)));
 
     final res = await req.close().timeout(const Duration(seconds: 15));

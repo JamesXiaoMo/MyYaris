@@ -9,6 +9,50 @@ enum CircuitBreakerAction {
   stopPlayer,
 }
 
+/// Immutable backup snapshot of the complete queue controller state for transactional rollback
+class QueueControllerStateBackup {
+  final List<NeteaseQueueTrackItem> tracks;
+  final String queueId;
+  final int queueVersion;
+  final String queueSource;
+  final String? queueName;
+  final int total;
+  final bool isComplete;
+  final bool isFullyLoaded;
+  final int currentIndex;
+  final PlaybackMode appliedMode;
+  final List<int> shuffleIndices;
+  final int shufflePosition;
+  final int consecutiveFailures;
+  final String? errorCode;
+  final String? errorDetail;
+  final int intelligenceBatchIndex;
+  final int? intelligencePlaylistId;
+
+  QueueControllerStateBackup({
+    required this.tracks,
+    required this.queueId,
+    required this.queueVersion,
+    required this.queueSource,
+    this.queueName,
+    required this.total,
+    required this.isComplete,
+    required this.isFullyLoaded,
+    required this.currentIndex,
+    required this.appliedMode,
+    required this.shuffleIndices,
+    required this.shufflePosition,
+    required this.consecutiveFailures,
+    this.errorCode,
+    this.errorDetail,
+    required this.intelligenceBatchIndex,
+    this.intelligencePlaylistId,
+  });
+
+  NeteaseQueueTrackItem? get currentTrack =>
+      (currentIndex >= 0 && currentIndex < tracks.length) ? tracks[currentIndex] : null;
+}
+
 /// Central controller for Car Music Queue and Playback Mode scheduling (V2.2.0 contract).
 /// Maintains full-queue in-memory snapshot, autonomous progression, Fisher-Yates shuffle,
 /// authentic intelligence streaming, and 3-failure circuit breaking.
@@ -150,25 +194,81 @@ class CarMusicQueueController {
     currentTrackNotifier.value = currentTrack;
   }
 
-  /// Fetches a complete queue snapshot across pages with atomic buffer validation.
-  /// If queueId and queueVersion are specified, locks to that snapshot.
-  /// If unspecified (e.g. initial favorite probe), offset=0 discovers queueId & version.
-  Future<bool> loadQueueSnapshotWithPaging({
+  /// Creates an immutable backup of the complete controller state for transactional rollback
+  QueueControllerStateBackup createBackup() {
+    return QueueControllerStateBackup(
+      tracks: List<NeteaseQueueTrackItem>.from(_tracks),
+      queueId: _queueId,
+      queueVersion: _queueVersion,
+      queueSource: _queueSource,
+      queueName: _queueName,
+      total: _total,
+      isComplete: _isComplete,
+      isFullyLoaded: _isFullyLoaded,
+      currentIndex: _currentIndex,
+      appliedMode: _appliedMode,
+      shuffleIndices: List<int>.from(_shuffleIndices),
+      shufflePosition: _shufflePosition,
+      consecutiveFailures: _consecutiveFailures,
+      errorCode: _errorCode,
+      errorDetail: _errorDetail,
+      intelligenceBatchIndex: _intelligenceBatchIndex,
+      intelligencePlaylistId: _intelligencePlaylistId,
+    );
+  }
+
+  /// Restores complete controller state from backup upon transaction failure
+  void restoreBackup(QueueControllerStateBackup backup) {
+    _tracks.clear();
+    _tracks.addAll(backup.tracks);
+    _queueId = backup.queueId;
+    _queueVersion = backup.queueVersion;
+    _queueSource = backup.queueSource;
+    _queueName = backup.queueName;
+    _total = backup.total;
+    _isComplete = backup.isComplete;
+    _isFullyLoaded = backup.isFullyLoaded;
+    _currentIndex = backup.currentIndex;
+    _appliedMode = backup.appliedMode;
+    _requestedMode = backup.appliedMode;
+    _shuffleIndices.clear();
+    _shuffleIndices.addAll(backup.shuffleIndices);
+    _shufflePosition = backup.shufflePosition;
+    _consecutiveFailures = backup.consecutiveFailures;
+    _errorCode = backup.errorCode;
+    _errorDetail = backup.errorDetail;
+    _intelligenceBatchIndex = backup.intelligenceBatchIndex;
+    _intelligencePlaylistId = backup.intelligencePlaylistId;
+
+    queueVersionNotifier.value = _queueVersion;
+    currentTrackNotifier.value = currentTrack;
+    appliedModeNotifier.value = _appliedMode;
+  }
+
+  void setIntelligencePlaylistId(int? playlistId) {
+    _intelligencePlaylistId = playlistId;
+  }
+
+  int? get intelligencePlaylistId => _intelligencePlaylistId;
+
+  /// Fetches a complete queue snapshot candidate across pages without mutating controller state.
+  /// Strictly verifies page source, total, offset continuity, is_complete, queue_state,
+  /// has_more consistency, and rejects any disordered/non-monotonic track indices with 422.
+  Future<MusicQueueSnapshot?> fetchAndValidateQueueSnapshot({
     String? queueId,
     int? queueVersion,
     required String source,
-    int targetIndex = 0,
     int maxRetries = 3,
   }) async {
     if (_backendClient == null || _baseUrl.isEmpty) {
-      debugPrint('[CarMusicQueue] Cannot load queue: BackendClient or baseUrl not configured');
-      return false;
+      debugPrint('[CarMusicQueue] Cannot fetch queue: BackendClient or baseUrl not configured');
+      return null;
     }
 
     int retryCount = 0;
     while (retryCount < maxRetries) {
       try {
-        debugPrint('[CarMusicQueue] Loading queue page 0 (source=$source, qid=$queueId, ver=$queueVersion, attempt=${retryCount + 1})...');
+        debugPrint('[CarMusicQueue] Fetching candidate queue page 0 (source=$source, qid=$queueId, ver=$queueVersion, attempt=${retryCount + 1})...');
         final firstPage = await _backendClient!.fetchMusicQueuePage(
           baseUrl: _baseUrl,
           token: _token,
@@ -184,9 +284,18 @@ class CarMusicQueueController {
         final discoveredVer = firstPage.queueVersion;
         final total = firstPage.total;
 
-        // Verify basic first page attributes
+        // 1. Strict first page attributes validation
         if (discoveredQid.isEmpty) {
           throw BackendException(422, 'Received empty queue_id from backend');
+        }
+        if (firstPage.source != source) {
+          throw BackendException(422, 'First page source mismatch: expected $source, got ${firstPage.source}');
+        }
+        if (firstPage.offset != 0) {
+          throw BackendException(422, 'First page offset must be 0, got ${firstPage.offset}');
+        }
+        if (total <= 0) {
+          throw BackendException(422, 'First page total must be positive, got $total');
         }
         if (queueId != null && queueId.isNotEmpty && discoveredQid != queueId) {
           throw BackendException(409, 'Queue ID mismatch: expected $queueId, got $discoveredQid');
@@ -194,12 +303,21 @@ class CarMusicQueueController {
         if (queueVersion != null && discoveredVer != queueVersion) {
           throw BackendException(409, 'Queue version mismatch: expected $queueVersion, got $discoveredVer');
         }
+        if (firstPage.queueState != 'ready') {
+          throw BackendException(409, 'Queue state is not ready (state=${firstPage.queueState})');
+        }
+        final expectedFirstHasMore = firstPage.tracks.length < total;
+        if (firstPage.hasMore != expectedFirstHasMore) {
+          throw BackendException(422, 'First page has_more mismatch: expected $expectedFirstHasMore, got ${firstPage.hasMore}');
+        }
 
-        // Buffer all pages before touching active state!
         final buffer = <NeteaseQueueTrackItem>[];
         final seenTrackIds = <String>{};
 
         for (final track in firstPage.tracks) {
+          if (track.queueIndex != buffer.length) {
+            throw BackendException(422, 'Disordered track index in page 0: expected ${buffer.length}, got ${track.queueIndex}');
+          }
           if (seenTrackIds.contains(track.trackId)) {
             throw BackendException(422, 'Duplicate track_id in page 0: ${track.trackId}');
           }
@@ -210,7 +328,7 @@ class CarMusicQueueController {
         bool isComplete = firstPage.isComplete;
         String queueState = firstPage.queueState;
 
-        // Paginate remaining tracks
+        // 2. Paginate remaining tracks
         while (buffer.length < total) {
           final expectedOffset = buffer.length;
           final nextPage = await _backendClient!.fetchMusicQueuePage(
@@ -224,17 +342,33 @@ class CarMusicQueueController {
             queueVersion: discoveredVer,
           );
 
+          if (nextPage.source != source) {
+            throw BackendException(422, 'Page source mismatch: expected $source, got ${nextPage.source}');
+          }
+          if (nextPage.total != total) {
+            throw BackendException(422, 'Total shifted during pagination: expected $total, got ${nextPage.total}');
+          }
           if (nextPage.queueId != discoveredQid || nextPage.queueVersion != discoveredVer) {
             throw BackendException(409, 'Queue version shifted during pagination: expected $discoveredVer, got ${nextPage.queueVersion}');
           }
           if (nextPage.offset != expectedOffset) {
             throw BackendException(422, 'Offset discontinuity: expected $expectedOffset, got ${nextPage.offset}');
           }
+          if (nextPage.queueState != 'ready') {
+            throw BackendException(409, 'Page queue state not ready: ${nextPage.queueState}');
+          }
           if (nextPage.tracks.isEmpty) {
             throw BackendException(422, 'Received empty tracks array while buffer (${buffer.length}) < total ($total)');
           }
+          final expectedNextHasMore = (buffer.length + nextPage.tracks.length) < total;
+          if (nextPage.hasMore != expectedNextHasMore) {
+            throw BackendException(422, 'Page has_more mismatch: expected $expectedNextHasMore, got ${nextPage.hasMore}');
+          }
 
           for (final track in nextPage.tracks) {
+            if (track.queueIndex != buffer.length) {
+              throw BackendException(422, 'Disordered track index: expected ${buffer.length}, got ${track.queueIndex}');
+            }
             if (seenTrackIds.contains(track.trackId)) {
               throw BackendException(422, 'Duplicate track_id encountered: ${track.trackId}');
             }
@@ -244,12 +378,9 @@ class CarMusicQueueController {
 
           isComplete = nextPage.isComplete;
           queueState = nextPage.queueState;
-          if (!nextPage.hasMore && buffer.length < total) {
-            throw BackendException(422, 'has_more is false but buffer length ${buffer.length} < total $total');
-          }
         }
 
-        // Strict completeness & index validation
+        // 3. Strict completeness & index validation
         if (buffer.length != total) {
           throw BackendException(422, 'Buffer track count mismatch: expected $total, got ${buffer.length}');
         }
@@ -260,56 +391,39 @@ class CarMusicQueueController {
           throw BackendException(409, 'Queue state is not ready (state=$queueState)');
         }
 
-        // Validate index continuity (0..total-1)
+        // Double check index monotonicity (strictly 0..total-1)
         for (int i = 0; i < buffer.length; i++) {
           if (buffer[i].queueIndex != i) {
-            buffer[i] = buffer[i].copyWith(queueIndex: i);
+            throw BackendException(422, 'Disordered track index at $i: expected $i, got ${buffer[i].queueIndex}');
           }
         }
 
-        // ATOMIC SWAP: All validations passed!
-        _tracks.clear();
-        _tracks.addAll(buffer);
-        _queueId = discoveredQid;
-        _queueVersion = discoveredVer;
-        _queueSource = source;
-        _queueName = firstPage.name ?? (source == QueueSource.neteaseFavorite ? '我喜欢的音乐' : '播放队列');
-        _total = total;
-        _isComplete = true;
-        _isFullyLoaded = true;
-
-        if (targetIndex >= 0 && targetIndex < _tracks.length) {
-          _currentIndex = targetIndex;
-        } else {
-          _currentIndex = 0;
-        }
-
-        if (_appliedMode == PlaybackMode.shuffle) {
-          _generateShuffleOrder(seedIndex: _currentIndex);
-        }
-
-        _consecutiveFailures = 0;
-        _errorCode = null;
-        _errorDetail = null;
-
-        queueVersionNotifier.value = _queueVersion;
-        currentTrackNotifier.value = currentTrack;
-        debugPrint('[CarMusicQueue] Queue atomically applied: $_queueId v$_queueVersion ($_total tracks, source=$_queueSource, index=$_currentIndex)');
-        return true;
+        return MusicQueueSnapshot(
+          code: 200,
+          queueId: discoveredQid,
+          queueVersion: discoveredVer,
+          source: source,
+          name: firstPage.name ?? (source == QueueSource.neteaseFavorite ? '我喜欢的音乐' : '播放队列'),
+          total: total,
+          isComplete: true,
+          queueState: 'ready',
+          offset: 0,
+          limit: total,
+          hasMore: false,
+          tracks: buffer,
+        );
       } on BackendException catch (e) {
-        debugPrint('[CarMusicQueue] BackendException loading queue: ${e.statusCode} ${e.message}');
+        debugPrint('[CarMusicQueue] BackendException fetching queue: ${e.statusCode} ${e.message}');
         if (e.statusCode == 409) {
-          // Version conflict: retry from offset 0
           retryCount++;
           await Future.delayed(Duration(milliseconds: 300 * retryCount));
           continue;
         }
         _errorCode = 'LOAD_QUEUE_FAILED';
         _errorDetail = e.message;
-        // Old queue is safely preserved!
-        return false;
+        return null;
       } catch (e) {
-        debugPrint('[CarMusicQueue] Error loading queue: $e');
+        debugPrint('[CarMusicQueue] Error fetching queue: $e');
         retryCount++;
         await Future.delayed(Duration(milliseconds: 300 * retryCount));
       }
@@ -317,7 +431,67 @@ class CarMusicQueueController {
 
     _errorCode = 'LOAD_QUEUE_RETRIES_EXCEEDED';
     _errorDetail = '加载队列连续 $maxRetries 次失败，已保留原播放队列';
-    return false;
+    return null;
+  }
+
+  /// Atomically applies a validated candidate queue snapshot to the active controller state
+  void applyQueueSnapshot(
+    MusicQueueSnapshot snapshot, {
+    int targetIndex = 0,
+    PlaybackMode? mode,
+  }) {
+    _tracks.clear();
+    _tracks.addAll(snapshot.tracks);
+    _queueId = snapshot.queueId;
+    _queueVersion = snapshot.queueVersion;
+    _queueSource = snapshot.source;
+    _queueName = snapshot.name;
+    _total = snapshot.total;
+    _isComplete = true;
+    _isFullyLoaded = true;
+
+    if (targetIndex >= 0 && targetIndex < _tracks.length) {
+      _currentIndex = targetIndex;
+    } else {
+      _currentIndex = 0;
+    }
+
+    if (mode != null) {
+      _appliedMode = mode;
+      _requestedMode = mode;
+      appliedModeNotifier.value = mode;
+    }
+
+    if (_appliedMode == PlaybackMode.shuffle) {
+      _generateShuffleOrder(seedIndex: _currentIndex);
+    }
+
+    _consecutiveFailures = 0;
+    _errorCode = null;
+    _errorDetail = null;
+
+    queueVersionNotifier.value = _queueVersion;
+    currentTrackNotifier.value = currentTrack;
+    debugPrint('[CarMusicQueue] Queue atomically applied: $_queueId v$_queueVersion ($_total tracks, source=$_queueSource, index=$_currentIndex)');
+  }
+
+  /// Convenience method that fetches candidate snapshot and atomically applies it if successful
+  Future<bool> loadQueueSnapshotWithPaging({
+    String? queueId,
+    int? queueVersion,
+    required String source,
+    int targetIndex = 0,
+    int maxRetries = 3,
+  }) async {
+    final candidate = await fetchAndValidateQueueSnapshot(
+      queueId: queueId,
+      queueVersion: queueVersion,
+      source: source,
+      maxRetries: maxRetries,
+    );
+    if (candidate == null) return false;
+    applyQueueSnapshot(candidate, targetIndex: targetIndex);
+    return true;
   }
 
   /// Fetches the full favorite playlist across pages with version locking and bounded retry.
@@ -580,59 +754,129 @@ class CarMusicQueueController {
 
   /// Dynamic continuation for intelligence mode (< 5 tracks remaining).
   Future<void> _continueIntelligenceBatch() async {
+    if (_appliedMode != PlaybackMode.intelligence) return;
     if (_isContinuingIntelligence) return;
     if (_intelligenceBatchIndex >= maxIntelligenceBatches) {
-      debugPrint('[CarMusicQueue] Intelligence batch limit reached ($maxIntelligenceBatches batches, max 150 tracks).');
+      _errorCode = 'INTELLIGENCE_QUEUE_EXHAUSTED';
+      _errorDetail = '心动模式推荐曲目已达上限 ($maxIntelligenceBatches batches, max 150 tracks)';
+      debugPrint('[CarMusicQueue] $_errorDetail');
       return;
     }
-    if (_backendClient == null || _baseUrl.isEmpty || currentTrack == null) return;
+    if (_backendClient == null || _baseUrl.isEmpty || _tracks.isEmpty) return;
 
     _isContinuingIntelligence = true;
     try {
       final nextBatchIndex = _intelligenceBatchIndex + 1;
-      final seedSongId = currentTrack!.songId;
-      final playlistId = _intelligencePlaylistId ?? 0;
-      final requestId = 'req_intel_batch_${nextBatchIndex}_${DateTime.now().millisecondsSinceEpoch}';
+      final seedSongId = _tracks.last.songId > 0 ? _tracks.last.songId : (currentTrack?.songId ?? 0);
+      if (seedSongId <= 0) {
+        _errorCode = 'INVALID_SEED_SONG';
+        _errorDetail = '缺少合法的心动续批种子歌曲ID';
+        debugPrint('[CarMusicQueue] $_errorDetail');
+        return;
+      }
+      final requestId = 'req_intel_${_queueId}_b$nextBatchIndex';
 
-      debugPrint('[CarMusicQueue] Requesting intelligence batch $nextBatchIndex (seed=$seedSongId)...');
+      debugPrint('[CarMusicQueue] Requesting intelligence batch $nextBatchIndex (seed=$seedSongId, req=$requestId)...');
       final res = await _backendClient!.requestIntelligenceBatch(
         baseUrl: _baseUrl,
         token: _token,
         requestId: requestId,
         seedSongId: seedSongId,
-        playlistId: playlistId,
+        playlistId: _intelligencePlaylistId,
         batchIndex: nextBatchIndex,
         count: 30,
       );
 
-      final rawTracks = res['tracks'] as List? ?? [];
-      final oldTotal = _tracks.length;
-      final newTracks = <NeteaseQueueTrackItem>[];
+      final returnedMode = res['mode']?.toString();
+      if (returnedMode != 'intelligence') {
+        throw BackendException(422, 'Invalid intelligence mode response: $returnedMode');
+      }
 
+      final returnedQueueId = res['queue_id']?.toString();
+      if (returnedQueueId != null && returnedQueueId.isNotEmpty && returnedQueueId != _queueId) {
+        throw BackendException(409, 'Intelligence queue_id shifted: expected $_queueId, got $returnedQueueId');
+      }
+
+      final newVersion = (res['queue_version'] as num?)?.toInt();
+      if (newVersion == null || newVersion <= 0) {
+        throw BackendException(422, 'Invalid or missing queue_version in intelligence response');
+      }
+
+      final rawTracks = res['tracks'] as List? ?? [];
+      final parsedTracks = <NeteaseQueueTrackItem>[];
       for (int i = 0; i < rawTracks.length; i++) {
         if (rawTracks[i] is Map<String, dynamic>) {
-          newTracks.add(NeteaseQueueTrackItem.fromJson(
-            rawTracks[i] as Map<String, dynamic>,
-            fallbackIndex: oldTotal + i,
-          ));
+          parsedTracks.add(NeteaseQueueTrackItem.fromJson(rawTracks[i] as Map<String, dynamic>));
         }
       }
 
-      if (newTracks.isNotEmpty) {
-        _tracks.addAll(newTracks);
-        _total = _tracks.length;
-        _queueVersion++;
-        _intelligenceBatchIndex = nextBatchIndex;
-        queueVersionNotifier.value = _queueVersion;
-        debugPrint('[CarMusicQueue] Appended ${newTracks.length} tracks to intelligence queue (total=$_total, v$_queueVersion).');
+      // Check whether server returned the full updated list or just the appended batch
+      if (parsedTracks.length >= _tracks.length && parsedTracks.isNotEmpty && parsedTracks[0].trackId == _tracks[0].trackId) {
+        // Full list returned: verify old prefix is 100% intact
+        for (int i = 0; i < _tracks.length; i++) {
+          if (parsedTracks[i].trackId != _tracks[i].trackId || parsedTracks[i].queueIndex != i) {
+            throw BackendException(422, 'Prefix inconsistency in replenished tracks at index $i');
+          }
+        }
+        // Verify newly added tracks have monotonic indices and no duplicate IDs
+        final seenIds = _tracks.map((t) => t.trackId).toSet();
+        for (int i = _tracks.length; i < parsedTracks.length; i++) {
+          if (parsedTracks[i].queueIndex != i) {
+            throw BackendException(422, 'Disordered track index in replenished tracks: expected $i, got ${parsedTracks[i].queueIndex}');
+          }
+          if (seenIds.contains(parsedTracks[i].trackId)) {
+            throw BackendException(422, 'Duplicate track_id in replenished tracks: ${parsedTracks[i].trackId}');
+          }
+          seenIds.add(parsedTracks[i].trackId);
+        }
+        _tracks.clear();
+        _tracks.addAll(parsedTracks);
+      } else {
+        // Appended batch returned: verify sequential continuation and no duplicates
+        final seenIds = _tracks.map((t) => t.trackId).toSet();
+        final startIdx = _tracks.length;
+        for (int i = 0; i < parsedTracks.length; i++) {
+          final expectedIdx = startIdx + i;
+          if (parsedTracks[i].queueIndex != expectedIdx) {
+            throw BackendException(422, 'Disordered track index in replenishment batch: expected $expectedIdx, got ${parsedTracks[i].queueIndex}');
+          }
+          if (seenIds.contains(parsedTracks[i].trackId)) {
+            throw BackendException(422, 'Duplicate track_id in replenishment batch: ${parsedTracks[i].trackId}');
+          }
+          seenIds.add(parsedTracks[i].trackId);
+          _tracks.add(parsedTracks[i]);
+        }
+      }
+
+      _total = _tracks.length;
+      _queueVersion = newVersion;
+      _intelligenceBatchIndex = nextBatchIndex;
+      _errorCode = null;
+      _errorDetail = null;
+      queueVersionNotifier.value = _queueVersion;
+      debugPrint('[CarMusicQueue] Intelligence replenishment succeeded: batch=$nextBatchIndex, total=$_total, v$_queueVersion');
+    } on BackendException catch (e) {
+      debugPrint('[CarMusicQueue] BackendException in intelligence continuation: ${e.statusCode} ${e.message}');
+      if (e.statusCode == 503 || e.message.contains('INTELLIGENCE_QUEUE_EXHAUSTED')) {
+        _errorCode = 'INTELLIGENCE_QUEUE_EXHAUSTED';
+        _errorDetail = '心动模式推荐曲目已达上限';
+        _intelligenceBatchIndex = maxIntelligenceBatches;
+      } else {
+        _errorCode = 'INTELLIGENCE_CONTINUE_FAILED';
+        _errorDetail = e.message;
       }
     } catch (e) {
-      debugPrint('[CarMusicQueue] Intelligence continuation failed: $e');
-      // No fake fallback! Keep existing tracks and allow natural playout.
+      debugPrint('[CarMusicQueue] Intelligence continuation error: $e');
+      _errorCode = 'INTELLIGENCE_CONTINUE_ERROR';
+      _errorDetail = e.toString();
     } finally {
       _isContinuingIntelligence = false;
     }
   }
+
+  /// Exposed for testing intelligence continuation explicitly
+  @visibleForTesting
+  Future<void> continueIntelligenceBatchForTesting() => _continueIntelligenceBatch();
 
   /// Sets up an authentic intelligence queue from a validated seed track.
   void initIntelligenceQueue({

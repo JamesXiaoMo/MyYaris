@@ -1,14 +1,114 @@
+import 'dart:async';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:just_audio_platform_interface/just_audio_platform_interface.dart';
 import 'package:my_yaris/models/music_queue_models.dart';
 import 'package:my_yaris/services/backend_client.dart';
 import 'package:my_yaris/services/built_in_player_service.dart';
 import 'package:my_yaris/services/car_music_queue_controller.dart';
 import 'package:my_yaris/services/car_music_sync_service.dart';
+import 'package:my_yaris/services/in_app_audio_stream_proxy.dart';
+
+class FakeJustAudioPlatform extends JustAudioPlatform {
+  final Map<String, FakeAudioPlayerPlatform> players = {};
+
+  @override
+  Future<AudioPlayerPlatform> init(InitRequest request) async {
+    final player = FakeAudioPlayerPlatform(request.id);
+    players[request.id] = player;
+    return player;
+  }
+
+  @override
+  Future<DisposePlayerResponse> disposePlayer(DisposePlayerRequest request) async {
+    players.remove(request.id);
+    return DisposePlayerResponse();
+  }
+
+  @override
+  Future<DisposeAllPlayersResponse> disposeAllPlayers(DisposeAllPlayersRequest request) async {
+    players.clear();
+    return DisposeAllPlayersResponse();
+  }
+}
+
+class FakeAudioPlayerPlatform extends AudioPlayerPlatform {
+  final StreamController<PlaybackEventMessage> _eventController = StreamController<PlaybackEventMessage>.broadcast();
+  final StreamController<PlayerDataMessage> _dataController = StreamController<PlayerDataMessage>.broadcast();
+  Duration _position = Duration.zero;
+
+  FakeAudioPlayerPlatform(super.id);
+
+  @override
+  Stream<PlaybackEventMessage> get playbackEventMessageStream => _eventController.stream;
+
+  @override
+  Stream<PlayerDataMessage> get playerDataMessageStream => _dataController.stream;
+
+  @override
+  Future<LoadResponse> load(LoadRequest request) async {
+    final str = request.toMap().toString();
+    if (str.contains('invalid-stream')) {
+      throw PlatformException(code: 'playback_error', message: 'Failed to load audio stream');
+    }
+    _position = request.initialPosition ?? Duration.zero;
+    _eventController.add(PlaybackEventMessage(
+      processingState: ProcessingStateMessage.ready,
+      updateTime: DateTime.now(),
+      updatePosition: _position,
+      bufferedPosition: const Duration(seconds: 180),
+      duration: const Duration(seconds: 180),
+      icyMetadata: null,
+      currentIndex: request.initialIndex ?? 0,
+      androidAudioSessionId: 1,
+    ));
+    return LoadResponse(duration: const Duration(seconds: 180));
+  }
+
+  @override
+  Future<PlayResponse> play(PlayRequest request) async {
+    _dataController.add(PlayerDataMessage(playing: true));
+    return PlayResponse();
+  }
+
+  @override
+  Future<PauseResponse> pause(PauseRequest request) async {
+    _dataController.add(PlayerDataMessage(playing: false));
+    return PauseResponse();
+  }
+
+  @override
+  Future<SeekResponse> seek(SeekRequest request) async {
+    _position = request.position ?? Duration.zero;
+    _eventController.add(PlaybackEventMessage(
+      processingState: ProcessingStateMessage.ready,
+      updateTime: DateTime.now(),
+      updatePosition: _position,
+      bufferedPosition: const Duration(seconds: 180),
+      duration: const Duration(seconds: 180),
+      icyMetadata: null,
+      currentIndex: 0,
+      androidAudioSessionId: 1,
+    ));
+    return SeekResponse();
+  }
+
+  @override
+  Future<SetVolumeResponse> setVolume(SetVolumeRequest request) async => SetVolumeResponse();
+
+  @override
+  Future<SetSpeedResponse> setSpeed(SetSpeedRequest request) async => SetSpeedResponse();
+
+  @override
+  Future<SetLoopModeResponse> setLoopMode(SetLoopModeRequest request) async => SetLoopModeResponse();
+
+  @override
+  Future<SetShuffleModeResponse> setShuffleMode(SetShuffleModeRequest request) async => SetShuffleModeResponse();
+}
 
 class FakeBackendClient extends BackendClient {
   final Map<String, dynamic> Function(Uri uri, Map<String, String> queryParams)? onFetchQueue;
-  final Future<Map<String, dynamic>> Function(Map<String, dynamic> body)? onPostIntelligence;
+  dynamic Function(Map<String, dynamic> body)? onPostIntelligence;
   final void Function(String commandId, String status, Map<String, dynamic> payload)? onAck;
 
   FakeBackendClient({
@@ -50,18 +150,19 @@ class FakeBackendClient extends BackendClient {
     required String token,
     required String requestId,
     required int seedSongId,
-    required int playlistId,
+    int? playlistId,
     int batchIndex = 0,
     int count = 30,
   }) async {
     if (onPostIntelligence != null) {
-      return onPostIntelligence!({
+      final res = await onPostIntelligence!({
         'request_id': requestId,
         'seed_song_id': seedSongId,
         'playlist_id': playlistId,
         'batch_index': batchIndex,
         'count': count,
       });
+      return Map<String, dynamic>.from(res as Map);
     }
     throw BackendException(500, 'onPostIntelligence not implemented');
   }
@@ -97,13 +198,13 @@ void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
   setUpAll(() {
-    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-        .setMockMethodCallHandler(const MethodChannel('com.ryanheise.just_audio.methods'), (call) async {
-      return {};
-    });
-    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-        .setMockMethodCallHandler(const MethodChannel('com.ryanheise.audio_session'), (call) async {
+    JustAudioPlatform.instance = FakeJustAudioPlatform();
+    final messenger = TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(const MethodChannel('com.ryanheise.audio_session'), (call) async {
       return null;
+    });
+    messenger.setMockMethodCallHandler(const MethodChannel('plugins.flutter.io/path_provider'), (call) async {
+      return '.';
     });
   });
 
@@ -437,6 +538,141 @@ void main() {
       expect(queueCtrl.queueId, 'q_valid_stay');
       expect(queueCtrl.tracks.first.trackId, 'netease_stay');
     });
+
+    test('Disordered track index in page rejects with 422 and preserves existing queue', () async {
+      queueCtrl.setQueueSnapshot(MusicQueueSnapshot(
+        code: 200,
+        queueId: 'q_valid_stay',
+        queueVersion: 1,
+        source: QueueSource.neteaseFavorite,
+        total: 1,
+        isComplete: true,
+        offset: 0,
+        limit: 1,
+        hasMore: false,
+        tracks: [
+          const NeteaseQueueTrackItem(
+            trackId: 'netease_stay',
+            songId: 999,
+            title: 'Stay',
+            artist: 'Stay',
+            streamUrl: '/stay',
+            queueIndex: 0,
+          ),
+        ],
+      ));
+
+      final fakeClient = FakeBackendClient(
+        onFetchQueue: (uri, query) => {
+          'code': 200,
+          'queue_id': 'q_disordered',
+          'queue_version': 1,
+          'source': 'netease_favorite',
+          'total': 2,
+          'is_complete': true,
+          'queue_state': 'ready',
+          'offset': 0,
+          'limit': 50,
+          'has_more': false,
+          'tracks': [
+            {
+              'track_id': 'netease_d_0',
+              'song_id': 600,
+              'title': 'Track 0',
+              'stream_url': '/0',
+              'queue_index': 1, // Invalid disordered index (expected 0)!
+            },
+            {
+              'track_id': 'netease_d_1',
+              'song_id': 601,
+              'title': 'Track 1',
+              'stream_url': '/1',
+              'queue_index': 0,
+            },
+          ],
+        },
+      );
+
+      queueCtrl.configure(
+        baseUrl: 'https://backend.example.ts.net',
+        token: 'test-token',
+        backendClient: fakeClient,
+      );
+
+      final success = await queueCtrl.loadFullFavoriteQueue(maxRetries: 1);
+      expect(success, false);
+      expect(queueCtrl.queueId, 'q_valid_stay'); // Preserved without copyWith alteration!
+    });
+
+    test('Page source mismatch rejects with 422 and preserves existing queue', () async {
+      final fakeClient = FakeBackendClient(
+        onFetchQueue: (uri, query) => {
+          'code': 200,
+          'queue_id': 'q_wrong_source',
+          'queue_version': 1,
+          'source': 'single_track', // Mismatched source! Expected netease_favorite
+          'total': 1,
+          'is_complete': true,
+          'queue_state': 'ready',
+          'offset': 0,
+          'limit': 50,
+          'has_more': false,
+          'tracks': [
+            {
+              'track_id': 'netease_ws',
+              'song_id': 700,
+              'title': 'Song',
+              'stream_url': '/s',
+              'queue_index': 0,
+            },
+          ],
+        },
+      );
+
+      queueCtrl.configure(
+        baseUrl: 'https://backend.example.ts.net',
+        token: 'test-token',
+        backendClient: fakeClient,
+      );
+
+      final success = await queueCtrl.loadFullFavoriteQueue(maxRetries: 1);
+      expect(success, false);
+    });
+
+    test('Page has_more mismatch with total rejects with 422', () async {
+      final fakeClient = FakeBackendClient(
+        onFetchQueue: (uri, query) => {
+          'code': 200,
+          'queue_id': 'q_has_more_bad',
+          'queue_version': 1,
+          'source': 'netease_favorite',
+          'total': 1,
+          'is_complete': true,
+          'queue_state': 'ready',
+          'offset': 0,
+          'limit': 50,
+          'has_more': true, // has_more is true when tracks.length (1) == total (1)!
+          'tracks': [
+            {
+              'track_id': 'netease_hm',
+              'song_id': 701,
+              'title': 'Song',
+              'stream_url': '/s',
+              'queue_index': 0,
+            },
+          ],
+        },
+      );
+
+      queueCtrl.configure(
+        baseUrl: 'https://backend.example.ts.net',
+        token: 'test-token',
+        backendClient: fakeClient,
+      );
+
+      final success = await queueCtrl.loadFullFavoriteQueue(maxRetries: 1);
+      expect(success, false);
+    });
   });
 
   group('CarMusicQueueController Modes & Circuit Breaker Tests', () {
@@ -577,6 +813,12 @@ void main() {
       CarMusicQueueController().clear();
     });
 
+    tearDown(() async {
+      syncService.stop();
+      await BuiltInPlayerService().stop();
+      await InAppAudioStreamProxy().stop();
+    });
+
     test('set_playback_mode with prepared queue_id and version awaits atomic load and reports ACK', () async {
       String? ackCommandId;
       String? ackStatus;
@@ -584,27 +826,53 @@ void main() {
       int? ackQueueVersion;
 
       final fakeClient = FakeBackendClient(
-        onFetchQueue: (uri, query) => {
-          'code': 200,
-          'queue_id': 'q_intel_prepared_001',
-          'queue_version': 1,
-          'source': 'netease_intelligence',
-          'total': 1,
-          'is_complete': true,
-          'queue_state': 'ready',
-          'offset': 0,
-          'limit': 50,
-          'has_more': false,
-          'tracks': [
-            {
-              'track_id': 'netease_8888',
-              'song_id': 8888,
-              'title': 'Intel Song',
-              'artist': 'Intel Artist',
-              'stream_url': '/stream/8888',
-              'queue_index': 0,
-            },
-          ],
+        onFetchQueue: (uri, query) {
+          if (query['queue_id'] == 'q_intel_prepared_001') {
+            return {
+              'code': 200,
+              'queue_id': 'q_intel_prepared_001',
+              'queue_version': 1,
+              'source': 'netease_intelligence',
+              'total': 1,
+              'is_complete': true,
+              'queue_state': 'ready',
+              'offset': 0,
+              'limit': 50,
+              'has_more': false,
+              'tracks': [
+                {
+                  'track_id': 'netease_8888',
+                  'song_id': 8888,
+                  'title': 'Intel Song',
+                  'artist': 'Intel Artist',
+                  'stream_url': '/stream/8888',
+                  'queue_index': 0,
+                },
+              ],
+            };
+          }
+          return {
+            'code': 200,
+            'queue_id': 'q_fav_init',
+            'queue_version': 1,
+            'source': 'netease_favorite',
+            'total': 1,
+            'is_complete': true,
+            'queue_state': 'ready',
+            'offset': 0,
+            'limit': 50,
+            'has_more': false,
+            'tracks': [
+              {
+                'track_id': 'netease_fav_init_1',
+                'song_id': 100,
+                'title': 'Fav Init',
+                'artist': 'Fav Artist',
+                'stream_url': '/stream/100',
+                'queue_index': 0,
+              },
+            ],
+          };
         },
         onAck: (cmdId, status, payload) {
           ackCommandId = cmdId;
@@ -619,6 +887,7 @@ void main() {
         deviceId: 'car_test',
         token: 'test-token',
         backendClient: fakeClient,
+        autoConnect: false,
       );
 
       await syncService.handleCommand({
@@ -658,6 +927,7 @@ void main() {
         deviceId: 'car_test',
         token: 'test-token',
         backendClient: fakeClient,
+        autoConnect: false,
       );
 
       await syncService.handleCommand({
@@ -736,6 +1006,7 @@ void main() {
         deviceId: 'car_test',
         token: 'test-token',
         backendClient: fakeClient,
+        autoConnect: false,
       );
 
       // Active queue has only track netease_555
@@ -803,6 +1074,513 @@ void main() {
         'params': {'volume': 0.12},
       });
       expect(BuiltInPlayerService().currentVolume, 0.30);
+    });
+
+    test('expected_queue_id and expected_queue_version precondition mismatch rejects with 409 QUEUE_PRECONDITION_FAILED', () async {
+      String? ackStatus;
+      String? ackErrorCode;
+
+      final fakeClient = FakeBackendClient(
+        onAck: (cmdId, status, payload) {
+          ackStatus = status;
+          ackErrorCode = payload['error_code'] as String?;
+        },
+      );
+
+      syncService.start(
+        baseUrl: 'https://backend.example.ts.net',
+        deviceId: 'car_test',
+        token: 'test-token',
+        backendClient: fakeClient,
+        autoConnect: false,
+      );
+
+      CarMusicQueueController().setQueueSnapshot(MusicQueueSnapshot(
+        code: 200,
+        queueId: 'q_active_base',
+        queueVersion: 10,
+        source: QueueSource.neteaseFavorite,
+        total: 1,
+        isComplete: true,
+        offset: 0,
+        limit: 1,
+        hasMore: false,
+        tracks: [
+          const NeteaseQueueTrackItem(
+            trackId: 'netease_base',
+            songId: 101,
+            title: 'Base',
+            artist: 'Base Artist',
+            streamUrl: '/base',
+            queueIndex: 0,
+          ),
+        ],
+      ));
+
+      // 1. Expected queue id mismatch
+      await syncService.handleCommand({
+        'command_id': 'cmd_pre_mismatch_id',
+        'action': 'set_playback_mode',
+        'params': {
+          'mode': 'shuffle',
+          'expected_queue_id': 'q_different',
+          'expected_queue_version': 10,
+        },
+      });
+      expect(ackStatus, 'failed');
+      expect(ackErrorCode, 'QUEUE_PRECONDITION_FAILED');
+      expect(CarMusicQueueController().queueId, 'q_active_base');
+
+      // 2. Expected queue version mismatch
+      await syncService.handleCommand({
+        'command_id': 'cmd_pre_mismatch_ver',
+        'action': 'set_playback_mode',
+        'params': {
+          'mode': 'shuffle',
+          'expected_queue_id': 'q_active_base',
+          'expected_queue_version': 99,
+        },
+      });
+      expect(ackStatus, 'failed');
+      expect(ackErrorCode, 'QUEUE_PRECONDITION_FAILED');
+      expect(CarMusicQueueController().queueVersion, 10);
+    });
+
+    test('Mode switch while playing preserves current playback progress on same track', () async {
+      String? ackStatus;
+
+      final fakeClient = FakeBackendClient(
+        onAck: (cmdId, status, payload) {
+          ackStatus = status;
+        },
+      );
+
+      syncService.start(
+        baseUrl: 'https://backend.example.ts.net',
+        deviceId: 'car_test',
+        token: 'test-token',
+        backendClient: fakeClient,
+        autoConnect: false,
+      );
+
+      final track = const NeteaseQueueTrackItem(
+        trackId: 'netease_same_pos',
+        songId: 1001,
+        title: 'Playing Song',
+        artist: 'Singer',
+        streamUrl: 'https://backend.example.ts.net/api/v1/music/stream/1001',
+        durationMs: 200000,
+        queueIndex: 0,
+      );
+
+      CarMusicQueueController().setQueueSnapshot(MusicQueueSnapshot(
+        code: 200,
+        queueId: 'q_playing_stay',
+        queueVersion: 1,
+        source: QueueSource.neteaseFavorite,
+        total: 1,
+        isComplete: true,
+        offset: 0,
+        limit: 1,
+        hasMore: false,
+        tracks: [track],
+      ));
+
+      await BuiltInPlayerService().playQueueTrack(
+        track,
+        initialPosition: const Duration(milliseconds: 45000),
+        startPlaying: true,
+      );
+      expect(BuiltInPlayerService().player.playing, true);
+
+      // Switch mode to single_loop without changing track
+      await syncService.handleCommand({
+        'command_id': 'cmd_switch_same_track',
+        'action': 'set_playback_mode',
+        'params': {'mode': 'single_loop'},
+      });
+
+      expect(ackStatus, 'applied');
+      expect(CarMusicQueueController().appliedMode, PlaybackMode.singleLoop);
+      expect(BuiltInPlayerService().player.playing, true);
+      // Progress not reset to 0!
+      expect(BuiltInPlayerService().player.position.inMilliseconds >= 45000, true);
+    });
+
+    test('Mode switch while paused pre-loads candidate track on player with startPlaying=false keeping consistency', () async {
+      String? ackStatus;
+
+      final fakeClient = FakeBackendClient(
+        onFetchQueue: (uri, query) => {
+          'code': 200,
+          'queue_id': 'q_intel_prep_paused',
+          'queue_version': 1,
+          'source': 'netease_intelligence',
+          'total': 1,
+          'is_complete': true,
+          'queue_state': 'ready',
+          'offset': 0,
+          'limit': 50,
+          'has_more': false,
+          'tracks': [
+            {
+              'track_id': 'netease_intel_new',
+              'song_id': 8888,
+              'title': 'Candidate Song',
+              'stream_url': 'https://backend.example.ts.net/api/v1/music/stream/8888',
+              'queue_index': 0,
+            },
+          ],
+        },
+        onAck: (cmdId, status, payload) {
+          ackStatus = status;
+        },
+      );
+
+      syncService.start(
+        baseUrl: 'https://backend.example.ts.net',
+        deviceId: 'car_test',
+        token: 'test-token',
+        backendClient: fakeClient,
+        autoConnect: false,
+      );
+
+      // Start player in paused state
+      await BuiltInPlayerService().stop();
+      expect(BuiltInPlayerService().player.playing, false);
+
+      await syncService.handleCommand({
+        'command_id': 'cmd_mode_paused',
+        'action': 'set_playback_mode',
+        'params': {
+          'mode': 'intelligence',
+          'queue_id': 'q_intel_prep_paused',
+          'queue_version': 1,
+        },
+      });
+
+      expect(ackStatus, 'applied');
+      expect(CarMusicQueueController().currentTrack?.trackId, 'netease_intel_new');
+      expect(BuiltInPlayerService().currentTrack.id, 'netease_intel_new');
+      expect(BuiltInPlayerService().player.playing, false); // Zero auto-play preserved!
+    });
+
+    test('Cold resume with exact prepared queue loads candidate snapshot, prepares player and plays', () async {
+      String? ackStatus;
+
+      final fakeClient = FakeBackendClient(
+        onFetchQueue: (uri, query) => {
+          'code': 200,
+          'queue_id': 'q_cold_prep',
+          'queue_version': 5,
+          'source': 'netease_favorite',
+          'total': 1,
+          'is_complete': true,
+          'queue_state': 'ready',
+          'offset': 0,
+          'limit': 50,
+          'has_more': false,
+          'tracks': [
+            {
+              'track_id': 'netease_cold_1',
+              'song_id': 991,
+              'title': 'Cold Song',
+              'stream_url': 'https://backend.example.ts.net/api/v1/music/stream/991',
+              'queue_index': 0,
+            },
+          ],
+        },
+        onAck: (cmdId, status, payload) {
+          ackStatus = status;
+        },
+      );
+
+      syncService.start(
+        baseUrl: 'https://backend.example.ts.net',
+        deviceId: 'car_test',
+        token: 'test-token',
+        backendClient: fakeClient,
+        autoConnect: false,
+      );
+
+      CarMusicQueueController().clear();
+      expect(CarMusicQueueController().tracks.isEmpty, true);
+
+      await syncService.handleCommand({
+        'command_id': 'cmd_cold_resume',
+        'action': 'resume',
+        'params': {
+          'queue_id': 'q_cold_prep',
+          'queue_version': 5,
+          'source': 'netease_favorite',
+          'track_id': 'netease_cold_1',
+          'seek_ms': 12000,
+        },
+      });
+
+      expect(ackStatus, 'applied');
+      expect(CarMusicQueueController().queueId, 'q_cold_prep');
+      expect(CarMusicQueueController().queueVersion, 5);
+      expect(CarMusicQueueController().currentTrack?.trackId, 'netease_cold_1');
+      expect(BuiltInPlayerService().currentTrack.id, 'netease_cold_1');
+      expect(BuiltInPlayerService().player.playing, true);
+    });
+
+    test('Heart continuation updates queueVersion from server non-+1, uses deterministic requestId, exposes error on failure', () async {
+      String? capturedRequestId;
+      int? capturedSeedSongId;
+
+      final fakeClient = FakeBackendClient(
+        onPostIntelligence: (req) {
+          capturedRequestId = req['request_id'] as String?;
+          capturedSeedSongId = req['seed_song_id'] as int?;
+          return {
+            'code': 200,
+            'mode': 'intelligence',
+            'queue_id': 'q_intel_seq',
+            'queue_version': 42, // Non-+1 version (from 1 to 42)!
+            'batch_index': 1,
+            'tracks': [
+              {
+                'track_id': 'netease_seed',
+                'song_id': 1111,
+                'title': 'Seed',
+                'stream_url': '/seed',
+                'queue_index': 0,
+              },
+              {
+                'track_id': 'netease_rep_1',
+                'song_id': 2222,
+                'title': 'Replenished',
+                'stream_url': '/rep',
+                'queue_index': 1,
+              },
+            ],
+          };
+        },
+      );
+
+      final queueCtrl = CarMusicQueueController();
+      queueCtrl.configure(
+        baseUrl: 'https://backend.example.ts.net',
+        token: 'test-token',
+        backendClient: fakeClient,
+      );
+
+      queueCtrl.initIntelligenceQueue(
+        queueId: 'q_intel_seq',
+        queueVersion: 1,
+        playlistId: 12345,
+        initialTracks: [
+          const NeteaseQueueTrackItem(
+            trackId: 'netease_seed',
+            songId: 1111,
+            title: 'Seed',
+            artist: 'Seed Artist',
+            streamUrl: '/seed',
+            queueIndex: 0,
+          ),
+        ],
+      );
+
+      // Trigger continuation
+      await queueCtrl.continueIntelligenceBatchForTesting();
+
+      // Assert deterministic requestId and seed song ID
+      expect(capturedRequestId, 'req_intel_q_intel_seq_b1');
+      expect(capturedSeedSongId, 1111);
+      // Assert non-+1 server version allocation applied
+      expect(queueCtrl.queueVersion, 42);
+      expect(queueCtrl.tracks.length, 2);
+      expect(queueCtrl.tracks.last.trackId, 'netease_rep_1');
+
+      // Failure exposure test: upstream exhausted returns 503
+      fakeClient.onPostIntelligence = (req) {
+        throw BackendException(503, 'INTELLIGENCE_QUEUE_EXHAUSTED');
+      };
+      await queueCtrl.continueIntelligenceBatchForTesting();
+      expect(queueCtrl.errorCode, 'INTELLIGENCE_QUEUE_EXHAUSTED');
+    });
+
+    test('Cross-queue source switching single_track -> netease_favorite -> single_track verifies source and updates correctly', () async {
+      String? ackStatus;
+
+      final fakeClient = FakeBackendClient(
+        onFetchQueue: (uri, query) {
+          final qid = query['queue_id'];
+          if (qid == 'q_single_abc') {
+            return {
+              'code': 200,
+              'queue_id': 'q_single_abc',
+              'queue_version': 1,
+              'source': 'single_track',
+              'total': 1,
+              'is_complete': true,
+              'queue_state': 'ready',
+              'offset': 0,
+              'limit': 50,
+              'has_more': false,
+              'tracks': [
+                {
+                  'track_id': 'netease_single_1',
+                  'song_id': 100,
+                  'title': 'Single',
+                  'stream_url': '/s1',
+                  'queue_index': 0,
+                },
+              ],
+            };
+          }
+          return {
+            'code': 200,
+            'queue_id': 'q_fav_xyz',
+            'queue_version': 1,
+            'source': 'netease_favorite',
+            'total': 1,
+            'is_complete': true,
+            'queue_state': 'ready',
+            'offset': 0,
+            'limit': 50,
+            'has_more': false,
+            'tracks': [
+              {
+                'track_id': 'netease_fav_1',
+                'song_id': 200,
+                'title': 'Fav',
+                'stream_url': '/f1',
+                'queue_index': 0,
+              },
+            ],
+          };
+        },
+        onAck: (cmdId, status, payload) {
+          ackStatus = status;
+        },
+      );
+
+      syncService.start(
+        baseUrl: 'https://backend.example.ts.net',
+        deviceId: 'car_test',
+        token: 'test-token',
+        backendClient: fakeClient,
+        autoConnect: false,
+      );
+
+      // 1. Switch to single_track
+      await syncService.handleCommand({
+        'command_id': 'cmd_sw_single',
+        'action': 'switch_queue',
+        'params': {
+          'source': 'single_track',
+          'queue_id': 'q_single_abc',
+          'queue_version': 1,
+        },
+      });
+      expect(ackStatus, 'applied');
+      expect(CarMusicQueueController().queueSource, QueueSource.singleTrack);
+
+      // 2. Switch back to favorite
+      await syncService.handleCommand({
+        'command_id': 'cmd_sw_fav',
+        'action': 'switch_queue',
+        'params': {
+          'source': 'netease_favorite',
+          'queue_id': 'q_fav_xyz',
+          'queue_version': 1,
+        },
+      });
+      expect(ackStatus, 'applied');
+      expect(CarMusicQueueController().queueSource, QueueSource.neteaseFavorite);
+    });
+
+    test('Transactional rollback on player failure restores previous queue, mode, track, position, and playing state', () async {
+      String? ackStatus;
+      String? ackErrorCode;
+
+      final fakeClient = FakeBackendClient(
+        onFetchQueue: (uri, query) => {
+          'code': 200,
+          'queue_id': 'q_bad_stream',
+          'queue_version': 1,
+          'source': 'netease_favorite',
+          'total': 1,
+          'is_complete': true,
+          'queue_state': 'ready',
+          'offset': 0,
+          'limit': 50,
+          'has_more': false,
+          'tracks': [
+            {
+              'track_id': 'netease_bad_url',
+              'song_id': 9999,
+              'title': 'Bad URL Track',
+              'stream_url': 'http://999.999.999.999:9999/invalid-stream',
+              'queue_index': 0,
+            },
+          ],
+        },
+        onAck: (cmdId, status, payload) {
+          ackStatus = status;
+          ackErrorCode = payload['error_code'] as String?;
+        },
+      );
+
+      syncService.start(
+        baseUrl: 'https://backend.example.ts.net',
+        deviceId: 'car_test',
+        token: 'test-token',
+        backendClient: fakeClient,
+        autoConnect: false,
+      );
+
+      final origTrack = const NeteaseQueueTrackItem(
+        trackId: 'netease_orig_safe',
+        songId: 101,
+        title: 'Original Safe',
+        artist: 'Safe Artist',
+        streamUrl: 'https://backend.example.ts.net/api/v1/music/stream/101',
+        durationMs: 180000,
+        queueIndex: 0,
+      );
+
+      CarMusicQueueController().setQueueSnapshot(MusicQueueSnapshot(
+        code: 200,
+        queueId: 'q_orig_safe',
+        queueVersion: 1,
+        source: QueueSource.neteaseFavorite,
+        total: 1,
+        isComplete: true,
+        offset: 0,
+        limit: 1,
+        hasMore: false,
+        tracks: [origTrack],
+      ));
+
+      await BuiltInPlayerService().playQueueTrack(
+        origTrack,
+        initialPosition: const Duration(milliseconds: 30000),
+        startPlaying: true,
+      );
+
+      // Trigger command to load q_bad_stream with unreachable URI
+      await syncService.handleCommand({
+        'command_id': 'cmd_fail_rollback',
+        'action': 'set_playback_mode',
+        'params': {
+          'mode': 'intelligence',
+          'queue_id': 'q_bad_stream',
+          'queue_version': 1,
+          'source': 'netease_favorite',
+        },
+      });
+
+      // Assert fail-closed rejection
+      expect(ackStatus, 'failed');
+      expect(ackErrorCode, isNotNull);
+      // Assert controller state completely rolled back
+      expect(CarMusicQueueController().queueId, 'q_orig_safe');
+      expect(CarMusicQueueController().appliedMode, PlaybackMode.listLoop);
+      expect(CarMusicQueueController().currentTrack?.trackId, 'netease_orig_safe');
     });
   });
 }

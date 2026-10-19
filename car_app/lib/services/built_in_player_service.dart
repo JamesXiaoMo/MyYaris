@@ -243,19 +243,9 @@ class BuiltInPlayerService {
     Duration? initialPosition,
     bool startPlaying = true,
     Map<String, String>? headers,
+    bool rethrowOnError = false,
   }) async {
     if (!_isInitialized) await init();
-
-    _activeRemoteTrack = LocalTrackItem(
-      id: track.trackId,
-      title: track.title,
-      artist: track.artist,
-      assetPath: track.streamUrl,
-      isLocal: false,
-      durationDesc: '${track.durationMs ~/ 1000}秒 • 在线流',
-      tag: track.album ?? '网络歌单',
-    );
-    activeRemoteTrackNotifier.value = _activeRemoteTrack;
 
     try {
       String fullStreamUrl = track.streamUrl;
@@ -274,11 +264,26 @@ class BuiltInPlayerService {
       final uri = Uri.parse(resolvedUrl);
       final source = AudioSource.uri(uri, headers: headers);
       await _player.setAudioSource(source, initialPosition: initialPosition ?? Duration.zero);
+
+      _activeRemoteTrack = LocalTrackItem(
+        id: track.trackId,
+        title: track.title,
+        artist: track.artist,
+        assetPath: track.streamUrl,
+        isLocal: false,
+        durationDesc: '${track.durationMs ~/ 1000}秒 • 在线流',
+        tag: track.album ?? '网络歌单',
+      );
+      activeRemoteTrackNotifier.value = _activeRemoteTrack;
+
       if (startPlaying) {
         unawaited(_player.play());
       }
     } catch (e) {
       debugPrint('[BuiltInPlayer] Error loading queue track: $e');
+      if (rethrowOnError) {
+        rethrow;
+      }
       await _handlePlaybackError(e.toString());
     }
   }
