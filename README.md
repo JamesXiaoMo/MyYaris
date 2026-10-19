@@ -20,7 +20,7 @@
 
 面向个人丰田 Yaris 使用场景的手机与车机互联系统，由 Flutter iPhone 客户端、Flutter Android 车机应用和 Python 后端组成。手机发送目的地或音乐控制指令，后端保存并分发任务，车机执行并回传状态。
 
-目前为自用开发项目，目标设备为 Ottocast P3 Pro，后端部署在运行 Ubuntu 的 R9000P 上，设备之间通过 Tailscale 私有网络连接。
+项目由手机端、Android 车机端与可自行部署的后端组成，不绑定特定车机盒子或服务器型号。设备间可通过 Tailscale 私有网络连接。
 
 ## 系统架构
 
@@ -28,9 +28,9 @@
 flowchart LR
     Phone["iPhone · Flutter"]
     Shortcut["iPhone 快捷指令"]
-    Server["R9000P · Ubuntu\nTailscale Serve HTTPS → FastAPI"]
+    Server["后端服务\nHTTPS → FastAPI"]
     DB[("SQLite\n用户 / 收藏 / 任务 / 指令")]
-    Car["Ottocast P3 Pro · Flutter\n导航调起 / 内置播放器 / OBD"]
+    Car["Android 车机 · Flutter\n导航调起 / 内置播放器 / OBD"]
     Nav["CAR NAVITIME"]
     Music["网易云第三方 API 服务"]
     Phone -->|HTTPS / WebSocket| Server
@@ -41,7 +41,7 @@ flowchart LR
     Car -->|Android Intent| Nav
 ```
 
-Tailscale Serve 提供 Tailnet 内的 HTTPS 入口；客户端仍验证 HTTPS 证书。此部署方式不等于将服务公开到互联网。
+使用 Tailscale Serve 时，HTTPS 入口仅在对应 Tailnet 内可达；客户端仍验证 HTTPS 证书。此部署方式不等于将服务公开到互联网。
 
 ## 功能概览
 
@@ -109,7 +109,7 @@ cd backend
 .venv/bin/pytest
 ```
 
-生产部署使用 systemd 用户服务，并由 Tailscale Serve 代理到回环地址。数据库、头像、缓存和配置文件应放在运行环境中，不纳入源码仓库。
+Linux 部署可使用 systemd 管理服务，并由 Tailscale Serve 代理到回环地址。数据库、头像、缓存和配置文件应放在运行环境中，不纳入源码仓库。
 
 ## 文档入口
 
