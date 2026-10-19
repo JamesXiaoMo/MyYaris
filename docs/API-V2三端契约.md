@@ -150,11 +150,11 @@ def resolve_car_device_id(input_id: Optional[str] = None, fallback_id: Optional[
 {
   "type": "status_update",
   "timestamp": "2026-10-19T12:00:00Z",
-  "device_id": "car_p3pro",
+  "device_id": "car_example",
   "playback_state": "playing",
   "applied_mode": "list_loop",
   "requested_mode": "list_loop",
-  "queue_id": "q_fav_12345678_987654321",
+  "queue_id": "q_fav_a1b2c3d4e5f6",
   "queue_version": 102,
   "queue_source": "netease_favorite",
   "current_index": 45,
@@ -164,11 +164,11 @@ def resolve_car_device_id(input_id: Optional[str] = None, fallback_id: Optional[
   "software_volume": 0.25,
   "capabilities": ["queue_v2", "intelligence_v1", "full_favorite_shuffle"],
   "data": {
-    "device_id": "car_p3pro",
+    "device_id": "car_example",
     "playback_state": "playing",
     "applied_mode": "list_loop",
     "requested_mode": "list_loop",
-    "queue_id": "q_fav_12345678_987654321",
+    "queue_id": "q_fav_a1b2c3d4e5f6",
     "queue_version": 102,
     "queue_source": "netease_favorite",
     "current_index": 45,
@@ -192,12 +192,12 @@ def resolve_car_device_id(input_id: Optional[str] = None, fallback_id: Optional[
   "type": "music_command",
   "timestamp": "2026-10-12T14:00:01Z",
   "command_id": "cmd_music_abc123",
-  "device_id": "car_p3pro",
+  "device_id": "car_example",
   "action": "play_track",
   "command": "play_track",
   "params": {
-    "track_id": "netease_123456",
-    "stream_url": "https://.../api/v1/music/netease/stream/123456",
+    "track_id": "netease_1901371647",
+    "stream_url": "/api/v1/music/netease/stream/1901371647",
     "title": "海阔天空",
     "artist": "Beyond",
     "seek_ms": 0,
@@ -205,7 +205,7 @@ def resolve_car_device_id(input_id: Optional[str] = None, fallback_id: Optional[
   },
   "data": {
     "command_id": "cmd_music_abc123",
-    "device_id": "car_p3pro",
+    "device_id": "car_example",
     "action": "play_track",
     "params": { ... }
   }
@@ -327,9 +327,9 @@ def resolve_car_device_id(input_id: Optional[str] = None, fallback_id: Optional[
   ```json
   {
     "command_id": "cmd_music_abc123",
-    "device_id": "car_p3pro",
+    "device_id": "car_example",
     "action": "play_track",
-    "params": { "track_id": "123" },
+    "params": { "track_id": "netease_1901371647" },
     "status": "applied",
     "sender_role": "phone",
     "dispatched_channel": "ws",
@@ -362,13 +362,13 @@ def resolve_car_device_id(input_id: Optional[str] = None, fallback_id: Optional[
   "type": "command_status",
   "timestamp": "2026-10-12T14:00:02Z",
   "command_id": "cmd_music_abc123",
-  "device_id": "car_p3pro",
+  "device_id": "car_example",
   "status": "applied",
   "error_code": null,
   "error_detail": null,
   "data": {
     "command_id": "cmd_music_abc123",
-    "device_id": "car_p3pro",
+    "device_id": "car_example",
     "status": "applied",
     "error_code": null,
     "error_detail": null
@@ -378,32 +378,45 @@ def resolve_car_device_id(input_id: Optional[str] = None, fallback_id: Optional[
 
 ---
 
-## 6. 9 大标准播控 Action 与参数字典
+## 6. 播控 Action 与全量播放队列协同规范 (V2.2 扩展)
 
+详细规范见专篇契约：[`docs/音乐播放队列与状态同步契约.md`](./音乐播放队列与状态同步契约.md)。核心原则与接口摘要如下：
+
+### 6.1 播控 Action 枚举
 | Action | 支持别名 | 关键参数 (`params`) | 说明 |
 | :--- | :--- | :--- | :--- |
-| `play_track` | `play` | `track_id`, `stream_url`, `title`, `artist`, `seek_ms` / `seek_position_ms`, `loop_mode`, `shuffle` | 播放指定音轨（本地或网易云私网中继） |
+| `play_track` | `play` | `track_id`, `stream_url`, `title`, `artist`, `seek_ms` / `seek_position_ms`, `loop_mode`, `shuffle` | 播放指定音轨（媒体流为相对路径 `/api/v1/music/netease/stream/{id}`） |
+| `set_playback_mode` | - | `mode` (`list_loop` \| `shuffle` \| `intelligence` \| `single_loop`), `seed_track_id`, `expected_queue_id`, `expected_queue_version` | 显式切换播放模式（需车机 `queue_v2` 能力门禁） |
+| `switch_queue` | - | `source` (`netease_favorite` \| `netease_intelligence` \| `single_track`), `start_index`, `start_track_id` | 显式切换播放队列源（需车机 `queue_v2` 能力门禁） |
 | `pause` | - | - | 暂停当前播放 |
 | `resume` | - | - | 恢复播放 |
 | `stop` | - | - | 停止播放并重置进度 |
-| `next` | - | - | 下一首 |
+| `next` | - | - | 下一首（由车机端基于全量元数据独立维持循环） |
 | `prev` | `previous` | - | 上一首 |
-| `seek` | - | `seek_ms` / `seek_position_ms` / `position_ms` (单位毫秒) | 跳转指定播放进度（短 TTL 保护） |
-| `set_loop` | `set_loop_mode` | `loop_mode`: `"all"` \| `"one"` \| `"off"` | 设置循环模式 |
-| `set_shuffle` | - | `shuffle`: `true` \| `false` | 设置随机播放开关 |
-| `set_volume` | - | `volume`: `0.0` ~ `1.0` (浮点数) | 设置车机软件播放音量（短 TTL 保护） |
+| `seek` | - | `seek_ms` / `seek_position_ms` / `position_ms` (单位毫秒) | 跳转指定播放进度（短 TTL 20s 保护） |
+| `set_loop` | `set_loop_mode` | `loop_mode`: `"all"` \| `"one"` \| `"off"` | 设置循环模式（向后兼容映射） |
+| `set_shuffle` | - | `shuffle`: `true` \| `false` | 设置随机播放开关（向后兼容映射） |
+| `set_volume` | - | `volume`: `0.0` ~ `1.0` (浮点数) | 设置车机软件播放音量（短 TTL 20s 保护） |
+
+### 6.2 全量播放队列不可变快照分页 (`GET /api/v1/music/queue`)
+- **纯读无副作用**：纯读幂等查询，Query 带 `?source=...` 不激活或改变当前播放队列；
+- **不可变快照版本绑定**：分页携带 `(queue_id, queue_version)`；若版本发生变更，服务端返回 `409 Conflict` (`QUEUE_VERSION_CONFLICT`)，车机丢弃脏数据重新从第 0 页拉取；
+- **Opaque 脱敏队列 ID**：喜欢歌单 `q_fav_<hash>`，心动队列 `q_intel_<hash>`，单曲队列 `q_single_<hash>`；
+- **标准错误码**：`EMPTY_PLAYLIST` (喜欢歌单为0首)、`QUEUE_NOT_READY` (队列尚未就绪)、`INTELLIGENCE_AUTH_INVALID` (上游网易云凭证无效)、`CAPABILITY_NOT_SUPPORTED` (车机未声明 `queue_v2` 能力)。
 
 ---
 
 ## 7. 端侧工程师实施对齐指引 (Alignment Guide)
 
-1. **车机端 (`car_app`) 后续对齐任务**：
-   - 在 `car_music_sync_service.dart` 执行完 `handleCommand` 之后，除上报 `sendCurrentStatus()` 外，增加发送 WS `command_ack`：
+1. **车机端 (`car_app`, Flutter 嵌入式实现) 对齐指引**：
+   - 在 `car_music_sync_service.dart` 执行完 `handleCommand` 之后，除上报 `sendCurrentStatus()` 外，发送 WS `command_ack`：
      `_webSocket?.add(jsonEncode({'type': 'command_ack', 'command_id': msg['command_id'], 'status': 'applied'}));`
-   - 若执行异常，上报 `status: 'failed'` 与对应 `error_code`。
-2. **手机端 (`ios_app`) 后续对齐任务**：
+   - 若执行异常，上报 `status: 'failed'` 与对应 `error_code`；
+   - 保持车机端纯内存元数据快照，按需拉取相对路径媒体流，严格遵守连续失败熔断上限（3 首）。
+2. **手机端 (`ios_app`, Flutter 客户端实现) 对齐指引**：
    - 现有的 `command_ack` 是即时提交成功握手；
-   - 可在 `consumeRealtime` 监听 `type == 'command_status'`，根据 `applied` 或 `failed` 刷新 UI 状态与弹窗报错。
+   - 可在 `consumeRealtime` 监听 `type == 'command_status'`，根据 `applied` 或 `failed` 刷新 UI 状态与弹窗报错；
+   - 手机端只读拉取队列与状态，不依赖任何未经验证的手机后台切歌代理假设，完全由车机音频服务自主维护循环。
 
 ---
 
