@@ -65,8 +65,8 @@ iOS App 第二页「行驶」提供底部收藏抽屉，支持车主将常用地
 | `id` | String(64) | 是 | 自动生成 | 主键，格式 `fav_[12位十六进制]` | `"fav_a1b2c3d4e5f6"` |
 | `folder_id` | String(64) | 否 | `null` | 所属文件夹 ID（新库建表含 `REFERENCES favorite_folders(id) ON DELETE SET NULL`；既有库经 `ALTER TABLE ADD COLUMN` 迁移无底层 `REFERENCES` 约束，由应用层原子事务保障），`null` 表示未分类 | `"fld_9a8b7c6d5e4f"` |
 | `folder_name` | String(64) | 否 | `null` | 响应冗余字段：所属文件夹名称，未分类时为 `null` | `"日常通勤"` |
-| `name` | String(128) | 否 | `null` | 可选自定义名称/标签（如“家”、“公司”） | `"公司"` |
-| `address` | String(512) | 是 | 无 | 详细地址文本，去除前后空格后非空 | `"北京市海淀区中关村南大街1号"` |
+| `name` | String(128) | 否 | `null` | 可选自定义名称/标签（如“家”、“公司”）；去前后空白，空字符或纯空白规范化为 `null`，超长（>128）返回 422；可与 `address` 同时为空（依靠经纬度坐标唯一定位） | `"公司"` |
+| `address` | String(512) | 否 | `""` | 可选地址文本；缺省、传入 `null` 或纯空白字符均规范化为空字符串 `""`，最大长度 512 字符；响应中固定为非空字符串类型（无详细地址时返回 `""`） | `"北京市海淀区中关村南大街1号"` |
 | `latitude` | Float (Double) | 是 | 无 | 纬度，有限数值，范围 `[-90.0, 90.0]` | `39.9567` |
 | `longitude` | Float (Double) | 是 | 无 | 经度，有限数值，范围 `[-180.0, 180.0]` | `116.3212` |
 | `coord_system` | String(32) | 否 | `"wgs84"` | **严格仅支持 `"wgs84"`**，传入 `gcj02`/`bd09` 返回 422 | `"wgs84"` |
@@ -206,16 +206,23 @@ iOS App 第二页「行驶」提供底部收藏抽屉，支持车主将常用地
   "folder_id": "fld_9a8b7c6d5e4f"
 }
 ```
-- **向后兼容与归类说明**：
+- **向后兼容与可选字段说明**：
+  - `address` 为**可选字段**（默认 `""`）：用户从地图图钉选点但无详细门牌地址时可缺省、传 `null` 或传空字符串，服务端统一落库为空字符串 `""`，最大 512 字符；
+  - `name` 为可选字段（默认 `null`）：可与 `address` 同时缺省；
   - `folder_id` 为可选字段；旧版客户端不传或传 `null`/`""` 时，默认保存为**未分类 (`folder_id: null`)**；
   - 若传入 `folder_id`，必须为当前登录账号自己的有效文件夹，否则返回 `HTTP 404 Not Found`。
 
 ### 5.3 编辑修改收藏与移动文件夹 (Update / Move Favorite)
 - **请求方式 & 路径**：`PATCH /api/v1/favorites/{id}`（同时兼容 `PUT`）
-- **请求 Body 归类语义 (`exclude_unset=True`)**：
-  1. **不传 `folder_id` 字段**（如仅传 `{"name": "新名称"}`）：保持原有所属文件夹不变；
-  2. **传入 `"folder_id": "fld_xxx"`**：将该地址移动到目标文件夹（须属于同一账号，否则返回 `404`）；
-  3. **显式传入 `"folder_id": null` 或 `""` 或 `"uncategorized"`**：将该地址移回**未分类 (`folder_id: null`)**。
+- **请求 Body 字段与归类语义 (`exclude_unset=True`)**：
+  1. **地址文本更新 (`address`)**：
+     - **不传 `address` 字段**（如仅传 `{"name": "新名称"}`）：保持原地址文本不变；
+     - **显式传入 `null`、`""` 或纯空白字符**：将该地址重置清空为空字符串 `""`；
+     - **传入非空字符串**：去除前后空白后更新（最长 512 字符，超长返回 422）；
+  2. **归类归属更新 (`folder_id`)**：
+     - **不传 `folder_id` 字段**：保持原有所属文件夹不变；
+     - **传入 `"folder_id": "fld_xxx"`**：将该地址移动到目标文件夹（须属于同一账号，否则返回 `404`）；
+     - **显式传入 `"folder_id": null` 或 `""` 或 `"uncategorized"`**：将该地址移回**未分类 (`folder_id: null`)**。
 
 ### 5.4 获取详情与删除收藏项
 - **获取详情**：`GET /api/v1/favorites/{id}`
@@ -233,7 +240,7 @@ iOS App 第二页「行驶」提供底部收藏抽屉，支持车主将常用地
 | **`403 Forbidden`** | 1. 车机角色 (`car`) 调用收藏夹/文件夹接口；<br>2. Cookie 鉴权写操作 (`POST`/`PATCH`/`PUT`/`DELETE`) 缺失或携带无效 `X-CSRF-Token` | 停止自动重试；检查当前角色或补齐 CSRF Token |
 | **`404 Not Found`** | 1. 目标 `favorite_id` 或 `folder_id` 不存在或已被删除；<br>2. 跨账号（含管理员跨用户、账号与 Legacy 池互引）访问或归类引用 | 若为删除操作或按文件夹筛选报 `404`，客户端应回退至「全部/未分类」视图并重新拉取列表 |
 | **`409 Conflict`** | 新建或重命名文件夹时，规范化名称 `lower(trim(name))` 在当前账号作用域内已存在（含并发请求触发 SQLite 唯一约束 `IntegrityError`） | 提示用户“该文件夹名称已存在”，并可刷新文件夹列表 |
-| **`422 Unprocessable Entity`** | 1. 地址或文件夹名为空/纯空白，或文件夹名超过 64 字符；<br>2. 经纬度越界或非有限数值，或 `coord_system != "wgs84"`；<br>3. `GET /api/v1/favorites` 同时传入 `uncategorized=true` 与具体 `folder_id=fld_xxx` | 修正表单输入或查询参数，禁止原样重试 |
+| **`422 Unprocessable Entity`** | 1. 文件夹名为空/纯空白，或文件夹名超过 64 字符；<br>2. 收藏地址非字符串或超过 512 字符，或名称超过 128 字符；<br>3. 经纬度越界（纬度超出 [-90, 90]，经度超出 [-180, 180]）或非有限数值，或 `coord_system != "wgs84"`；<br>4. `GET /api/v1/favorites` 同时传入 `uncategorized=true` 与具体 `folder_id=fld_xxx` | 修正表单输入或查询参数，禁止原样重试 |
 
 ### 6.2 客户端重试与幂等边界规范
 1. **重复 `DELETE` 与 `404` 刷新处理**：

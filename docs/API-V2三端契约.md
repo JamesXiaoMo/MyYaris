@@ -53,11 +53,36 @@ def resolve_car_device_id(input_id: Optional[str] = None, fallback_id: Optional[
 
 ### 2.1 纯解析阶段 (Phase 1: Pure Resolution)
 - **接口**：`POST /api/v1/destinations/resolve`
-- **请求体**：`{"raw_input": "...", "source": "ios_share"}`
-- **行为约束**：
-  - 仅负责解析经纬度、地图链接（支持 Google Maps、Apple Maps、高德等）、Plus Code 或 POI。
-  - **严禁提前创建任务**（`parse_request.task_id = None`）。
-  - 返回统一的 `destination_id` 以及解析出的地名、经纬度与置信度。
+- **请求体**：
+  ```json
+  {
+    "raw_input": "8Q7XMPR3+PP",
+    "source": "ios_share",
+    "reference_coordinate": {          // 可选，用于解析短 Plus Code（如 "MPR3+PP"）避免歧义
+      "latitude": 35.6812,
+      "longitude": 139.7671
+    }
+  }
+  ```
+- **行为约束与契约保障**：
+  - 负责解析经纬度文本、地图链接（支持 Google Maps、Apple Maps、高德等）、Plus Code（全码离线解析 / 短码配合参考坐标或地名离线解析）或 POI。
+  - **严禁提前创建任务 (Zero Eager Task)**：无论输入为 URL、纯经纬度还是 Plus Code，`auto_create_task=False` 始终生效，`tasks` 表不产生任何新增记录（`parse_request.task_id = None`）。
+  - **杜绝虚假经纬度兜底**：解析无果或短 Plus Code 缺少参考坐标/地名时，**严禁使用 `(0.0, 0.0)` 伪装成功**；直接返回 `HTTP 422 Unprocessable Entity` 并给出清晰错误或澄清提示 `detail`；仅当用户显式输入真实原点 `"0.0, 0.0"` 时才返回合法的 0 坐标。
+  - **响应结构 (`200 OK`)**：
+    ```json
+    {
+      "code": 200,
+      "destination_id": "req_12345678",
+      "name": "秋叶原电车站",
+      "latitude": 35.6983,
+      "longitude": 139.7730,
+      "confidence": 0.98,
+      "status": "resolved",
+      "message": null,
+      "clarification_question": null,
+      "needs_confirmation": false
+    }
+    ```
 
 ### 2.2 正式派发阶段 (Phase 2: Formal Dispatch)
 - **单候选/直接派发**：`POST /api/v1/tasks/destination`
