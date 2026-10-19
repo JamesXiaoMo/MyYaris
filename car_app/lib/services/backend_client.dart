@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 import '../models/task_model.dart';
+import '../models/music_queue_models.dart';
 
 class AuthException implements Exception {
   final int statusCode;
@@ -546,12 +547,100 @@ class BackendClient {
     }
   }
 
+  /// Fetches music queue snapshot page conforming to Section 3.2 / 4.1 of V2.2 contract.
+  /// Throws BackendException on non-200 responses (e.g. 409 QUEUE_VERSION_CONFLICT, 409 EMPTY_PLAYLIST).
+  Future<MusicQueueSnapshot> fetchMusicQueuePage({
+    required String baseUrl,
+    required String token,
+    String? deviceId,
+    String? source,
+    int offset = 0,
+    int limit = 50,
+    String? queueId,
+    int? queueVersion,
+  }) async {
+    final base = _normalizeUrl(baseUrl);
+    final queryParams = <String, String>{
+      'offset': offset.toString(),
+      'limit': limit.toString(),
+    };
+    if (deviceId != null && deviceId.isNotEmpty) {
+      queryParams['device_id'] = deviceId;
+    }
+    if (source != null && source.isNotEmpty) {
+      queryParams['source'] = source;
+    }
+    if (queueId != null && queueId.isNotEmpty) {
+      queryParams['queue_id'] = queueId;
+    }
+    if (queueVersion != null) {
+      queryParams['queue_version'] = queueVersion.toString();
+    }
+
+    final uri = Uri.parse('$base/api/v1/music/queue').replace(queryParameters: queryParams);
+    final req = await _httpClient.getUrl(uri);
+    req.headers.set(HttpHeaders.acceptHeader, 'application/json');
+    if (token.isNotEmpty) {
+      req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+      req.headers.set('X-Device-Token', token);
+    }
+
+    final res = await req.close().timeout(const Duration(seconds: 15));
+    final responseBody = await utf8.decodeStream(res);
+    if (res.statusCode == 200) {
+      final json = jsonDecode(responseBody) as Map<String, dynamic>;
+      return MusicQueueSnapshot.fromJson(json);
+    }
+    throw BackendException(res.statusCode, responseBody);
+  }
+
+  /// Requests authentic intelligence mode batch conforming to Section 4.2 of V2.2 contract.
+  /// seedSongId must belong to owner favorite playlist for batchIndex == 0.
+  Future<Map<String, dynamic>> requestIntelligenceBatch({
+    required String baseUrl,
+    required String token,
+    required String requestId,
+    required int seedSongId,
+    required int playlistId,
+    int batchIndex = 0,
+    int count = 30,
+  }) async {
+    final base = _normalizeUrl(baseUrl);
+    final uri = Uri.parse('$base/api/v1/music/netease/intelligence');
+    final req = await _httpClient.postUrl(uri);
+    req.headers.set(HttpHeaders.contentTypeHeader, 'application/json');
+    req.headers.set(HttpHeaders.acceptHeader, 'application/json');
+    if (token.isNotEmpty) {
+      req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+      req.headers.set('X-Device-Token', token);
+    }
+    final payload = {
+      'request_id': requestId,
+      'seed_song_id': seedSongId,
+      'playlist_id': playlistId,
+      'batch_index': batchIndex,
+      'count': count,
+    };
+    req.add(utf8.encode(jsonEncode(payload)));
+
+    final res = await req.close().timeout(const Duration(seconds: 15));
+    final responseBody = await utf8.decodeStream(res);
+    if (res.statusCode == 200) {
+      return jsonDecode(responseBody) as Map<String, dynamic>;
+    }
+    throw BackendException(res.statusCode, responseBody);
+  }
+
   /// Reports command execution acknowledgement via HTTP fallback (POST /api/v1/music/control/command/{command_id}/ack)
   Future<bool> ackMusicCommand({
     required String baseUrl,
     required String token,
     required String commandId,
     required String status,
+    String? appliedMode,
+    int? queueVersion,
+    int? currentIndex,
+    String? currentTrackId,
     String? errorCode,
     String? errorDetail,
   }) async {
@@ -568,10 +657,15 @@ class BackendClient {
       }
       final payload = {
         'status': status,
+        'applied_mode': ?appliedMode,
+        'queue_version': ?queueVersion,
+        'current_index': ?currentIndex,
+        'current_track_id': ?currentTrackId,
         'error_code': errorCode,
         'error_detail': errorDetail,
         'device_timestamp': DateTime.now().toUtc().toIso8601String(),
       };
+
       req.add(utf8.encode(jsonEncode(payload)));
 
       final res = await req.close().timeout(const Duration(seconds: 8));
@@ -580,6 +674,7 @@ class BackendClient {
       return false;
     }
   }
+
 
   /// Connects to a WebSocket endpoint using the configured HttpClient with DNS fallback and strict TLS verification
   Future<WebSocket> connectWebSocket(

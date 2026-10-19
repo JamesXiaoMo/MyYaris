@@ -3,6 +3,8 @@ import 'package:audio_session/audio_session.dart';
 import 'package:flutter/foundation.dart';
 import 'package:just_audio/just_audio.dart';
 import 'in_app_audio_stream_proxy.dart';
+import 'car_music_queue_controller.dart';
+import '../models/music_queue_models.dart';
 
 class LocalTrackItem {
   final String id;
@@ -74,8 +76,31 @@ class BuiltInPlayerService {
   final ValueNotifier<LocalTrackItem?> activeRemoteTrackNotifier = ValueNotifier(null);
   int _selectedTrackIndex = 0;
 
+  String _currentBaseUrl = '';
+  String _currentDeviceToken = '';
+
+  void setServerConfig({required String baseUrl, required String token}) {
+    _currentBaseUrl = baseUrl.trim();
+    while (_currentBaseUrl.endsWith('/')) {
+      _currentBaseUrl = _currentBaseUrl.substring(0, _currentBaseUrl.length - 1);
+    }
+    _currentDeviceToken = token.trim();
+  }
+
   LocalTrackItem get currentTrack {
     if (_activeRemoteTrack != null) return _activeRemoteTrack!;
+    final queueTrack = CarMusicQueueController().currentTrack;
+    if (queueTrack != null) {
+      return LocalTrackItem(
+        id: queueTrack.trackId,
+        title: queueTrack.title,
+        artist: queueTrack.artist,
+        assetPath: queueTrack.streamUrl,
+        isLocal: false,
+        durationDesc: '${queueTrack.durationMs ~/ 1000}秒 • 在线流',
+        tag: queueTrack.album ?? '网络歌单',
+      );
+    }
     final idx = _player.currentIndex ?? _selectedTrackIndex;
     if (idx >= 0 && idx < tracks.length) {
       return tracks[idx];
@@ -122,6 +147,22 @@ class BuiltInPlayerService {
         }
       });
 
+      // Listen to player state: completed -> autonomous progression, playing -> record success
+      _player.playerStateStream.listen((state) {
+        if (state.processingState == ProcessingState.completed) {
+          _handleTrackCompleted();
+        } else if (state.playing && state.processingState == ProcessingState.ready) {
+          CarMusicQueueController().recordPlaybackSuccess();
+        }
+      });
+
+      _player.playbackEventStream.listen((event) {
+        // Stream event received
+      }, onError: (Object e) {
+        debugPrint('[BuiltInPlayer] Playback stream error: $e');
+        _handlePlaybackError(e.toString());
+      });
+
       // 2. Load audio sources with local offline items
       final audioSources = tracks.map<AudioSource>((t) {
         if (t.isLocal) {
@@ -150,6 +191,84 @@ class BuiltInPlayerService {
     }
   }
 
+  Future<void> _handleTrackCompleted() async {
+    debugPrint('[BuiltInPlayer] Track completed processingState. Checking next track in queue...');
+    final queueCtrl = CarMusicQueueController();
+    if (queueCtrl.tracks.isNotEmpty) {
+      final nextTrack = queueCtrl.getNextTrack();
+      if (nextTrack == null) {
+        debugPrint('[BuiltInPlayer] No next track available. Stopping player.');
+        await stop();
+      } else {
+        debugPrint('[BuiltInPlayer] Autonomous progression to next track: ${nextTrack.title} (${nextTrack.trackId})');
+        await playQueueTrack(nextTrack);
+      }
+    } else {
+      if (_player.hasNext) {
+        await _player.seekToNext();
+      } else {
+        await _player.seek(Duration.zero, index: 0);
+      }
+    }
+  }
+
+  Future<void> _handlePlaybackError(String reason) async {
+    final action = CarMusicQueueController().recordPlaybackFailure(reason);
+    if (action == CircuitBreakerAction.stopPlayer) {
+      debugPrint('[BuiltInPlayer] Circuit breaker triggered! Stopping player.');
+      await stop();
+    } else {
+      debugPrint('[BuiltInPlayer] Consecutive failure < 3. Skipping to next track...');
+      await skipToNext();
+    }
+  }
+
+  /// Plays an online track from the active CarMusicQueueController
+  Future<void> playQueueTrack(
+    NeteaseQueueTrackItem track, {
+    Duration? initialPosition,
+    bool startPlaying = true,
+    Map<String, String>? headers,
+  }) async {
+    if (!_isInitialized) await init();
+
+    _activeRemoteTrack = LocalTrackItem(
+      id: track.trackId,
+      title: track.title,
+      artist: track.artist,
+      assetPath: track.streamUrl,
+      isLocal: false,
+      durationDesc: '${track.durationMs ~/ 1000}秒 • 在线流',
+      tag: track.album ?? '网络歌单',
+    );
+    activeRemoteTrackNotifier.value = _activeRemoteTrack;
+
+    try {
+      String fullStreamUrl = track.streamUrl;
+      if (fullStreamUrl.startsWith('/')) {
+        fullStreamUrl = '$_currentBaseUrl$fullStreamUrl';
+      }
+
+      final token = headers?['X-Device-Token'] ??
+          headers?['Authorization']?.replaceAll('Bearer ', '') ??
+          _currentDeviceToken;
+
+      final resolvedUrl = InAppAudioStreamProxy().resolveStreamUrl(
+        fullStreamUrl,
+        token: token,
+      );
+      final uri = Uri.parse(resolvedUrl);
+      final source = AudioSource.uri(uri, headers: headers);
+      await _player.setAudioSource(source, initialPosition: initialPosition ?? Duration.zero);
+      if (startPlaying) {
+        unawaited(_player.play());
+      }
+    } catch (e) {
+      debugPrint('[BuiltInPlayer] Error loading queue track: $e');
+      await _handlePlaybackError(e.toString());
+    }
+  }
+
   /// Plays a remote network audio stream URL (e.g. from R9000P /api/v1/music/stream or netease stream)
   Future<void> playRemoteStream(
     String streamUrl, {
@@ -173,7 +292,8 @@ class BuiltInPlayerService {
     activeRemoteTrackNotifier.value = _activeRemoteTrack;
 
     final token = headers?['X-Device-Token'] ??
-        headers?['Authorization']?.replaceAll('Bearer ', '');
+        headers?['Authorization']?.replaceAll('Bearer ', '') ??
+        _currentDeviceToken;
     final resolvedUrl = InAppAudioStreamProxy().resolveStreamUrl(
       streamUrl,
       token: token,
@@ -202,6 +322,17 @@ class BuiltInPlayerService {
   }
 
   Future<void> skipToNext() async {
+    final queueCtrl = CarMusicQueueController();
+    if (queueCtrl.tracks.isNotEmpty) {
+      final nextTrack = queueCtrl.getNextTrack();
+      if (nextTrack != null) {
+        await playQueueTrack(nextTrack);
+      } else {
+        await stop();
+      }
+      return;
+    }
+
     _activeRemoteTrack = null;
     activeRemoteTrackNotifier.value = null;
     _selectedTrackIndex = (_selectedTrackIndex + 1) % tracks.length;
@@ -213,6 +344,17 @@ class BuiltInPlayerService {
   }
 
   Future<void> skipToPrevious() async {
+    final queueCtrl = CarMusicQueueController();
+    if (queueCtrl.tracks.isNotEmpty) {
+      final prevTrack = queueCtrl.getPreviousTrack();
+      if (prevTrack != null) {
+        await playQueueTrack(prevTrack);
+      } else {
+        await stop();
+      }
+      return;
+    }
+
     _activeRemoteTrack = null;
     activeRemoteTrackNotifier.value = null;
     _selectedTrackIndex = (_selectedTrackIndex - 1 + tracks.length) % tracks.length;
@@ -222,6 +364,7 @@ class BuiltInPlayerService {
       await _player.seek(Duration.zero, index: tracks.length - 1);
     }
   }
+
 
   Future<void> selectTrack(int index) async {
     _activeRemoteTrack = null;
@@ -245,6 +388,8 @@ class BuiltInPlayerService {
   }
 
   Future<void> setLoopModeString(String mode) async {
+    final parsed = PlaybackMode.fromString(mode);
+    CarMusicQueueController().setPlaybackMode(parsed);
     switch (mode.toLowerCase().trim()) {
       case 'one':
       case 'single':
@@ -265,25 +410,31 @@ class BuiltInPlayerService {
     final current = _player.loopMode;
     switch (current) {
       case LoopMode.off:
-        await _player.setLoopMode(LoopMode.all);
+        await setLoopModeString('all');
         break;
       case LoopMode.all:
-        await _player.setLoopMode(LoopMode.one);
+        await setLoopModeString('one');
         break;
       case LoopMode.one:
-        await _player.setLoopMode(LoopMode.off);
+        await setLoopModeString('off');
         break;
     }
   }
 
   Future<void> setShuffle(bool enabled) async {
+    if (enabled) {
+      CarMusicQueueController().setPlaybackMode(PlaybackMode.shuffle);
+    } else {
+      CarMusicQueueController().setPlaybackMode(PlaybackMode.listLoop);
+    }
     await _player.setShuffleModeEnabled(enabled);
   }
 
   Future<void> toggleShuffle() async {
     final enabled = _player.shuffleModeEnabled;
-    await _player.setShuffleModeEnabled(!enabled);
+    await setShuffle(!enabled);
   }
+
 
   Future<void> setVolume(double val) async {
     _currentVolume = val.clamp(0.0, 1.0);

@@ -5,6 +5,8 @@ import 'package:flutter/foundation.dart';
 import 'backend_client.dart';
 import 'built_in_player_service.dart';
 import 'in_app_audio_stream_proxy.dart';
+import 'car_music_queue_controller.dart';
+import '../models/music_queue_models.dart';
 
 enum MusicSyncMode {
   disconnected,
@@ -58,6 +60,9 @@ class CarMusicSyncService {
   final Map<String, CommandHistoryEntry> _commandHistory = {};
   final Set<String> _executingCommands = {};
 
+  int _statusSeq = 1;
+  String? _lastAppliedCommandId;
+
   void start({
     required String baseUrl,
     required String deviceId,
@@ -81,6 +86,22 @@ class CarMusicSyncService {
         );
     _isRunning = true;
 
+    _playerService.setServerConfig(
+      baseUrl: _baseUrl,
+      token: _token,
+    );
+    CarMusicQueueController().configure(
+      baseUrl: _baseUrl,
+      token: _token,
+      deviceId: _deviceId,
+      backendClient: _backendClient,
+    );
+
+    // Coldstart zero auto-play: load metadata in background, player remains stopped/paused
+    if (CarMusicQueueController().tracks.isEmpty) {
+      unawaited(CarMusicQueueController().loadFullFavoriteQueue());
+    }
+
     InAppAudioStreamProxy().configure(
       backendClient: _backendClient,
       defaultToken: _token,
@@ -90,6 +111,7 @@ class CarMusicSyncService {
     _listenToPlayerChanges();
     _connectWebSocket();
   }
+
 
   void stop() {
     _isRunning = false;
@@ -386,50 +408,112 @@ class CarMusicSyncService {
 
     try {
       switch (action) {
+        case 'set_playback_mode':
+          final modeStr = (params['mode'] ?? params['playback_mode'])?.toString();
+          final requestedMode = PlaybackMode.fromString(modeStr);
+          final seedTrackId = params['seed_track_id']?.toString();
+          int? seedSongId;
+          if (seedTrackId != null && seedTrackId.startsWith('netease_')) {
+            seedSongId = int.tryParse(seedTrackId.replaceFirst('netease_', ''));
+          } else if (seedTrackId != null) {
+            seedSongId = int.tryParse(seedTrackId);
+          }
+          if (params['seed_song_id'] != null) {
+            seedSongId = (params['seed_song_id'] as num?)?.toInt() ?? seedSongId;
+          }
+
+          CarMusicQueueController().setPlaybackMode(requestedMode, seedSongId: seedSongId);
+
+          // Synchronize low-level loopMode/shuffleMode
+          if (requestedMode == PlaybackMode.singleLoop) {
+            await _playerService.setLoopModeString('one');
+          } else if (requestedMode == PlaybackMode.listLoop) {
+            await _playerService.setLoopModeString('all');
+            await _playerService.setShuffle(false);
+          } else if (requestedMode == PlaybackMode.shuffle) {
+            await _playerService.setShuffle(true);
+          }
+          break;
+
+
+        case 'switch_queue':
+          final source = params['source']?.toString() ?? QueueSource.neteaseFavorite;
+          final startIndex = (params['start_index'] as num?)?.toInt() ?? 0;
+          final startTrackId = params['start_track_id']?.toString();
+          final wasPlaying = _playerService.player.playing;
+
+          CarMusicQueueController().switchQueue(
+            source: source,
+            startIndex: startIndex,
+            startTrackId: startTrackId,
+          );
+
+          final cur = CarMusicQueueController().currentTrack;
+          if (cur != null) {
+            // Preserve playing/paused state across queue switches
+            await _playerService.playQueueTrack(cur, startPlaying: wasPlaying);
+          }
+          break;
+
         case 'play_track':
         case 'play':
           final trackId = (params['track_id'] ?? params['song_id'])?.toString();
-          String? streamUrl = params['stream_url'] as String?;
+          final queueCtrl = CarMusicQueueController();
 
-          // Check if trackId matches a local built-in offline asset track
-          final localIdx = _playerService.tracks.indexWhere((t) => t.id == trackId);
-          if (localIdx >= 0 && (streamUrl == null || streamUrl.isEmpty)) {
-            await _playerService.selectTrack(localIdx);
+          // 1. Check if track belongs to current active queue
+          if (trackId != null && queueCtrl.tracks.any((t) => t.trackId == trackId)) {
+            queueCtrl.selectTrackById(trackId);
+            final track = queueCtrl.currentTrack!;
+            final seekMs = (params['seek_ms'] ?? params['seek_position_ms'] ?? params['position_ms'] as num?)?.toInt() ?? 0;
+            await _playerService.playQueueTrack(
+              track,
+              initialPosition: Duration(milliseconds: seekMs),
+              startPlaying: true,
+            );
           } else {
-            // If streamUrl not directly provided, build stream URL via BackendClient
-            if (streamUrl == null || streamUrl.isEmpty) {
-              if (params['song_id'] != null || (trackId != null && trackId.startsWith('netease_'))) {
-                final sid = params['song_id']?.toString() ?? trackId!.replaceFirst('netease_', '');
-                streamUrl = _backendClient?.buildNeteaseStreamUrl(_baseUrl, sid);
-              } else if (trackId != null && trackId.isNotEmpty) {
-                streamUrl = _backendClient?.buildLocalStreamUrl(_baseUrl, trackId);
+            // 2. Check if track is a local test asset
+            final localIdx = _playerService.tracks.indexWhere((t) => t.id == trackId);
+            if (localIdx >= 0 && (params['stream_url'] == null || (params['stream_url'] as String).isEmpty)) {
+              await _playerService.selectTrack(localIdx);
+            } else {
+              // 3. Point-to-point temporary single track queue
+              String? streamUrl = params['stream_url'] as String?;
+              if (streamUrl == null || streamUrl.isEmpty) {
+                if (params['song_id'] != null || (trackId != null && trackId.startsWith('netease_'))) {
+                  final sid = params['song_id']?.toString() ?? trackId!.replaceFirst('netease_', '');
+                  streamUrl = _backendClient?.buildNeteaseStreamUrl(_baseUrl, sid);
+                } else if (trackId != null && trackId.isNotEmpty) {
+                  streamUrl = _backendClient?.buildLocalStreamUrl(_baseUrl, trackId);
+                }
               }
-            }
 
-            if (streamUrl != null && streamUrl.isNotEmpty) {
+              final songIdInt = int.tryParse(trackId?.replaceFirst('netease_', '') ?? '') ?? 0;
               final title = params['title'] as String? ?? '远端点播曲目';
-              final artist = params['artist'] as String? ?? 'R9000P 媒体库';
-              final seekMs = params['seek_ms'] as int? ??
-                  params['seek_position_ms'] as int? ??
-                  params['position_ms'] as int? ??
-                  0;
+              final artist = params['artist'] as String? ?? '网易云音乐';
+              final durationMs = (params['duration_ms'] as num?)?.toInt() ?? 0;
 
-              final headers = <String, String>{};
-              if (_token.isNotEmpty) {
-                headers['X-Device-Token'] = _token;
-                headers['Authorization'] = 'Bearer $_token';
-              }
-
-              await _playerService.playRemoteStream(
-                streamUrl,
-                trackId: trackId ?? 'remote_stream',
+              final singleItem = NeteaseQueueTrackItem(
+                trackId: trackId ?? 'track_${DateTime.now().millisecondsSinceEpoch}',
+                songId: songIdInt,
                 title: title,
                 artist: artist,
-                headers: headers,
-                initialPosition: Duration(milliseconds: seekMs),
+                album: params['album'] as String?,
+                durationMs: durationMs,
+                streamUrl: streamUrl ?? '',
+                queueIndex: 0,
               );
-            } else {
-              await _playerService.play();
+
+              queueCtrl.switchQueue(
+                source: QueueSource.singleTrack,
+                singleTrackItem: singleItem,
+              );
+
+              final seekMs = (params['seek_ms'] ?? params['seek_position_ms'] ?? params['position_ms'] as num?)?.toInt() ?? 0;
+              await _playerService.playQueueTrack(
+                singleItem,
+                initialPosition: Duration(milliseconds: seekMs),
+                startPlaying: true,
+              );
             }
           }
 
@@ -464,10 +548,7 @@ class CarMusicSyncService {
           break;
 
         case 'seek':
-          final positionMs = params['seek_ms'] as int? ??
-              params['seek_position_ms'] as int? ??
-              params['position_ms'] as int? ??
-              0;
+          final positionMs = (params['seek_position_ms'] ?? params['seek_ms'] ?? params['position_ms'] as num?)?.toInt() ?? 0;
           await _playerService.seek(Duration(milliseconds: positionMs));
           break;
 
@@ -493,11 +574,20 @@ class CarMusicSyncService {
       }
 
       if (commandId != null && commandId.isNotEmpty) {
+        _lastAppliedCommandId = commandId;
         _commandHistory[commandId] = CommandHistoryEntry(
           timestamp: DateTime.now().millisecondsSinceEpoch,
           status: 'applied',
         );
-        _reportCommandAck(commandId, status: 'applied');
+        final queueCtrl = CarMusicQueueController();
+        _reportCommandAck(
+          commandId,
+          status: 'applied',
+          appliedMode: queueCtrl.appliedMode.value,
+          queueVersion: queueCtrl.queueVersion,
+          currentIndex: queueCtrl.currentIndex,
+          currentTrackId: queueCtrl.currentTrack?.trackId ?? _playerService.currentTrack.id,
+        );
       }
       sendCurrentStatus();
     } catch (e) {
@@ -526,6 +616,10 @@ class CarMusicSyncService {
   void _reportCommandAck(
     String commandId, {
     required String status,
+    String? appliedMode,
+    int? queueVersion,
+    int? currentIndex,
+    String? currentTrackId,
     String? errorCode,
     String? errorDetail,
   }) {
@@ -537,9 +631,15 @@ class CarMusicSyncService {
           'type': 'command_ack',
           'command_id': commandId,
           'status': status,
+          'applied_mode': ?appliedMode,
+          'queue_version': ?queueVersion,
+          'current_index': ?currentIndex,
+          'current_track_id': ?currentTrackId,
           'error_code': errorCode,
           'error_detail': errorDetail,
+          'device_timestamp': DateTime.now().toUtc().toIso8601String(),
         };
+
         _webSocket!.add(jsonEncode(ackPayload));
         debugPrint('[CarMusicSync] Sent WebSocket command_ack for $commandId (status=$status)');
       } catch (e) {
@@ -551,6 +651,10 @@ class CarMusicSyncService {
         token: _token,
         commandId: commandId,
         status: status,
+        appliedMode: appliedMode,
+        queueVersion: queueVersion,
+        currentIndex: currentIndex,
+        currentTrackId: currentTrackId,
         errorCode: errorCode,
         errorDetail: errorDetail,
       ).then((ok) {
@@ -561,25 +665,47 @@ class CarMusicSyncService {
     }
   }
 
-  /// Builds standard CarStatusReportRequest payload matching backend schema
+  /// Builds standard CarStatusReportRequest payload matching V2.2 backend schema
   Map<String, dynamic> _buildStatusData() {
     final player = _playerService.player;
     final isPlaying = player.playing;
     final stateStr = isPlaying ? 'playing' : (player.position > Duration.zero ? 'paused' : 'stopped');
     final curTrack = _playerService.currentTrack;
+    final queueCtrl = CarMusicQueueController();
+
+    final statusSeq = _statusSeq++;
 
     return {
       'device_id': _deviceId,
+      'status_seq': statusSeq,
+      'last_applied_command_id': _lastAppliedCommandId,
       'playback_state': stateStr,
+      'applied_mode': queueCtrl.appliedMode.value,
+      'requested_mode': queueCtrl.requestedMode.value,
+      'queue_id': queueCtrl.queueId.isNotEmpty ? queueCtrl.queueId : null,
+      'queue_version': queueCtrl.queueVersion > 0 ? queueCtrl.queueVersion : null,
+      'queue_source': queueCtrl.queueSource,
+      'current_index': queueCtrl.currentIndex,
       'current_track_id': curTrack.id,
+      'title': curTrack.title,
+      'artist': curTrack.artist,
       'position_ms': player.position.inMilliseconds,
       'duration_ms': player.duration?.inMilliseconds ?? 0,
       'software_volume': _playerService.currentVolume,
+      'consecutive_failures': queueCtrl.consecutiveFailures,
+      'error_code': queueCtrl.errorCode,
+      'error_detail': queueCtrl.errorDetail,
+      'capabilities': const [
+        'queue_v2',
+        'intelligence_v1',
+        'full_favorite_shuffle',
+      ],
       'loop_mode': _playerService.currentLoopModeString,
       'shuffle': player.shuffleModeEnabled,
-      'updated_at': DateTime.now().millisecondsSinceEpoch,
+      'updated_at': DateTime.now().toUtc().toIso8601String(),
     };
   }
+
 
   /// Sends status payload over WebSocket wrapped in {"type": "status_update", "data": {...}}
   void sendCurrentStatus() {
