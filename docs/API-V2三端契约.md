@@ -56,31 +56,52 @@ def resolve_car_device_id(input_id: Optional[str] = None, fallback_id: Optional[
 - **请求体**：
   ```json
   {
-    "raw_input": "8Q7XMPR3+PP",
+    "raw_input": "MPR3+PP",
     "source": "ios_share",
-    "reference_coordinate": {          // 可选，用于解析短 Plus Code（如 "MPR3+PP"）避免歧义
+    "purpose": "favorite_preview",      // 可选: "favorite_preview" (默认) | "navigation"
+    "reference_coordinate": {          // 短 Plus Code 必填，且严格要求 WGS84
       "latitude": 35.6812,
-      "longitude": 139.7671
+      "longitude": 139.7671,
+      "coord_system": "wgs84"
     }
   }
   ```
 - **行为约束与契约保障**：
-  - 负责解析经纬度文本、地图链接（支持 Google Maps、Apple Maps、高德等）、Plus Code（全码离线解析 / 短码配合参考坐标或地名离线解析）或 POI。
-  - **严禁提前创建任务 (Zero Eager Task)**：无论输入为 URL、纯经纬度还是 Plus Code，`auto_create_task=False` 始终生效，`tasks` 表不产生任何新增记录（`parse_request.task_id = None`）。
-  - **杜绝虚假经纬度兜底**：解析无果或短 Plus Code 缺少参考坐标/地名时，**严禁使用 `(0.0, 0.0)` 伪装成功**；直接返回 `HTTP 422 Unprocessable Entity` 并给出清晰错误或澄清提示 `detail`；仅当用户显式输入真实原点 `"0.0, 0.0"` 时才返回合法的 0 坐标。
+  - **支持类型**：解析经纬度文本、主流地图分享短链、Plus Code（全码离线解码 / 短码必须提供显式 WGS84 参考坐标离线恢复）或在线 POI。
+  - **Open Location Code 区域中心声明**：Open Location Code (Plus Code) 表示的是地球表面分级网格区域，解码出的经纬度为**该网格单元的几何中心坐标 (`latitudeCenter`, `longitudeCenter`)，绝非建筑物大门或出入口的精确图钉坐标**。
+  - **短 Plus Code 严格约束与拒绝猜测**：
+    - 短码在 `/api/v1/destinations/resolve` 流程中**必须显式提供合法的 WGS84 参考坐标 (`coord_system: "wgs84"`)**；
+    - 若未传 `reference_coordinate`（即使文本中附带城市名称），服务端**断然拒绝并返回 `HTTP 422 Unprocessable Entity`**，严禁调用外部地理编码服务猜测，杜绝虚假经纬度 `(0.0, 0.0)` 兜底；
+    - 参照坐标非 `wgs84` 或经纬度越界同样返回 `422`。
+  - **确认状态语义 (`needs_confirmation: true`)**：
+    - 短码经参照坐标还原、全码粗粒度编码（编码长度 < 10）以及产生多个候选的检索结果，服务端固定返回 `needs_confirmation: true` 与 `status: "needs_clarification"` 及澄清提示 `clarification_question`；
+    - **确认仅用于客户端前端确认后保存至收藏夹**：为收藏预览用途 (`purpose="favorite_preview"`) 创建的解析记录，**严禁调用旧版 `POST /destinations/{id}/confirm` 创建车机导航任务**（直接返回 `HTTP 400 Bad Request`）；
+  - **严禁提前创建任务 (Zero Eager Task)**：解析阶段 `auto_create_task=False` 始终生效，`tasks` 表不产生任何新增记录（`parse_request.task_id = None`）。
+  - **多候选完整透传**：多候选时，响应中的 `candidates` 数组返回全量候选列表，客户端不可将首个候选误判为唯一确定地点。
   - **响应结构 (`200 OK`)**：
     ```json
     {
       "code": 200,
       "destination_id": "req_12345678",
-      "name": "秋叶原电车站",
+      "name": "Plus Code 8Q7XMPR3+PP",
       "latitude": 35.6983,
       "longitude": 139.7730,
-      "confidence": 0.98,
-      "status": "resolved",
+      "confidence": 0.85,
+      "status": "needs_clarification",
       "message": null,
-      "clarification_question": null,
-      "needs_confirmation": false
+      "clarification_question": "已按参照位置还原最近匹配的短编码区域中心，请确认是否为目标地点；参照位置偏差可能导致错误地点。",
+      "needs_confirmation": true,
+      "candidates": [
+        {
+          "candidate_id": "cand_98765432",
+          "title": "Plus Code 8Q7XMPR3+PP",
+          "address": "Plus Code 编码区域中心（按参照位置还原，非建筑物入口精确坐标）",
+          "latitude": 35.6983,
+          "longitude": 139.7730,
+          "coord_system": "wgs84",
+          "source": "plus_code"
+        }
+      ]
     }
     ```
 
