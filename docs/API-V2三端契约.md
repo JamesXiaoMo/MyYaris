@@ -385,7 +385,7 @@ def resolve_car_device_id(input_id: Optional[str] = None, fallback_id: Optional[
 ### 6.1 播控 Action 枚举
 | Action | 支持别名 | 关键参数 (`params`) | 说明 |
 | :--- | :--- | :--- | :--- |
-| `play_track` | `play` | `song_id`, `track_id`, `stream_url`, `title`, `artist`, `seek_position_ms` | 播放指定音轨。若曲目为当前激活队列（如喜欢歌单）成员，保持当前队列与 `source` 并更新 `queue_index`；若为非列表单曲，准备临时 `single_track` 队列 |
+| `play_track` | `play` | `song_id`, `track_id`, `source` (`netease_favorite` \| `single_track`), `queue_id`, `queue_version`, `queue_index`, `stream_url`, `title`, `artist`, `seek_position_ms` | 播放指定音轨。**显式喜欢歌单成员点播** (`source="netease_favorite"`) 校验指定快照版本 (不符返 409 `QUEUE_VERSION_CONFLICT`)、来源 (不符返 422 `QUEUE_SOURCE_MISMATCH`)、成员归属 (不在返 404 `TRACK_NOT_IN_QUEUE`)、索引匹配 (不符返 422 `QUEUE_INDEX_MISMATCH`) 及 Owner 权限 (非车主返 403 `OWNER_QUEUE_PERMISSION_DENIED`)，校验失败零落库拦截；成功时注册待定快照，不增版本，车机 ACK applied 后提升为活跃队列并切为 `list_loop`；**显式单曲点播** (`source="single_track"`) 准备单曲队列；**缺省兼容点播** (未传 `source`) 若为当前活跃队列成员则保持队列并更新索引，否则准备单曲队列 |
 | `set_playback_mode` | - | `mode` (`list_loop` \| `shuffle` \| `intelligence` \| `single_loop`), `seed_song_id`, `expected_queue_id`, `expected_queue_version` | 显式切换播放模式（限 Owner/Admin，需车机 `queue_v2` 能力门禁） |
 | `switch_queue` | - | `source` (`netease_favorite` \| `netease_intelligence` \| `single_track`), `start_index`, `start_track_id` | 显式切换播放队列源（限 Owner/Admin，需车机 `queue_v2` 能力门禁） |
 | `pause` | - | - | 暂停当前播放 |
@@ -409,7 +409,7 @@ def resolve_car_device_id(input_id: Optional[str] = None, fallback_id: Optional[
 - **独立单调递增水位表**：`queue_version` 采用独立的 SQLite `queue_version_sequences` 表持久化水位序列号，毫秒精度单调递增，彻底与车机当前状态解耦，重启或缓存清理后依然保持严格递增且不碰撞；
 - **单指令原子状态流转**：发送 `play_track` / `set_playback_mode` / `switch_queue` 时服务端注入 `queue_id`/`queue_version` 并更新 `requested_mode`；仅当车机真正上报 `applied` ACK 时，DB 状态中的 `applied_mode`、`queue_id`、`queue_version` 与 `queue_source` 方正式提交；
 - **Opaque 脱敏队列 ID**：喜欢歌单 `q_fav_<hash>`，心动队列 `q_intel_<hash>`，单曲队列 `q_single_<hash>`；
-- **标准错误码**：`EMPTY_PLAYLIST` (喜欢歌单为0首)、`QUEUE_NOT_READY` (队列尚未就绪)、`INTELLIGENCE_AUTH_INVALID` (上游网易云凭证无效)、`CAPABILITY_NOT_SUPPORTED` (车机未声明 `queue_v2` 能力)。
+- **标准错误码**：`EMPTY_PLAYLIST` (喜欢歌单为0首)、`QUEUE_NOT_READY` (队列尚未就绪)、`INTELLIGENCE_AUTH_INVALID` (上游网易云凭证无效)、`CAPABILITY_NOT_SUPPORTED` (车机未声明 `queue_v2` 能力)、`TRACK_NOT_IN_QUEUE` (点播曲目不在队列中)、`QUEUE_SOURCE_MISMATCH` (队列源不匹配)、`QUEUE_INDEX_MISMATCH` (索引不匹配)、`OWNER_QUEUE_PERMISSION_DENIED` (普通用户越权点播车主队列)。
 
 ---
 
