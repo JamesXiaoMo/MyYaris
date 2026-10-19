@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/obd_telemetry.dart';
+import '../models/obd_deep_scan_result.dart';
 
 class CarObdService {
   static final CarObdService _instance = CarObdService._internal();
@@ -21,6 +22,12 @@ class CarObdService {
   final ValueNotifier<bool> isScanningNotifier = ValueNotifier<bool>(false);
   final ValueNotifier<List<String>> debugLogNotifier =
       ValueNotifier<List<String>>([]);
+  final ValueNotifier<bool> isDeepScanningNotifier = ValueNotifier<bool>(false);
+  final ValueNotifier<ObdDeepScanReport?> lastDeepScanReportNotifier =
+      ValueNotifier<ObdDeepScanReport?>(null);
+
+  bool _isDeepScanning = false;
+  bool _cancelDeepScanRequested = false;
 
   BluetoothDevice? _connectedDevice;
   BluetoothCharacteristic? _writeCharacteristic;
@@ -30,6 +37,7 @@ class CarObdService {
 
   final StringBuffer _rxBuffer = StringBuffer();
   Completer<String>? _cmdCompleter;
+  Completer<void>? _cmdQueue;
   Timer? _pollingTimer;
   bool _isPollingBusy = false;
   int _pollCycleCount = 0;
@@ -144,52 +152,22 @@ class CarObdService {
 
       log('🔎 正在发现 GATT 服务与串口特征值...');
       final services = await device.discoverServices();
-      BluetoothCharacteristic? writeChar;
-      BluetoothCharacteristic? notifyChar;
+      final channel = _resolveObdGattChannel(services);
 
-      for (final service in services) {
-        for (final char in service.characteristics) {
-          final props = char.properties;
-          final isWritable = props.write || props.writeWithoutResponse;
-          final isNotifiable = props.notify || props.indicate;
-
-          // 匹配常见 OBD BLE 串口特征值 (0xFFE1, Nordic UART, 或兼具读写特征)
-          final uuidStr = char.uuid.str128.toLowerCase();
-          if (uuidStr.contains('ffe1') ||
-              uuidStr.contains('6e400002') ||
-              uuidStr.contains('6e400003') ||
-              uuidStr.contains('18f0') ||
-              (isWritable && isNotifiable)) {
-            if (isWritable && writeChar == null) writeChar = char;
-            if (isNotifiable && notifyChar == null) notifyChar = char;
-          }
-        }
-      }
-
-      // 若未精准匹配特定 UUID，寻找第一个可写且可通知的特征
-      if (writeChar == null || notifyChar == null) {
-        for (final service in services) {
-          for (final char in service.characteristics) {
-            if (writeChar == null &&
-                (char.properties.write || char.properties.writeWithoutResponse)) {
-              writeChar = char;
-            }
-            if (notifyChar == null &&
-                (char.properties.notify || char.properties.indicate)) {
-              notifyChar = char;
-            }
-          }
-        }
-      }
-
-      if (writeChar == null || notifyChar == null) {
+      if (channel == null) {
         log('❌ 未能在该设备中找到兼容的串口 GATT 读写通道');
         await disconnect();
         _updateStatus(ObdConnectionStatus.error, message: '未找到 OBD 串口特征值');
         return false;
       }
 
-      _writeCharacteristic = writeChar;
+      _writeCharacteristic = channel.writeCharacteristic;
+      final notifyChar = channel.notifyCharacteristic;
+
+      log('🎯 锁定 OBD 通信通道 [${channel.profileName}]');
+      log('   🔹 服务: ${channel.service.uuid.str128}');
+      log('   🔸 TX写特征: ${channel.writeCharacteristic.uuid.str128}');
+      log('   🔸 RX读特征: ${channel.notifyCharacteristic.uuid.str128}');
 
       // 开启数据下行监听
       await notifyChar.setNotifyValue(true);
@@ -213,7 +191,7 @@ class CarObdService {
 
       _updateStatus(
         ObdConnectionStatus.ready,
-        message: 'OBD 连接就绪，开始实时采集',
+        message: 'OBD 适配器就绪，开始实时采集',
         deviceName: deviceName,
         deviceId: device.remoteId.str,
       );
@@ -224,7 +202,9 @@ class CarObdService {
     } catch (e) {
       log('❌ 连接失败: $e');
       await disconnect();
-      _updateStatus(ObdConnectionStatus.error, message: '连接失败: $e');
+      final isTimeout = e.toString().contains('Timed out');
+      final msg = isTimeout ? '连接超时 (模块可能休眠，请开启车辆电源唤醒)' : '连接失败: $e';
+      _updateStatus(ObdConnectionStatus.error, message: msg);
       return false;
     }
   }
@@ -232,29 +212,59 @@ class CarObdService {
   // --- 3. ELM327 AT 指令集初始化流程 ---
   Future<bool> _initializeElm327() async {
     try {
-      // 1. 复位
+      // 1. 复位适配器
       var resp = await sendRawCommand('ATZ', timeout: const Duration(seconds: 2));
       log('ATZ 应答: $resp');
+      // 给 ELM327 芯片 350ms 重新稳定内部波特率与缓冲区
+      await Future.delayed(const Duration(milliseconds: 350));
 
-      // 2. 关闭回显
-      await sendRawCommand('ATE0');
-      // 3. 关闭换行符
+      // 2. 关闭回显与换行
+      final ate0Resp = await sendRawCommand('ATE0');
+      log('ATE0 (关闭回显) 应答: $ate0Resp');
       await sendRawCommand('ATL0');
-      // 4. 关闭空格加速传输
+
+      // 3. 读取适配器标识 (只读识别)
+      final ati = await sendRawCommand('ATI');
+      log('ATI (固件识别) 应答: $ati');
+
+      // 4. 读取 12V 蓄电池引脚电压 (引脚16独立 ADC 测量，不依赖车辆 ECU 就绪)
+      final atrv = await sendRawCommand('ATRV');
+      log('ATRV (12V 电瓶电压) 应答: $atrv');
+      final battV = _parseAtRv(atrv);
+      if (battV != null) {
+        _updateTelemetry((t) => t.copyWith(
+              aux12vVoltage: battV,
+            ));
+      }
+
+      // 5. 关闭空格加速传输
       await sendRawCommand('ATS0');
-      // 5. 关闭报头 (默认)
+
+      // 6. 关闭多余报头 (标准 PID 模式)
       await sendRawCommand('ATH0');
-      // 6. 自适应超时
+
+      // 7. 自适应超时
       await sendRawCommand('ATAT1');
-      // 7. 锁定丰田 CAN 协议: ISO 15765-4 CAN 11-bit 500k
+
+      // 8. 锁定丰田 CAN 协议: ISO 15765-4 CAN 11-bit 500k
       resp = await sendRawCommand('ATSP6');
       log('ATSP6 (锁定 CAN 11-bit 500k) 应答: $resp');
 
-      // 8. 测试读取支持的 PID 0100 确认车辆 CAN 就绪
+      // 9. 测试读取支持的 PID 0100 确认车辆 CAN 就绪
       resp = await sendRawCommand('0100', timeout: const Duration(seconds: 3));
       log('0100 测试应答: $resp');
 
-      return resp.isNotEmpty && !resp.contains('UNABLE') && !resp.contains('ERROR');
+      if (resp.contains('4100') || resp.contains('41 00')) {
+        log('🎉 车辆 ECU 已成功响应 PID 0100，CAN 总线已联机');
+      } else {
+        log('ℹ️ 车辆 ECU 当前未应答 (车辆可能处于 OFF/ACC 档位)，适配器保持监听等待切入 READY');
+      }
+
+      // 只要适配器能响应 AT 指令 (ATE0/ATI/ATRV 正常返回非 ERROR)，即认定适配器链路正常
+      final adapterOk = (ate0Resp.isNotEmpty && !ate0Resp.startsWith('ERROR')) ||
+          (ati.isNotEmpty && !ati.startsWith('ERROR')) ||
+          (atrv.isNotEmpty && !atrv.startsWith('ERROR'));
+      return adapterOk;
     } catch (e) {
       log('初始化指令异常: $e');
       return false;
@@ -420,6 +430,11 @@ class CarObdService {
   // 0105 / 010F / 0146: 41 XX YY -> YY - 40
   double? _parseStandardTemp(String resp) {
     final clean = _cleanHex(resp);
+    final match = RegExp(r'41(05|0F|46)([0-9A-F]{2})').firstMatch(clean);
+    if (match != null) {
+      final val = int.tryParse(match.group(2)!, radix: 16);
+      if (val != null) return val - 40.0;
+    }
     if (clean.length >= 6) {
       final hexVal = clean.substring(clean.length - 2);
       final val = int.tryParse(hexVal, radix: 16);
@@ -428,9 +443,14 @@ class CarObdService {
     return null;
   }
 
-  // 0111 / 0104: (XX * 100) / 255
+  // 0111 / 0104 / 012F: (XX * 100) / 255
   double? _parsePercent(String resp) {
     final clean = _cleanHex(resp);
+    final match = RegExp(r'41(11|04|2F)([0-9A-F]{2})').firstMatch(clean);
+    if (match != null) {
+      final val = int.tryParse(match.group(2)!, radix: 16);
+      if (val != null) return (val * 100.0) / 255.0;
+    }
     if (clean.length >= 6) {
       final hexVal = clean.substring(clean.length - 2);
       final val = int.tryParse(hexVal, radix: 16);
@@ -561,6 +581,30 @@ class CarObdService {
     String command, {
     Duration timeout = const Duration(milliseconds: 1200),
   }) async {
+    while (_cmdQueue != null) {
+      try {
+        await _cmdQueue!.future;
+      } catch (_) {}
+    }
+    final queueCompleter = Completer<void>();
+    _cmdQueue = queueCompleter;
+
+    try {
+      return await _sendRawCommandInternal(command, timeout: timeout);
+    } finally {
+      if (_cmdQueue == queueCompleter) {
+        _cmdQueue = null;
+      }
+      if (!queueCompleter.isCompleted) {
+        queueCompleter.complete();
+      }
+    }
+  }
+
+  Future<String> _sendRawCommandInternal(
+    String command, {
+    Duration timeout = const Duration(milliseconds: 1200),
+  }) async {
     final writeChar = _writeCharacteristic;
     if (writeChar == null || _connectedDevice == null) {
       return 'ERROR: DISCONNECTED';
@@ -572,12 +616,24 @@ class CarObdService {
     final formatted = '${command.trim()}\r';
     final bytes = ascii.encode(formatted);
 
+    final hasWriteNoResp = writeChar.properties.writeWithoutResponse;
+    final hasWrite = writeChar.properties.write;
+    final useWithoutResponse = hasWriteNoResp;
+
     try {
-      if (writeChar.properties.writeWithoutResponse) {
-        await writeChar.write(bytes, withoutResponse: true);
-      } else {
-        await writeChar.write(bytes, withoutResponse: false);
+      try {
+        await writeChar.write(bytes, withoutResponse: useWithoutResponse);
+      } catch (e) {
+        if (hasWrite && hasWriteNoResp) {
+          log('⚠️ 切换写入模式重试: withoutResponse=${!useWithoutResponse}');
+          await writeChar.write(bytes, withoutResponse: !useWithoutResponse);
+        } else {
+          rethrow;
+        }
       }
+
+      // 指令间隔安全延时，保护低功耗蓝牙芯片 FIFO
+      await Future.delayed(const Duration(milliseconds: 25));
 
       final response = await _cmdCompleter!.future.timeout(
         timeout,
@@ -653,11 +709,527 @@ class CarObdService {
     telemetryNotifier.value = updater(telemetryNotifier.value);
   }
 
+  // --- 8. 全车数据一键深度探测与扫描引擎 (Deep Scan & Export) ---
+  bool get isDeepScanning => _isDeepScanning;
+
+  void cancelDeepScan() {
+    if (_isDeepScanning) {
+      _cancelDeepScanRequested = true;
+      log('⚠️ 用户请求终止全车深度扫描');
+    }
+  }
+
+  Future<ObdDeepScanReport?> runDeepScan({
+    void Function(double progress, String status, ObdDiscoveredItem? newItem)?
+        onProgress,
+  }) async {
+    if (!isConnected || _isDeepScanning) return null;
+    _isDeepScanning = true;
+    _cancelDeepScanRequested = false;
+    isDeepScanningNotifier.value = true;
+
+    // 暂停周期性轮询，避免总线串口请求冲突
+    _pollingTimer?.cancel();
+
+    final startTime = DateTime.now();
+    log('🔬 启动全车深度扫描与数据探索 (Deep Scan)...');
+
+    final discoveredItems = <ObdDiscoveredItem>[];
+    final activeEcus = <String>[];
+    String protocolName = 'ISO 15765-4 CAN 11-bit 500k';
+
+    try {
+      // 1. 读取通信协议
+      final dpResp = await sendRawCommand('ATDP');
+      if (dpResp.isNotEmpty && !dpResp.contains('ERROR')) {
+        protocolName = dpResp;
+      }
+
+      // 2. 发现活跃 ECU 节点
+      onProgress?.call(0.04, '正在探测全车在线 ECU 电脑节点...', null);
+      await sendRawCommand('ATH1'); // 临时开启报头
+      final ecuProbeResp =
+          await sendRawCommand('0100', timeout: const Duration(seconds: 3));
+      await sendRawCommand('ATH0'); // 关闭报头
+
+      final ecuMap = {
+        '7E8': 'ECM 发动机控制电脑',
+        '7EA': 'HV 混动系统控制电脑',
+        '7EB': 'EVB 混动动力电池电脑',
+        '7B8': 'Combination Meter 组合仪表',
+        '7D8': 'A/C 空调与车身电脑',
+        '738': 'EPS 电子助力转向',
+        '768': 'TSS 毫米波雷达/主动安全',
+      };
+
+      for (final entry in ecuMap.entries) {
+        if (ecuProbeResp.contains(entry.key)) {
+          activeEcus.add('${entry.key} (${entry.value})');
+        }
+      }
+      if (activeEcus.isEmpty) {
+        activeEcus.add('7E8 (ECM 发动机节点)');
+        activeEcus.add('7EA (HV 混动系统节点)');
+      }
+      log('发现活跃 ECU 节点: $activeEcus');
+
+      // 3. 构建全车探测探针列表
+      final probeList = _buildProbeList();
+      final totalCount = probeList.length;
+      int testedCount = 0;
+      int supportedCount = 0;
+
+      for (final probe in probeList) {
+        if (_cancelDeepScanRequested) {
+          log('⚠️ 深度扫描已被用户提前终止');
+          break;
+        }
+
+        testedCount++;
+        final progress = 0.08 + (testedCount / totalCount) * 0.90;
+        onProgress?.call(
+            progress, '探测 ${probe.category}: ${probe.cmd} (${probe.name})...', null);
+
+        // 切换报头 (若指定特定 ECU)
+        if (probe.header != null) {
+          await sendRawCommand('ATSH${probe.header}');
+        }
+
+        final sw = Stopwatch()..start();
+        final rawResp = await sendRawCommand(probe.cmd,
+            timeout: const Duration(milliseconds: 1400));
+        sw.stop();
+
+        final isSupported = _isResponseValid(rawResp, probe.cmd);
+        String? hint;
+        if (isSupported) {
+          supportedCount++;
+          hint = _formatSampleValue(probe.cmd, rawResp);
+          log('✅ 发现有效数据 [${probe.header ?? "7DF"}] ${probe.cmd} (${probe.name}): $rawResp ${hint != null ? "-> $hint" : ""}');
+        }
+
+        final item = ObdDiscoveredItem(
+          category: probe.category,
+          header: probe.header ?? '7DF',
+          command: probe.cmd,
+          name: probe.name,
+          rawHexResponse: rawResp,
+          decodedHint: hint,
+          responseTimeMs: sw.elapsedMilliseconds,
+          isSupported: isSupported,
+        );
+        discoveredItems.add(item);
+        onProgress?.call(
+            progress, '已测 $testedCount/$totalCount (开放 $supportedCount 项)', item);
+
+        // 微小停顿，避免过密占用 CAN 总线
+        await Future.delayed(const Duration(milliseconds: 30));
+      }
+
+      // 还原广播报头
+      await sendRawCommand('ATSH7DF');
+      await sendRawCommand('ATH0');
+
+      final report = ObdDeepScanReport(
+        startTime: startTime,
+        endTime: DateTime.now(),
+        deviceName: connectedDeviceName ?? 'Veepeak OBDCheck BLE+',
+        protocolName: protocolName,
+        activeEcus: activeEcus,
+        items: discoveredItems,
+        totalTested: testedCount,
+        totalSupported: supportedCount,
+      );
+
+      lastDeepScanReportNotifier.value = report;
+      log('🎉 深度扫描完成！共测试 $testedCount 项，车辆开放响应 $supportedCount 项');
+      return report;
+    } catch (e) {
+      log('❌ 深度扫描异常: $e');
+      return null;
+    } finally {
+      _isDeepScanning = false;
+      _cancelDeepScanRequested = false;
+      isDeepScanningNotifier.value = false;
+      // 恢复常规轮询
+      _startPolling();
+    }
+  }
+
+  bool _isResponseValid(String raw, String cmd) {
+    if (raw.isEmpty ||
+        raw.contains('NO DATA') ||
+        raw.contains('UNABLE') ||
+        raw.contains('ERROR') ||
+        raw.contains('TIMEOUT') ||
+        raw.contains('7F')) {
+      return false;
+    }
+    final clean = _cleanHex(raw);
+    if (clean.length < 4) return false;
+
+    // 针对 Mode 01: 正响应以 41 开头
+    if (cmd.startsWith('01') && clean.contains('41')) return true;
+    // 针对 Mode 09: 正响应以 49 开头
+    if (cmd.startsWith('09') && clean.contains('49')) return true;
+    // 针对 Mode 21: 正响应以 61 开头
+    if (cmd.startsWith('21') && clean.contains('61')) return true;
+    // 针对 Mode 22: 正响应以 62 开头
+    if (cmd.startsWith('22') && clean.contains('62')) return true;
+
+    return true;
+  }
+
+  String? _formatSampleValue(String cmd, String raw) {
+    if (cmd == '010D') {
+      final s = _parseStandardSpeed(raw);
+      if (s != null) return '${s.toInt()} km/h';
+    } else if (cmd == '010C') {
+      final r = _parseStandardRpm(raw);
+      if (r != null) return '${r.toInt()} rpm';
+    } else if (cmd == '0105') {
+      final c = _parseStandardTemp(raw);
+      if (c != null) return '${c.toInt()} °C (水温)';
+    } else if (cmd == '21C3') {
+      return '混动核心遥测 (包含电池SoC/总电压/充放电流/逆变器温)';
+    } else if (cmd == '21C4') {
+      return '升压变压器与扭矩 (包含升压前VL/升压后VH)';
+    } else if (cmd == '21CE') {
+      return '油温与动力总成高阶参数';
+    } else if (cmd == '0111') {
+      final p = _parsePercent(raw);
+      if (p != null) return '${p.toStringAsFixed(1)}% (节气门)';
+    } else if (cmd == '0142') {
+      final v = _parseAtRv(raw);
+      if (v != null) return '${v.toStringAsFixed(2)} V (12V小电池)';
+    } else if (cmd == '0902') {
+      return '车辆 VIN 码';
+    }
+    return null;
+  }
+
+  List<_ProbeEntry> _buildProbeList() {
+    return const [
+      // 1. 标准 OBD-II / JOBD (Mode 01)
+      _ProbeEntry('标准OBD', null, '0104', '发动机计算负荷 (Engine Load)'),
+      _ProbeEntry('标准OBD', null, '0105', '发动机冷却液温度 (Coolant Temp)'),
+      _ProbeEntry('标准OBD', null, '0106', '短期燃油修正 Bank 1 (STFT)'),
+      _ProbeEntry('标准OBD', null, '0107', '长期燃油修正 Bank 1 (LTFT)'),
+      _ProbeEntry('标准OBD', null, '010A', '燃油压力表压 (Fuel Pressure)'),
+      _ProbeEntry('标准OBD', null, '010B', '进气歧管绝对压力 (MAP)'),
+      _ProbeEntry('标准OBD', null, '010C', '发动机实际转速 (Engine RPM)'),
+      _ProbeEntry('标准OBD', null, '010D', '车辆行驶车速 (Vehicle Speed)'),
+      _ProbeEntry('标准OBD', null, '010E', '点火提前角 (Timing Advance)'),
+      _ProbeEntry('标准OBD', null, '010F', '进气空气温度 (Intake Air Temp)'),
+      _ProbeEntry('标准OBD', null, '0110', '进气空气质量流量 (MAF)'),
+      _ProbeEntry('标准OBD', null, '0111', '绝对节气门位置 (Throttle Position)'),
+      _ProbeEntry('标准OBD', null, '0112', '二次空气指令状态 (Secondary Air)'),
+      _ProbeEntry('标准OBD', null, '0113', '氧传感器布置状态 (O2 Sensors)'),
+      _ProbeEntry('标准OBD', null, '0114', '氧传感器 1 电压 (O2 Bank 1 Sensor 1)'),
+      _ProbeEntry('标准OBD', null, '0115', '氧传感器 2 电压 (O2 Bank 1 Sensor 2)'),
+      _ProbeEntry('标准OBD', null, '011C', 'OBD 认证法规标准 (JOBD / OBD)'),
+      _ProbeEntry('标准OBD', null, '011F', '发动机本次启动运行时间 (Run Time)'),
+      _ProbeEntry('标准OBD', null, '0121', '故障灯点亮后行驶距离 (Distance with MIL)'),
+      _ProbeEntry('标准OBD', null, '012E', '蒸发排放脱附指令 (Evap Purge)'),
+      _ProbeEntry('标准OBD', null, '012F', '燃油箱液位输入百分比 (Fuel Level %)'),
+      _ProbeEntry('标准OBD', null, '0130', '清码后热车循环次数 (Warm-ups)'),
+      _ProbeEntry('标准OBD', null, '0131', '清码后累计行驶距离 (Distance Cleared)'),
+      _ProbeEntry('标准OBD', null, '0132', '蒸发系统蒸汽压力 (Evap Vapor Press)'),
+      _ProbeEntry('标准OBD', null, '0133', '绝对大气压强 (Barometric Pressure)'),
+      _ProbeEntry('标准OBD', null, '0134', '空燃比当量比 (Lambda Equivalence)'),
+      _ProbeEntry('标准OBD', null, '013C', '催化转化器温度 1 (Cat Temp Sensor 1)'),
+      _ProbeEntry('标准OBD', null, '013D', '催化转化器温度 2 (Cat Temp Sensor 2)'),
+      _ProbeEntry('标准OBD', null, '0142', 'ECU 控制模块供电电压 (Module Voltage)'),
+      _ProbeEntry('标准OBD', null, '0143', '绝对负荷值 (Absolute Load)'),
+      _ProbeEntry('标准OBD', null, '0144', '指令空燃比当量比 (Commanded Equivalence)'),
+      _ProbeEntry('标准OBD', null, '0145', '相对节气门位置 (Relative Throttle)'),
+      _ProbeEntry('标准OBD', null, '0146', '车外环境空气温度 (Ambient Air Temp)'),
+      _ProbeEntry('标准OBD', null, '0147', '绝对节气门位置 B (Throttle Position B)'),
+      _ProbeEntry('标准OBD', null, '0149', '油门踏板位置 D (Pedal Position D)'),
+      _ProbeEntry('标准OBD', null, '014A', '油门踏板位置 E (Pedal Position E)'),
+      _ProbeEntry('标准OBD', null, '014C', '节气门作动器指令 (Throttle Actuator)'),
+      _ProbeEntry('标准OBD', null, '015C', '发动机机油温度 (Engine Oil Temp)'),
+      _ProbeEntry('标准OBD', null, '015E', '发动机燃油消耗流率 (Fuel Rate L/h)'),
+      _ProbeEntry('标准OBD', null, '01A6', '整车仪表累计总里程 (Odometer)'),
+
+      // 2. 车辆与诊断元数据 (Mode 09)
+      _ProbeEntry('车辆信息', null, '0902', '车辆识别代号 (VIN)'),
+      _ProbeEntry('车辆信息', null, '0904', '标定识别号 (CALID)'),
+      _ProbeEntry('车辆信息', null, '0906', '标定验证号 (CVN)'),
+      _ProbeEntry('车辆信息', null, '090A', 'ECU 模块名称 (ECU Name)'),
+
+      // 3. 丰田专有混动系统 (Header 0x7E2 / 0x7E3)
+      _ProbeEntry('丰田混动', '7E2', '2101', '混动综合状态基础块 (HV Base Data)'),
+      _ProbeEntry('丰田混动', '7E2', '2181', '动力电池单体/模组电压 (HV Cell Voltages)'),
+      _ProbeEntry('丰田混动', '7E2', '2182', '动力电池单体内阻 (HV Internal Resistance)'),
+      _ProbeEntry('丰田混动', '7E2', '2187', '动力电池包 6 点温感 (HV Temperatures)'),
+      _ProbeEntry('丰田混动', '7E2', '21C3', '混动核心三电矩阵 (SOC, VB, IB, MG1/MG2)'),
+      _ProbeEntry('丰田混动', '7E2', '21C4', '升压变压器与扭矩 (VL, VH, Boost Temp)'),
+      _ProbeEntry('丰田混动', '7E2', '21CE', '混动变速箱/电驱桥油温 (Transaxle Oil Temp)'),
+      _ProbeEntry('丰田混动', '7E2', '21CF', '双电机转子/定子温度 (Motor Temp)'),
+      _ProbeEntry('丰田混动', '7E2', '21D0', '再生制动与刹车踏板力 (Regen Brake Torque)'),
+      _ProbeEntry('丰田混动', '7E2', '220101', 'UDS 混动电池包扩充遥测 (Battery Pack Ext)'),
+      _ProbeEntry('丰田混动', '7E2', '221024', 'UDS 混动系统功率限值 (Hybrid System Limits)'),
+      _ProbeEntry('丰田混动', '7E2', '222006', 'UDS 车辆总里程 (HV Total Odometer)'),
+      _ProbeEntry('丰田混动', '7E2', '222884', 'UDS 锂电池寿命与电量 (Battery Pack Life)'),
+      _ProbeEntry('丰田混动', '7E2', '22F190', 'UDS 车辆底盘与 VIN 标识'),
+      _ProbeEntry('丰田混动', '7E2', '22F187', 'UDS 混动电脑零件号 (Spare Part Number)'),
+      _ProbeEntry('丰田混动', '7E2', '22F189', 'UDS 混动固件版本号 (ECU Software Version)'),
+
+      // 4. 丰田专出发动机 ECM (Header 0x7E0)
+      _ProbeEntry('发动机ECM', '7E0', '2101', '发动机 ECM 综合遥测块 (Engine Pack)'),
+      _ProbeEntry('发动机ECM', '7E0', '21CE', '机油温度与机油压力 (Oil Temp & Pressure)'),
+      _ProbeEntry('发动机ECM', '7E0', '21D4', '电子冷却水泵目标/实际转速 (Water Pump RPM)'),
+      _ProbeEntry('发动机ECM', '7E0', '21D5', '进气电驱可变凸轮 VVT-iE 角度 (VVT-iE Angle)'),
+      _ProbeEntry('发动机ECM', '7E0', '21D6', '排气凸轮轴 VVT 角度 (Exhaust VVT Angle)'),
+      _ProbeEntry('发动机ECM', '7E0', '21D8', '燃油喷油嘴喷射脉宽 (Injector Pulse Width)'),
+      _ProbeEntry('发动机ECM', '7E0', '221234', 'ECM 专有复合传感器块 (Extended Sensors)'),
+      _ProbeEntry('发动机ECM', '7E0', '222006', 'ECM 记录总里程 (ECM Total Odometer)'),
+      _ProbeEntry('发动机ECM', '7E0', '222008', '累计燃油消耗总量 (Total Fuel Consumed L)'),
+    ];
+  }
+
+  ObdGattChannel? _resolveObdGattChannel(List<BluetoothService> services) {
+    const excludedServicePrefixes = [
+      '00001800', // Generic Access (0x2A00 Device Name)
+      '00001801', // Generic Attribute (0x2A05 Service Changed)
+      '0000180a', // Device Information
+      '0000180f', // Battery Service
+      '00001805', // Current Time
+      '00001804', // Tx Power
+      '00001803', // Link Loss
+      '00001802', // Immediate Alert
+    ];
+
+    bool isSigExcluded(String uuid) {
+      final lower = uuid.toLowerCase();
+      return excludedServicePrefixes.any((prefix) => lower.startsWith(prefix));
+    }
+
+    // 1. Veepeak / Vgate / Generic FFF0 Profile (Service: 0xFFF0, Write: 0xFFF2, Notify: 0xFFF1)
+    for (final service in services) {
+      final sUuid = service.uuid.str128.toLowerCase();
+      if (sUuid.contains('fff0')) {
+        BluetoothCharacteristic? w;
+        BluetoothCharacteristic? n;
+        for (final c in service.characteristics) {
+          final cUuid = c.uuid.str128.toLowerCase();
+          final props = c.properties;
+          if (cUuid.contains('fff2') || (props.write || props.writeWithoutResponse)) {
+            if (props.write || props.writeWithoutResponse) w ??= c;
+          }
+          if (cUuid.contains('fff1') || (props.notify || props.indicate)) {
+            if (props.notify || props.indicate) n ??= c;
+          }
+        }
+        if (w != null && n != null) {
+          return ObdGattChannel(
+            service: service,
+            writeCharacteristic: w,
+            notifyCharacteristic: n,
+            profileName: 'Veepeak/Vgate FFF0',
+          );
+        }
+      }
+    }
+
+    // 2. Nordic UART Service (NUS) (Service: 6E400001, Write: 6E400002, Notify: 6E400003)
+    for (final service in services) {
+      final sUuid = service.uuid.str128.toLowerCase();
+      if (sUuid.contains('6e400001')) {
+        BluetoothCharacteristic? w;
+        BluetoothCharacteristic? n;
+        for (final c in service.characteristics) {
+          final cUuid = c.uuid.str128.toLowerCase();
+          final props = c.properties;
+          if (cUuid.contains('6e400002') && (props.write || props.writeWithoutResponse)) {
+            w = c;
+          } else if (cUuid.contains('6e400003') && (props.notify || props.indicate)) {
+            n = c;
+          }
+        }
+        if (w != null && n != null) {
+          return ObdGattChannel(
+            service: service,
+            writeCharacteristic: w,
+            notifyCharacteristic: n,
+            profileName: 'Nordic UART Service (NUS)',
+          );
+        }
+      }
+    }
+
+    // 3. ISSC / Microchip Transparent UART (Service: 49535343, Write: 1E4D, Notify: 8841)
+    for (final service in services) {
+      final sUuid = service.uuid.str128.toLowerCase();
+      if (sUuid.contains('49535343')) {
+        BluetoothCharacteristic? w;
+        BluetoothCharacteristic? n;
+        for (final c in service.characteristics) {
+          final cUuid = c.uuid.str128.toLowerCase();
+          final props = c.properties;
+          if ((cUuid.contains('1e4d') || props.write || props.writeWithoutResponse) && w == null) {
+            if (props.write || props.writeWithoutResponse) w = c;
+          }
+          if ((cUuid.contains('8841') || props.notify || props.indicate) && n == null) {
+            if (props.notify || props.indicate) n = c;
+          }
+        }
+        if (w != null && n != null) {
+          return ObdGattChannel(
+            service: service,
+            writeCharacteristic: w,
+            notifyCharacteristic: n,
+            profileName: 'ISSC/Microchip UART',
+          );
+        }
+      }
+    }
+
+    // 4. Custom Automotive 18F0 Profile (Service: 18F0)
+    for (final service in services) {
+      final sUuid = service.uuid.str128.toLowerCase();
+      if (sUuid.contains('18f0')) {
+        BluetoothCharacteristic? w;
+        BluetoothCharacteristic? n;
+        for (final c in service.characteristics) {
+          final props = c.properties;
+          if (w == null && (props.write || props.writeWithoutResponse)) {
+            w = c;
+          }
+          if (n == null && (props.notify || props.indicate)) {
+            n = c;
+          }
+        }
+        if (w != null && n != null) {
+          return ObdGattChannel(
+            service: service,
+            writeCharacteristic: w,
+            notifyCharacteristic: n,
+            profileName: 'Automotive 18F0',
+          );
+        }
+      }
+    }
+
+    // 5. HM-10 / CC2541 Profile (Service: 0xFFE0, Characteristic: 0xFFE1)
+    for (final service in services) {
+      final sUuid = service.uuid.str128.toLowerCase();
+      if (sUuid.contains('ffe0')) {
+        BluetoothCharacteristic? w;
+        BluetoothCharacteristic? n;
+        for (final c in service.characteristics) {
+          final cUuid = c.uuid.str128.toLowerCase();
+          final props = c.properties;
+          if (cUuid.contains('ffe1') || (props.write || props.writeWithoutResponse)) {
+            if (props.write || props.writeWithoutResponse) w ??= c;
+            if (props.notify || props.indicate) n ??= c;
+          }
+        }
+        if (w != null && n != null) {
+          return ObdGattChannel(
+            service: service,
+            writeCharacteristic: w,
+            notifyCharacteristic: n,
+            profileName: 'HM-10 FFE0/FFE1',
+          );
+        }
+      }
+    }
+
+    // 6. 通用后备匹配: 遍历非 SIG 专用服务，严格在同一自定义服务内成对提取写/读特征
+    for (final service in services) {
+      final sUuid = service.uuid.str128.toLowerCase();
+      if (isSigExcluded(sUuid)) continue;
+
+      BluetoothCharacteristic? combinedChar;
+      BluetoothCharacteristic? w;
+      BluetoothCharacteristic? n;
+
+      for (final c in service.characteristics) {
+        final props = c.properties;
+        final isWritable = props.write || props.writeWithoutResponse;
+        final isNotifiable = props.notify || props.indicate;
+
+        if (isWritable && isNotifiable) {
+          combinedChar = c;
+          break;
+        }
+        if (isWritable && w == null) w = c;
+        if (isNotifiable && n == null) n = c;
+      }
+
+      if (combinedChar != null) {
+        return ObdGattChannel(
+          service: service,
+          writeCharacteristic: combinedChar,
+          notifyCharacteristic: combinedChar,
+          profileName: 'Custom Single-Char UART (${service.uuid.str128})',
+        );
+      }
+
+      if (w != null && n != null) {
+        return ObdGattChannel(
+          service: service,
+          writeCharacteristic: w,
+          notifyCharacteristic: n,
+          profileName: 'Custom Dual-Char UART (${service.uuid.str128})',
+        );
+      }
+    }
+
+    return null;
+  }
+
+  @visibleForTesting
+  ObdGattChannel? resolveObdGattChannelForTesting(List<BluetoothService> services) =>
+      _resolveObdGattChannel(services);
+
+  @visibleForTesting
+  double? parseStandardSpeed(String resp) => _parseStandardSpeed(resp);
+
+  @visibleForTesting
+  double? parseStandardRpm(String resp) => _parseStandardRpm(resp);
+
+  @visibleForTesting
+  double? parseStandardTemp(String resp) => _parseStandardTemp(resp);
+
+  @visibleForTesting
+  double? parseAtRv(String resp) => _parseAtRv(resp);
+
+  @visibleForTesting
+  double? parsePercent(String resp) => _parsePercent(resp);
+
   void dispose() {
     disconnect();
     telemetryNotifier.dispose();
     scanResultsNotifier.dispose();
     isScanningNotifier.dispose();
     debugLogNotifier.dispose();
+    isDeepScanningNotifier.dispose();
+    lastDeepScanReportNotifier.dispose();
   }
+}
+
+class _ProbeEntry {
+  final String category;
+  final String? header;
+  final String cmd;
+  final String name;
+
+  const _ProbeEntry(this.category, this.header, this.cmd, this.name);
+}
+
+class ObdGattChannel {
+  final BluetoothService service;
+  final BluetoothCharacteristic writeCharacteristic;
+  final BluetoothCharacteristic notifyCharacteristic;
+  final String profileName;
+
+  const ObdGattChannel({
+    required this.service,
+    required this.writeCharacteristic,
+    required this.notifyCharacteristic,
+    required this.profileName,
+  });
 }

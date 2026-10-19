@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import '../models/obd_telemetry.dart';
 import '../services/car_obd_service.dart';
+import 'obd_deep_scan_dialog.dart';
 
 class ObdDashboardPage extends StatefulWidget {
   const ObdDashboardPage({super.key});
@@ -40,7 +41,54 @@ class _ObdDashboardPageState extends State<ObdDashboardPage> {
     _scrollToBottom();
   }
 
-  void _showDeviceSelectDialog(List<ScanResult> results) {
+  Future<void> _showDeviceSelectDialog(List<ScanResult> results) async {
+    List<BluetoothDevice> bonded = [];
+    try {
+      bonded = await FlutterBluePlus.bondedDevices;
+    } catch (_) {}
+
+    final allDevices = <_DeviceItem>[];
+    final seen = <String>{};
+
+    for (final b in bonded) {
+      final name = b.platformName.isNotEmpty ? b.platformName : '已配对设备 (${b.remoteId.str})';
+      allDevices.add(_DeviceItem(
+        device: b,
+        name: name,
+        subtitle: '系统已配对 • MAC: ${b.remoteId.str}',
+        isBonded: true,
+      ));
+      seen.add(b.remoteId.str.toUpperCase());
+    }
+
+    for (final r in results) {
+      final id = r.device.remoteId.str.toUpperCase();
+      if (!seen.contains(id)) {
+        final name = r.device.platformName.isNotEmpty
+            ? r.device.platformName
+            : '未知设备 (${r.device.remoteId.str})';
+        allDevices.add(_DeviceItem(
+          device: r.device,
+          name: name,
+          subtitle: 'MAC: ${r.device.remoteId.str} • RSSI: ${r.rssi} dBm',
+          isBonded: false,
+        ));
+        seen.add(id);
+      }
+    }
+
+    allDevices.sort((a, b) {
+      final aIsObd = a.name.toUpperCase().contains('OBD') || a.name.toUpperCase().contains('VEEPEAK');
+      final bIsObd = b.name.toUpperCase().contains('OBD') || b.name.toUpperCase().contains('VEEPEAK');
+      if (aIsObd && !bIsObd) return -1;
+      if (!aIsObd && bIsObd) return 1;
+      if (a.isBonded && !b.isBonded) return -1;
+      if (!a.isBonded && b.isBonded) return 1;
+      return 0;
+    });
+
+    if (!mounted) return;
+
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -55,7 +103,7 @@ class _ObdDashboardPageState extends State<ObdDashboardPage> {
         content: SizedBox(
           width: 480,
           height: 320,
-          child: results.isEmpty
+          child: allDevices.isEmpty
               ? const Center(
                   child: Text(
                     '未扫描到设备，请确认 Veepeak OBD 模块已插在车辆 OBD 接口并通电',
@@ -64,34 +112,50 @@ class _ObdDashboardPageState extends State<ObdDashboardPage> {
                   ),
                 )
               : ListView.builder(
-                  itemCount: results.length,
+                  itemCount: allDevices.length,
                   itemBuilder: (c, i) {
-                    final r = results[i];
-                    final name = r.device.platformName.isNotEmpty
-                        ? r.device.platformName
-                        : '未知设备 (${r.device.remoteId.str})';
-                    final isVeepeak = name.toUpperCase().contains('OBD') ||
-                        name.toUpperCase().contains('VEEPEAK') ||
-                        name.toUpperCase().contains('BLE');
+                    final item = allDevices[i];
+                    final isVeepeak = item.name.toUpperCase().contains('OBD') ||
+                        item.name.toUpperCase().contains('VEEPEAK') ||
+                        item.name.toUpperCase().contains('BLE');
 
                     return ListTile(
                       dense: true,
                       contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                       leading: Icon(
-                        isVeepeak ? Icons.speed : Icons.bluetooth,
-                        color: isVeepeak ? Colors.greenAccent : Colors.white60,
+                        isVeepeak ? Icons.speed : (item.isBonded ? Icons.bluetooth_connected : Icons.bluetooth),
+                        color: isVeepeak ? Colors.greenAccent : (item.isBonded ? Colors.blueAccent : Colors.white60),
                         size: 22,
                       ),
-                      title: Text(
-                        name,
-                        style: TextStyle(
-                          color: isVeepeak ? Colors.greenAccent : Colors.white,
-                          fontWeight: isVeepeak ? FontWeight.bold : FontWeight.normal,
-                          fontSize: 13,
-                        ),
+                      title: Row(
+                        children: [
+                          Flexible(
+                            child: Text(
+                              item.name,
+                              style: TextStyle(
+                                color: isVeepeak ? Colors.greenAccent : Colors.white,
+                                fontWeight: isVeepeak ? FontWeight.bold : FontWeight.normal,
+                                fontSize: 13,
+                              ),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                          if (item.isBonded) ...[
+                            const SizedBox(width: 6),
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                              decoration: BoxDecoration(
+                                color: Colors.blueAccent.withValues(alpha: 0.2),
+                                borderRadius: BorderRadius.circular(4),
+                                border: Border.all(color: Colors.blueAccent.withValues(alpha: 0.5), width: 1),
+                              ),
+                              child: const Text('已配对', style: TextStyle(color: Colors.blueAccent, fontSize: 9.5)),
+                            ),
+                          ],
+                        ],
                       ),
                       subtitle: Text(
-                        'MAC: ${r.device.remoteId.str} • RSSI: ${r.rssi} dBm',
+                        item.subtitle,
                         style: const TextStyle(color: Colors.white38, fontSize: 11),
                       ),
                       trailing: ElevatedButton(
@@ -102,7 +166,7 @@ class _ObdDashboardPageState extends State<ObdDashboardPage> {
                         ),
                         onPressed: () {
                           Navigator.pop(ctx);
-                          _obd.connect(r.device);
+                          _obd.connect(item.device);
                         },
                         child: const Text('连接', style: TextStyle(fontSize: 12)),
                       ),
@@ -140,12 +204,16 @@ class _ObdDashboardPageState extends State<ObdDashboardPage> {
         backgroundColor: const Color(0xFF161920),
         elevation: 0,
         title: const Row(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(Icons.electric_car, color: Colors.tealAccent, size: 22),
-            SizedBox(width: 8),
-            Text(
-              'Yaris 混动三电与 OBD 实时车况',
-              style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
+            Icon(Icons.electric_car, color: Colors.tealAccent, size: 20),
+            SizedBox(width: 6),
+            Flexible(
+              child: Text(
+                'Yaris 混动与 OBD 车况',
+                style: TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.bold),
+                overflow: TextOverflow.ellipsis,
+              ),
             ),
           ],
         ),
@@ -182,12 +250,17 @@ class _ObdDashboardPageState extends State<ObdDashboardPage> {
                           ),
                         ),
                         const SizedBox(width: 6),
-                        Text(
-                          tel.statusMessage ?? tel.status.name,
-                          style: TextStyle(
-                            color: _getStatusColor(tel.status),
-                            fontSize: 11,
-                            fontWeight: FontWeight.bold,
+                        ConstrainedBox(
+                          constraints: const BoxConstraints(maxWidth: 130),
+                          child: Text(
+                            tel.statusMessage ?? tel.status.name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              color: _getStatusColor(tel.status),
+                              fontSize: 11,
+                              fontWeight: FontWeight.bold,
+                            ),
                           ),
                         ),
                       ],
@@ -233,6 +306,22 @@ class _ObdDashboardPageState extends State<ObdDashboardPage> {
                       label: const Text('断开', style: TextStyle(fontSize: 12)),
                       onPressed: () => _obd.disconnect(),
                     ),
+                  const SizedBox(width: 8),
+                  ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF1E3A2F),
+                      foregroundColor: Colors.tealAccent,
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(6),
+                        side: const BorderSide(color: Colors.tealAccent, width: 1),
+                      ),
+                    ),
+                    icon: const Icon(Icons.manage_search, size: 16, color: Colors.tealAccent),
+                    label: const Text('全车深度扫描',
+                        style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                    onPressed: () => ObdDeepScanDialog.show(context),
+                  ),
                   const SizedBox(width: 8),
                   IconButton(
                     tooltip: '指令调试控制台',
@@ -747,4 +836,18 @@ class _ObdDashboardPageState extends State<ObdDashboardPage> {
       ),
     );
   }
+}
+
+class _DeviceItem {
+  final BluetoothDevice device;
+  final String name;
+  final String subtitle;
+  final bool isBonded;
+
+  const _DeviceItem({
+    required this.device,
+    required this.name,
+    required this.subtitle,
+    required this.isBonded,
+  });
 }
