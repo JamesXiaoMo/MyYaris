@@ -132,6 +132,9 @@ def resolve_car_device_id(input_id: Optional[str] = None, fallback_id: Optional[
 
 ## 3. WebSocket 实时双工与双信封契约 (Dual Envelope & State Sync)
 
+> **V2.2 音乐播放队列与全状态同步契约已冻结**：  
+> 包含“车机自主全量喜欢歌单维护（列表循环 `list_loop` / 随机播放 `shuffle`）、真实心动模式 (`intelligence`)、临时搜索点播单曲队列、零自动播放、3 次切歌失败熔断与新旧能力协商”，完整技术规范详见专篇契约：[音乐播放队列与状态同步契约](./音乐播放队列与状态同步契约.md)。
+
 ### 3.1 路径与鉴权
 - **URL**：`wss://<host>/api/v1/ws/music?client_type=<car|phone>&device_id=<device_id>`
 - **鉴权头**：
@@ -146,26 +149,36 @@ def resolve_car_device_id(input_id: Optional[str] = None, fallback_id: Optional[
 ```json
 {
   "type": "status_update",
-  "timestamp": "2026-10-12T14:00:00Z",
+  "timestamp": "2026-10-19T12:00:00Z",
   "device_id": "car_p3pro",
   "playback_state": "playing",
-  "current_track_id": "netease_123456",
+  "applied_mode": "list_loop",
+  "requested_mode": "list_loop",
+  "queue_id": "q_fav_12345678_987654321",
+  "queue_version": 102,
+  "queue_source": "netease_favorite",
+  "current_index": 45,
+  "current_track_id": "netease_1901371647",
   "position_ms": 45000,
   "duration_ms": 240000,
-  "software_volume": 0.8,
-  "loop_mode": "all",
-  "shuffle": false,
+  "software_volume": 0.25,
+  "capabilities": ["queue_v2", "intelligence_v1", "full_favorite_shuffle"],
   "data": {
     "device_id": "car_p3pro",
     "playback_state": "playing",
-    "current_track_id": "netease_123456",
+    "applied_mode": "list_loop",
+    "requested_mode": "list_loop",
+    "queue_id": "q_fav_12345678_987654321",
+    "queue_version": 102,
+    "queue_source": "netease_favorite",
+    "current_index": 45,
+    "current_track_id": "netease_1901371647",
     "position_ms": 45000,
     "duration_ms": 240000,
-    "software_volume": 0.8,
-    "loop_mode": "all",
-    "shuffle_enabled": false,
-    "last_heartbeat_at": "2026-10-12T14:00:00Z",
-    "updated_at": "2026-10-12T14:00:00Z"
+    "software_volume": 0.25,
+    "capabilities": ["queue_v2", "intelligence_v1", "full_favorite_shuffle"],
+    "last_heartbeat_at": "2026-10-19T12:00:00Z",
+    "updated_at": "2026-10-19T12:00:00Z"
   }
 }
 ```
