@@ -89,7 +89,8 @@ class BuiltInPlayerService {
 
   LocalTrackItem get currentTrack {
     if (_activeRemoteTrack != null) return _activeRemoteTrack!;
-    final queueTrack = CarMusicQueueController().currentTrack;
+    final queueCtrl = CarMusicQueueController();
+    final queueTrack = queueCtrl.currentTrack;
     if (queueTrack != null) {
       return LocalTrackItem(
         id: queueTrack.trackId,
@@ -101,12 +102,25 @@ class BuiltInPlayerService {
         tag: queueTrack.album ?? '网络歌单',
       );
     }
-    final idx = _player.currentIndex ?? _selectedTrackIndex;
-    if (idx >= 0 && idx < tracks.length) {
-      return tracks[idx];
+    // Only if queue is completely uninitialized and empty (offline test mode), fallback to local test tracks
+    if (queueCtrl.tracks.isEmpty) {
+      final idx = _player.currentIndex ?? _selectedTrackIndex;
+      if (idx >= 0 && idx < tracks.length) {
+        return tracks[idx];
+      }
+      return tracks[0];
     }
-    return tracks[0];
+    return const LocalTrackItem(
+      id: '',
+      title: '无播放曲目',
+      artist: '',
+      assetPath: '',
+      isLocal: false,
+      durationDesc: '',
+      tag: '',
+    );
   }
+
 
   Future<void> init() async {
     if (_isInitialized) return;

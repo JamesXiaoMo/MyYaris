@@ -411,20 +411,41 @@ class CarMusicSyncService {
         case 'set_playback_mode':
           final modeStr = (params['mode'] ?? params['playback_mode'])?.toString();
           final requestedMode = PlaybackMode.fromString(modeStr);
-          final seedTrackId = params['seed_track_id']?.toString();
-          int? seedSongId;
-          if (seedTrackId != null && seedTrackId.startsWith('netease_')) {
-            seedSongId = int.tryParse(seedTrackId.replaceFirst('netease_', ''));
-          } else if (seedTrackId != null) {
-            seedSongId = int.tryParse(seedTrackId);
-          }
-          if (params['seed_song_id'] != null) {
-            seedSongId = (params['seed_song_id'] as num?)?.toInt() ?? seedSongId;
+          final serverQueueId = params['queue_id']?.toString() ?? params['expected_queue_id']?.toString();
+          final serverQueueVersion = (params['queue_version'] ?? params['expected_queue_version'] as num?)?.toInt();
+          final wasPlaying = _playerService.player.playing;
+          final queueCtrl = CarMusicQueueController();
+
+          // 1. If server prepared a queue (e.g. authentic intelligence snapshot), await its atomic load
+          if (serverQueueId != null && serverQueueId.isNotEmpty) {
+            if (serverQueueId != queueCtrl.queueId || (serverQueueVersion != null && serverQueueVersion != queueCtrl.queueVersion)) {
+              final targetSource = requestedMode == PlaybackMode.intelligence
+                  ? QueueSource.neteaseIntelligence
+                  : queueCtrl.queueSource;
+              final ok = await queueCtrl.loadQueueSnapshotWithPaging(
+                queueId: serverQueueId,
+                queueVersion: serverQueueVersion,
+                source: targetSource,
+              );
+              if (!ok) {
+                throw BackendException(409, 'Failed to load prepared queue $serverQueueId v$serverQueueVersion: ${queueCtrl.errorDetail}');
+              }
+            }
+          } else if (requestedMode == PlaybackMode.shuffle && !queueCtrl.isFullyLoaded) {
+            // If switching to shuffle without server queue_id and favorite is not loaded, await full load
+            final ok = await queueCtrl.loadFullFavoriteQueue();
+            if (!ok) {
+              throw BackendException(409, 'Favorite queue not fully ready for shuffle: ${queueCtrl.errorDetail}');
+            }
           }
 
-          CarMusicQueueController().setPlaybackMode(requestedMode, seedSongId: seedSongId);
+          // 2. Apply requested mode
+          final applied = queueCtrl.setPlaybackMode(requestedMode);
+          if (!applied) {
+            throw BackendException(422, 'Cannot apply playback mode ${requestedMode.value}');
+          }
 
-          // Synchronize low-level loopMode/shuffleMode
+          // 3. Synchronize low-level loop/shuffle
           if (requestedMode == PlaybackMode.singleLoop) {
             await _playerService.setLoopModeString('one');
           } else if (requestedMode == PlaybackMode.listLoop) {
@@ -433,24 +454,50 @@ class CarMusicSyncService {
           } else if (requestedMode == PlaybackMode.shuffle) {
             await _playerService.setShuffle(true);
           }
-          break;
 
+          // 4. Mode switch preserves playing/paused state
+          if (wasPlaying && queueCtrl.currentTrack != null) {
+            await _playerService.playQueueTrack(queueCtrl.currentTrack!, startPlaying: true);
+          }
+          break;
 
         case 'switch_queue':
           final source = params['source']?.toString() ?? QueueSource.neteaseFavorite;
+          final serverQueueId = params['queue_id']?.toString();
+          final serverQueueVersion = (params['queue_version'] as num?)?.toInt();
           final startIndex = (params['start_index'] as num?)?.toInt() ?? 0;
           final startTrackId = params['start_track_id']?.toString();
           final wasPlaying = _playerService.player.playing;
+          final queueCtrl = CarMusicQueueController();
 
-          CarMusicQueueController().switchQueue(
-            source: source,
-            startIndex: startIndex,
-            startTrackId: startTrackId,
-          );
+          if (serverQueueId != null && serverQueueId.isNotEmpty) {
+            final ok = await queueCtrl.loadQueueSnapshotWithPaging(
+              queueId: serverQueueId,
+              queueVersion: serverQueueVersion,
+              source: source,
+              targetIndex: startIndex,
+            );
+            if (!ok) {
+              throw BackendException(409, 'Failed to switch queue to $serverQueueId: ${queueCtrl.errorDetail}');
+            }
+          } else if (source == QueueSource.neteaseFavorite) {
+            if (!queueCtrl.isFullyLoaded || queueCtrl.queueSource != QueueSource.neteaseFavorite) {
+              final ok = await queueCtrl.loadFullFavoriteQueue();
+              if (!ok) {
+                throw BackendException(409, 'Failed to load favorite queue: ${queueCtrl.errorDetail}');
+              }
+            }
+            if (startTrackId != null && startTrackId.isNotEmpty) {
+              queueCtrl.selectTrackById(startTrackId);
+            } else {
+              queueCtrl.selectTrackByIndex(startIndex);
+            }
+          } else {
+            throw BackendException(422, 'switch_queue requires server queue_id for source $source');
+          }
 
-          final cur = CarMusicQueueController().currentTrack;
+          final cur = queueCtrl.currentTrack;
           if (cur != null) {
-            // Preserve playing/paused state across queue switches
             await _playerService.playQueueTrack(cur, startPlaying: wasPlaying);
           }
           break;
@@ -458,73 +505,56 @@ class CarMusicSyncService {
         case 'play_track':
         case 'play':
           final trackId = (params['track_id'] ?? params['song_id'])?.toString();
+          final serverQueueId = params['queue_id']?.toString();
+          final serverQueueVersion = (params['queue_version'] as num?)?.toInt();
+          final queueIndex = (params['queue_index'] as num?)?.toInt();
           final queueCtrl = CarMusicQueueController();
 
-          // 1. Check if track belongs to current active queue
-          if (trackId != null && queueCtrl.tracks.any((t) => t.trackId == trackId)) {
-            queueCtrl.selectTrackById(trackId);
-            final track = queueCtrl.currentTrack!;
-            final seekMs = (params['seek_ms'] ?? params['seek_position_ms'] ?? params['position_ms'] as num?)?.toInt() ?? 0;
-            await _playerService.playQueueTrack(
-              track,
-              initialPosition: Duration(milliseconds: seekMs),
-              startPlaying: true,
-            );
-          } else {
-            // 2. Check if track is a local test asset
-            final localIdx = _playerService.tracks.indexWhere((t) => t.id == trackId);
-            if (localIdx >= 0 && (params['stream_url'] == null || (params['stream_url'] as String).isEmpty)) {
-              await _playerService.selectTrack(localIdx);
-            } else {
-              // 3. Point-to-point temporary single track queue
-              String? streamUrl = params['stream_url'] as String?;
-              if (streamUrl == null || streamUrl.isEmpty) {
-                if (params['song_id'] != null || (trackId != null && trackId.startsWith('netease_'))) {
-                  final sid = params['song_id']?.toString() ?? trackId!.replaceFirst('netease_', '');
-                  streamUrl = _backendClient?.buildNeteaseStreamUrl(_baseUrl, sid);
-                } else if (trackId != null && trackId.isNotEmpty) {
-                  streamUrl = _backendClient?.buildLocalStreamUrl(_baseUrl, trackId);
-                }
+          // 1. If server prepared a queue, load it first!
+          if (serverQueueId != null && serverQueueId.isNotEmpty) {
+            if (serverQueueId != queueCtrl.queueId || (serverQueueVersion != null && serverQueueVersion != queueCtrl.queueVersion)) {
+              final ok = await queueCtrl.loadQueueSnapshotWithPaging(
+                queueId: serverQueueId,
+                queueVersion: serverQueueVersion,
+                source: queueCtrl.queueSource,
+                targetIndex: queueIndex ?? 0,
+              );
+              if (!ok) {
+                throw BackendException(409, 'Failed to load prepared queue $serverQueueId: ${queueCtrl.errorDetail}');
               }
-
-              final songIdInt = int.tryParse(trackId?.replaceFirst('netease_', '') ?? '') ?? 0;
-              final title = params['title'] as String? ?? '远端点播曲目';
-              final artist = params['artist'] as String? ?? '网易云音乐';
-              final durationMs = (params['duration_ms'] as num?)?.toInt() ?? 0;
-
-              final singleItem = NeteaseQueueTrackItem(
-                trackId: trackId ?? 'track_${DateTime.now().millisecondsSinceEpoch}',
-                songId: songIdInt,
-                title: title,
-                artist: artist,
-                album: params['album'] as String?,
-                durationMs: durationMs,
-                streamUrl: streamUrl ?? '',
-                queueIndex: 0,
-              );
-
-              queueCtrl.switchQueue(
-                source: QueueSource.singleTrack,
-                singleTrackItem: singleItem,
-              );
-
-              final seekMs = (params['seek_ms'] ?? params['seek_position_ms'] ?? params['position_ms'] as num?)?.toInt() ?? 0;
-              await _playerService.playQueueTrack(
-                singleItem,
-                initialPosition: Duration(milliseconds: seekMs),
-                startPlaying: true,
-              );
             }
           }
 
-          if (params['loop_mode'] != null || params['mode'] != null) {
-            final mode = (params['loop_mode'] ?? params['mode']).toString();
-            await _playerService.setLoopModeString(mode);
+          // 2. Controlled local test sample compatibility (explicitly isolated)
+          final isLocalSample = trackId != null && trackId.startsWith('local_');
+          if (isLocalSample) {
+            final localIdx = _playerService.tracks.indexWhere((t) => t.id == trackId);
+            if (localIdx >= 0) {
+              await _playerService.selectTrack(localIdx);
+              break;
+            }
           }
-          if (params['shuffle'] is bool) {
-            await _playerService.setShuffle(params['shuffle'] as bool);
+
+          // 3. Track selection in active queue
+          if (trackId != null && queueCtrl.tracks.any((t) => t.trackId == trackId)) {
+            queueCtrl.selectTrackById(trackId);
+          } else if (queueIndex != null && queueIndex >= 0 && queueIndex < queueCtrl.tracks.length) {
+            queueCtrl.selectTrackByIndex(queueIndex);
+          } else {
+            throw BackendException(404, 'Track $trackId not found in active queue ${queueCtrl.queueId}');
+          }
+
+          final curTrack = queueCtrl.currentTrack;
+          if (curTrack != null) {
+            final seekMs = (params['seek_ms'] ?? params['seek_position_ms'] ?? params['position_ms'] as num?)?.toInt() ?? 0;
+            await _playerService.playQueueTrack(
+              curTrack,
+              initialPosition: Duration(milliseconds: seekMs),
+              startPlaying: true,
+            );
           }
           break;
+
 
         case 'pause':
           await _playerService.pause();

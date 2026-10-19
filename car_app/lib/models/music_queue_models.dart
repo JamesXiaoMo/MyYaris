@@ -68,11 +68,19 @@ class NeteaseQueueTrackItem {
 
   factory NeteaseQueueTrackItem.fromJson(Map<String, dynamic> json, {int? fallbackIndex}) {
     final rawSongId = json['song_id'] ?? json['id'];
-    final songId = rawSongId is int ? rawSongId : (int.tryParse(rawSongId?.toString() ?? '') ?? 0);
-    final rawTrackId = json['track_id']?.toString() ?? 'netease_$songId';
+    int? songId = rawSongId is int ? rawSongId : int.tryParse(rawSongId?.toString() ?? '');
+    final rawTrackId = json['track_id']?.toString();
+    if (songId == null && rawTrackId != null && rawTrackId.startsWith('netease_')) {
+      songId = int.tryParse(rawTrackId.replaceFirst('netease_', ''));
+    }
+    if (songId == null || songId <= 0) {
+      throw FormatException('Invalid or missing song_id in track payload: $json');
+    }
+    final trackId = rawTrackId ?? 'netease_$songId';
+
 
     return NeteaseQueueTrackItem(
-      trackId: rawTrackId,
+      trackId: trackId,
       songId: songId,
       title: json['title']?.toString() ?? '未知曲目',
       artist: json['artist']?.toString() ?? '未知歌手',

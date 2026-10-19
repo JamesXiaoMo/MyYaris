@@ -150,41 +150,16 @@ class CarMusicQueueController {
     currentTrackNotifier.value = currentTrack;
   }
 
-  /// Appends tracks from next page (checking snapshot version match)
-  bool appendPage(MusicQueueSnapshot page) {
-    if (_queueId.isNotEmpty && page.queueId != _queueId) {
-      debugPrint('[CarMusicQueue] Page queueId mismatch: got ${page.queueId}, expected $_queueId');
-      return false;
-    }
-    if (_queueVersion > 0 && page.queueVersion != _queueVersion) {
-      debugPrint('[CarMusicQueue] Page queueVersion mismatch: got ${page.queueVersion}, expected $_queueVersion');
-      return false;
-    }
-
-    _queueId = page.queueId;
-    _queueVersion = page.queueVersion;
-    _total = page.total;
-    _isComplete = page.isComplete;
-
-    for (final track in page.tracks) {
-      if (!_tracks.any((t) => t.trackId == track.trackId)) {
-        _tracks.add(track);
-      }
-    }
-
-    _isFullyLoaded = _isComplete && (_tracks.length >= _total);
-
-    if (_appliedMode == PlaybackMode.shuffle && _isFullyLoaded && _shuffleIndices.isEmpty) {
-      _generateShuffleOrder(seedIndex: _currentIndex);
-    }
-
-    queueVersionNotifier.value = _queueVersion;
-    currentTrackNotifier.value = currentTrack;
-    return true;
-  }
-
-  /// Fetches the full favorite playlist across pages with version locking and bounded retry.
-  Future<bool> loadFullFavoriteQueue({int maxRetries = 3}) async {
+  /// Fetches a complete queue snapshot across pages with atomic buffer validation.
+  /// If queueId and queueVersion are specified, locks to that snapshot.
+  /// If unspecified (e.g. initial favorite probe), offset=0 discovers queueId & version.
+  Future<bool> loadQueueSnapshotWithPaging({
+    String? queueId,
+    int? queueVersion,
+    required String source,
+    int targetIndex = 0,
+    int maxRetries = 3,
+  }) async {
     if (_backendClient == null || _baseUrl.isEmpty) {
       debugPrint('[CarMusicQueue] Cannot load queue: BackendClient or baseUrl not configured');
       return false;
@@ -193,51 +168,119 @@ class CarMusicQueueController {
     int retryCount = 0;
     while (retryCount < maxRetries) {
       try {
-        debugPrint('[CarMusicQueue] Fetching favorite queue page 0 (attempt ${retryCount + 1})...');
+        debugPrint('[CarMusicQueue] Loading queue page 0 (source=$source, qid=$queueId, ver=$queueVersion, attempt=${retryCount + 1})...');
         final firstPage = await _backendClient!.fetchMusicQueuePage(
           baseUrl: _baseUrl,
           token: _token,
           deviceId: _deviceId,
-          source: QueueSource.neteaseFavorite,
+          source: source,
           offset: 0,
           limit: 50,
+          queueId: queueId,
+          queueVersion: queueVersion,
         );
 
-        _queueId = firstPage.queueId;
-        _queueVersion = firstPage.queueVersion;
-        _queueSource = QueueSource.neteaseFavorite;
-        _queueName = firstPage.name ?? '我喜欢的音乐';
-        _total = firstPage.total;
-        _isComplete = firstPage.isComplete;
+        final discoveredQid = firstPage.queueId;
+        final discoveredVer = firstPage.queueVersion;
+        final total = firstPage.total;
 
-        _tracks.clear();
-        _tracks.addAll(firstPage.tracks);
+        // Verify basic first page attributes
+        if (discoveredQid.isEmpty) {
+          throw BackendException(422, 'Received empty queue_id from backend');
+        }
+        if (queueId != null && queueId.isNotEmpty && discoveredQid != queueId) {
+          throw BackendException(409, 'Queue ID mismatch: expected $queueId, got $discoveredQid');
+        }
+        if (queueVersion != null && discoveredVer != queueVersion) {
+          throw BackendException(409, 'Queue version mismatch: expected $queueVersion, got $discoveredVer');
+        }
 
-        // Fetch subsequent pages with locked queue_id and queue_version
-        while (_tracks.length < _total && firstPage.hasMore) {
-          final nextOffset = _tracks.length;
-          debugPrint('[CarMusicQueue] Fetching page at offset $nextOffset (v$_queueVersion)...');
+        // Buffer all pages before touching active state!
+        final buffer = <NeteaseQueueTrackItem>[];
+        final seenTrackIds = <String>{};
+
+        for (final track in firstPage.tracks) {
+          if (seenTrackIds.contains(track.trackId)) {
+            throw BackendException(422, 'Duplicate track_id in page 0: ${track.trackId}');
+          }
+          seenTrackIds.add(track.trackId);
+          buffer.add(track);
+        }
+
+        bool isComplete = firstPage.isComplete;
+        String queueState = firstPage.queueState;
+
+        // Paginate remaining tracks
+        while (buffer.length < total) {
+          final expectedOffset = buffer.length;
           final nextPage = await _backendClient!.fetchMusicQueuePage(
             baseUrl: _baseUrl,
             token: _token,
             deviceId: _deviceId,
-            source: QueueSource.neteaseFavorite,
-            offset: nextOffset,
+            source: source,
+            offset: expectedOffset,
             limit: 50,
-            queueId: _queueId,
-            queueVersion: _queueVersion,
+            queueId: discoveredQid,
+            queueVersion: discoveredVer,
           );
 
-          if (nextPage.queueVersion != _queueVersion) {
-            throw BackendException(409, 'Queue version shifted during paging: expected $_queueVersion, got ${nextPage.queueVersion}');
+          if (nextPage.queueId != discoveredQid || nextPage.queueVersion != discoveredVer) {
+            throw BackendException(409, 'Queue version shifted during pagination: expected $discoveredVer, got ${nextPage.queueVersion}');
+          }
+          if (nextPage.offset != expectedOffset) {
+            throw BackendException(422, 'Offset discontinuity: expected $expectedOffset, got ${nextPage.offset}');
+          }
+          if (nextPage.tracks.isEmpty) {
+            throw BackendException(422, 'Received empty tracks array while buffer (${buffer.length}) < total ($total)');
           }
 
-          _tracks.addAll(nextPage.tracks);
-          if (!nextPage.hasMore || nextPage.tracks.isEmpty) break;
+          for (final track in nextPage.tracks) {
+            if (seenTrackIds.contains(track.trackId)) {
+              throw BackendException(422, 'Duplicate track_id encountered: ${track.trackId}');
+            }
+            seenTrackIds.add(track.trackId);
+            buffer.add(track);
+          }
+
+          isComplete = nextPage.isComplete;
+          queueState = nextPage.queueState;
+          if (!nextPage.hasMore && buffer.length < total) {
+            throw BackendException(422, 'has_more is false but buffer length ${buffer.length} < total $total');
+          }
         }
 
+        // Strict completeness & index validation
+        if (buffer.length != total) {
+          throw BackendException(422, 'Buffer track count mismatch: expected $total, got ${buffer.length}');
+        }
+        if (!isComplete) {
+          throw BackendException(409, 'Queue snapshot is not complete (is_complete=false)');
+        }
+        if (queueState != 'ready') {
+          throw BackendException(409, 'Queue state is not ready (state=$queueState)');
+        }
+
+        // Validate index continuity (0..total-1)
+        for (int i = 0; i < buffer.length; i++) {
+          if (buffer[i].queueIndex != i) {
+            buffer[i] = buffer[i].copyWith(queueIndex: i);
+          }
+        }
+
+        // ATOMIC SWAP: All validations passed!
+        _tracks.clear();
+        _tracks.addAll(buffer);
+        _queueId = discoveredQid;
+        _queueVersion = discoveredVer;
+        _queueSource = source;
+        _queueName = firstPage.name ?? (source == QueueSource.neteaseFavorite ? '我喜欢的音乐' : '播放队列');
+        _total = total;
+        _isComplete = true;
         _isFullyLoaded = true;
-        if (_currentIndex >= _tracks.length) {
+
+        if (targetIndex >= 0 && targetIndex < _tracks.length) {
+          _currentIndex = targetIndex;
+        } else {
           _currentIndex = 0;
         }
 
@@ -245,34 +288,48 @@ class CarMusicQueueController {
           _generateShuffleOrder(seedIndex: _currentIndex);
         }
 
+        _consecutiveFailures = 0;
+        _errorCode = null;
+        _errorDetail = null;
+
         queueVersionNotifier.value = _queueVersion;
         currentTrackNotifier.value = currentTrack;
-        debugPrint('[CarMusicQueue] Full favorite queue loaded successfully: ${_tracks.length}/$_total tracks (v$_queueVersion).');
+        debugPrint('[CarMusicQueue] Queue atomically applied: $_queueId v$_queueVersion ($_total tracks, source=$_queueSource, index=$_currentIndex)');
         return true;
       } on BackendException catch (e) {
         debugPrint('[CarMusicQueue] BackendException loading queue: ${e.statusCode} ${e.message}');
         if (e.statusCode == 409) {
-          // Version conflict or queue not ready: discard and retry from offset 0
+          // Version conflict: retry from offset 0
           retryCount++;
-          await Future.delayed(Duration(milliseconds: 500 * retryCount));
+          await Future.delayed(Duration(milliseconds: 300 * retryCount));
           continue;
         }
         _errorCode = 'LOAD_QUEUE_FAILED';
         _errorDetail = e.message;
+        // Old queue is safely preserved!
         return false;
       } catch (e) {
-        debugPrint('[CarMusicQueue] Unexpected error loading queue: $e');
+        debugPrint('[CarMusicQueue] Error loading queue: $e');
         retryCount++;
-        await Future.delayed(Duration(milliseconds: 500 * retryCount));
+        await Future.delayed(Duration(milliseconds: 300 * retryCount));
       }
     }
 
     _errorCode = 'LOAD_QUEUE_RETRIES_EXCEEDED';
-    _errorDetail = '拉取喜欢歌单连续 $maxRetries 次失败';
+    _errorDetail = '加载队列连续 $maxRetries 次失败，已保留原播放队列';
     return false;
   }
 
+  /// Fetches the full favorite playlist across pages with version locking and bounded retry.
+  Future<bool> loadFullFavoriteQueue({int maxRetries = 3}) {
+    return loadQueueSnapshotWithPaging(
+      source: QueueSource.neteaseFavorite,
+      maxRetries: maxRetries,
+    );
+  }
+
   /// Generates a complete Fisher-Yates shuffle permutation of 0..total-1.
+
   /// Ensures seedIndex (current playing track) is at position 0 without repetition.
   void _generateShuffleOrder({int seedIndex = 0}) {
     if (_tracks.isEmpty) {
@@ -644,7 +701,9 @@ class CarMusicQueueController {
     _consecutiveFailures = 0;
     _errorCode = null;
     _errorDetail = null;
+    _appliedMode = PlaybackMode.listLoop;
     queueVersionNotifier.value = 0;
     currentTrackNotifier.value = null;
+    appliedModeNotifier.value = PlaybackMode.listLoop;
   }
 }
