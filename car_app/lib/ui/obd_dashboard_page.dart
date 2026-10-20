@@ -747,6 +747,43 @@ class _ObdDashboardPageState extends State<ObdDashboardPage> {
               ),
             ],
           ),
+          if (tel.cellDeltaVoltage != null || tel.batteryTemperatures.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                if (tel.cellDeltaVoltage != null)
+                  Expanded(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      decoration: BoxDecoration(
+                        color: Colors.black12,
+                        borderRadius: BorderRadius.circular(4),
+                        border: Border.all(color: Colors.white10),
+                      ),
+                      child: Text(
+                        '电芯压差: ${(tel.cellDeltaVoltage! * 1000).toInt()} mV (${tel.minCellVoltage?.toStringAsFixed(2)}V ~ ${tel.maxCellVoltage?.toStringAsFixed(2)}V)',
+                        style: const TextStyle(color: Colors.tealAccent, fontSize: 10.5),
+                      ),
+                    ),
+                  ),
+                if (tel.batteryTemperatures.isNotEmpty) ...[
+                  const SizedBox(width: 8),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: Colors.black12,
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(color: Colors.white10),
+                    ),
+                    child: Text(
+                      '电池包温感: ${tel.batteryTemperatures.map((t) => "${t.toInt()}°C").join(" / ")}',
+                      style: const TextStyle(color: Colors.amberAccent, fontSize: 10.5),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ],
         ],
       ),
     );
@@ -764,14 +801,24 @@ class _ObdDashboardPageState extends State<ObdDashboardPage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Row(
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Icon(Icons.speed, color: Colors.blueAccent, size: 18),
-              SizedBox(width: 6),
-              Text(
-                '发动机与车辆动力学 (M15A-FXE 1.5L 直列3缸)',
-                style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold),
+              const Row(
+                children: [
+                  Icon(Icons.speed, color: Colors.blueAccent, size: 18),
+                  SizedBox(width: 6),
+                  Text(
+                    '发动机与车辆动力学 (M15A-FXE 1.5L 直列3缸)',
+                    style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold),
+                  ),
+                ],
               ),
+              if (tel.totalOdometerKm != null)
+                Text(
+                  '总里程: ${tel.totalOdometerKm!.toStringAsFixed(1)} km',
+                  style: const TextStyle(color: Colors.white70, fontSize: 11, fontWeight: FontWeight.bold),
+                ),
             ],
           ),
           const SizedBox(height: 10),
@@ -804,7 +851,13 @@ class _ObdDashboardPageState extends State<ObdDashboardPage> {
                 value: tel.engineOilTemp != null ? '${tel.engineOilTemp!.toInt()} °C' : '--',
                 icon: Icons.opacity,
                 color: Colors.amberAccent,
-                subtext: 'ECM 专用 PID',
+                subtext: 'PID 015C / TNGA',
+              ),
+              _buildMetricItem(
+                label: '节气门开度',
+                value: tel.throttlePosition != null ? '${tel.throttlePosition!.toStringAsFixed(1)}%' : '--',
+                icon: Icons.tune,
+                color: Colors.lightGreenAccent,
               ),
             ],
           ),
@@ -865,6 +918,14 @@ class _ObdDashboardPageState extends State<ObdDashboardPage> {
                 value: tel.mg2InverterTemp != null ? '${tel.mg2InverterTemp!.toInt()} °C' : '--',
                 icon: Icons.device_thermostat,
                 color: Colors.tealAccent,
+              ),
+              _buildMetricItem(
+                label: '电子水泵转速',
+                value: tel.electricWaterPumpRpm != null
+                    ? '${tel.electricWaterPumpRpm!.toInt()} rpm'
+                    : '--',
+                icon: Icons.water,
+                color: Colors.lightBlueAccent,
               ),
               _buildMetricItem(
                 label: '12V 辅助蓄电池',

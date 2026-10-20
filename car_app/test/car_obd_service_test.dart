@@ -211,11 +211,136 @@ void main() {
       expect(obd.parseAtRv('ERROR'), isNull);
     });
 
-    test('Standard Percent 0111 / 0104 parsing', () {
+    test('Standard Percent 0111 / 0104 / 0149 / 014A parsing', () {
       // 0x80 (128) * 100 / 255 = ~50.196%
       final p = obd.parsePercent('41 11 80');
       expect(p, isNotNull);
       expect(p!, closeTo(50.19, 0.1));
+
+      // 0149: 0x28 (40) * 100 / 255 = 15.686%
+      final p49 = obd.parsePercent('414928');
+      expect(p49, isNotNull);
+      expect(p49!, closeTo(15.69, 0.1));
+
+      // 014A: 0x51 (81) * 100 / 255 = 31.764%
+      final p4a = obd.parsePercent('414A51');
+      expect(p4a, isNotNull);
+      expect(p4a!, closeTo(31.76, 0.1));
+    });
+
+    test('Standard Module Voltage 0142 parsing (0x360D -> 13.84V)', () {
+      // 0142: ((0x36 * 256) + 0x0D) / 1000 = 13837 / 1000 = 13.837 V
+      final v = obd.parseStandardModuleVoltage('41 42 36 0D');
+      expect(v, isNotNull);
+      expect(v!, closeTo(13.84, 0.01));
+
+      // 紧凑十六进制测试
+      expect(obd.parseStandardModuleVoltage('414236AF'), closeTo(13.999, 0.01));
+      expect(obd.parseStandardModuleVoltage('NO DATA'), isNull);
+    });
+
+    test('Standard Odometer 01A6 parsing (0x000BDF02 -> 77798.6 km)', () {
+      // 01A6: 0x000BDF02 = 777986 -> / 10.0 = 77798.6 km
+      final odo = obd.parseStandardOdometer('41 A6 00 0B DF 02');
+      expect(odo, isNotNull);
+      expect(odo!, closeTo(77798.6, 0.1));
+
+      // 多帧换行与行号过滤测试 (0: / 1:)
+      final odoMulti = obd.parseStandardOdometer('0: 41A6000B\r\n1: DF02\r\n>');
+      expect(odoMulti, isNotNull);
+      expect(odoMulti!, closeTo(77798.6, 0.1));
+    });
+
+    test('Standard Engine Oil Temp 015C parsing (0x40 -> 24 °C)', () {
+      // 015C: 0x40 (64) - 40 = 24.0 °C
+      expect(obd.parseStandardTemp('41 5C 40'), equals(24.0));
+      expect(obd.parseStandardTemp('415C5A'), equals(50.0));
+    });
+
+    test('Standard MAF 0110 parsing (0x0003 -> 0.03 g/s)', () {
+      expect(obd.parseStandardMaf('41 10 00 03'), equals(0.03));
+      expect(obd.parseStandardMaf('41100320'), equals(8.0));
+    });
+
+    test('Standard Barometric Pressure 0133 parsing (0x63 -> 99 kPa)', () {
+      expect(obd.parseStandardBaro('41 33 63'), equals(99.0));
+      expect(obd.parseStandardBaro('413364'), equals(100.0));
+    });
+
+    test('Standard Catalyst Temp 013C parsing (0x163B -> 529.1 °C)', () {
+      // 013C: ((0x16 * 256 + 0x3B) / 10) - 40 = (5691 / 10) - 40 = 529.1 °C
+      final cat = obd.parseStandardCatTemp('41 3C 16 3B');
+      expect(cat, isNotNull);
+      expect(cat!, closeTo(529.1, 0.1));
+    });
+  });
+
+  group('Toyota TNGA THS-II UDS Mode 22 DID Decoders', () {
+    final obd = CarObdService();
+
+    test('TNGA 221024 Hybrid Core (SOC 40.39%, Voltage 174.2V, Current -9.8A)', () {
+      // 62 10 24:
+      // Byte 0: 0x67 (103) -> 103 * 100 / 255 = ~40.39%
+      // Bytes 1-2: 0x06CE (1742) -> 174.2 V
+      // Bytes 3-4: 0x7C2C (31788) -> (31788 - 32768) * 0.01 = -9.80 A
+      obd.parseToyotaTnga221024ForTesting('62 10 24 67 06 CE 7C 2C');
+      final tel = obd.telemetryNotifier.value;
+
+      expect(tel.batterySoc, isNotNull);
+      expect(tel.batterySoc!, closeTo(40.39, 0.1));
+      expect(tel.batteryVoltage, isNotNull);
+      expect(tel.batteryVoltage!, closeTo(174.2, 0.1));
+      expect(tel.batteryCurrent, isNotNull);
+      expect(tel.batteryCurrent!, closeTo(-9.80, 0.01));
+      expect(tel.batteryPowerKw, isNotNull);
+      expect(tel.batteryPowerKw!, closeTo(-1.707, 0.05));
+    });
+
+    test('TNGA 221100 Inverters & Boost Converter (VL 150V, VH 250V, MG1/MG2 Temps)', () {
+      // 62 11 00:
+      // Bytes 0-1: 0x05DC (1500) -> 150.0 V
+      // Bytes 2-3: 0x09C4 (2500) -> 250.0 V
+      // Byte 4: 0x50 (80) -> 80 - 40 = 40.0 °C (MG1)
+      // Byte 5: 0x52 (82) -> 82 - 40 = 42.0 °C (MG2)
+      // Byte 6: 0x55 (85) -> 85 - 40 = 45.0 °C (Transaxle Oil)
+      obd.parseToyotaTnga221100ForTesting('62 11 00 05 DC 09 C4 50 52 55');
+      final tel = obd.telemetryNotifier.value;
+
+      expect(tel.voltageBeforeBoost, closeTo(150.0, 0.1));
+      expect(tel.voltageAfterBoost, closeTo(250.0, 0.1));
+      expect(tel.mg1InverterTemp, equals(40.0));
+      expect(tel.mg2InverterTemp, equals(42.0));
+      expect(tel.transaxleOilTemp, equals(45.0));
+    });
+
+    test('TNGA 222884 Battery Cell Extremes (Max 3.631V, Min 3.620V, Delta 11mV)', () {
+      // 62 28 84:
+      // Bytes 0-1: 0x0E2F (3631) -> 3.631 V
+      // Bytes 2-3: 0x0E24 (3620) -> 3.620 V
+      obd.parseToyotaTnga222884ForTesting('62 28 84 0E 2F 0E 24');
+      final tel = obd.telemetryNotifier.value;
+
+      expect(tel.maxCellVoltage, closeTo(3.631, 0.001));
+      expect(tel.minCellVoltage, closeTo(3.620, 0.001));
+      expect(tel.cellDeltaVoltage, closeTo(0.011, 0.001));
+    });
+
+    test('TNGA 222885 Battery Pack 6-Point Temperatures (26°C - 28°C)', () {
+      // 62 28 85: 0x42 (66-40=26), 0x43 (27), 0x44 (28), 0x43 (27), 0x42 (26), 0x43 (27)
+      obd.parseToyotaTnga222885ForTesting('62 28 85 42 43 44 43 42 43');
+      final tel = obd.telemetryNotifier.value;
+
+      expect(tel.batteryTemperatures.length, equals(6));
+      expect(tel.batteryTemperatures, equals([26.0, 27.0, 28.0, 27.0, 26.0, 27.0]));
+    });
+
+    test('TNGA 221234 Electric Water Pump (1700 RPM, Oil Temp 24°C)', () {
+      // 62 12 34: Bytes 0-1: 0x06A4 (1700 rpm), Byte 4: 0x40 (24 °C)
+      obd.parseToyotaTnga221234ForTesting('62 12 34 06 A4 06 90 40');
+      final tel = obd.telemetryNotifier.value;
+
+      expect(tel.electricWaterPumpRpm, equals(1700.0));
+      expect(tel.engineOilTemp, equals(24.0));
     });
   });
 

@@ -5,6 +5,7 @@ import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/obd_telemetry.dart';
 import '../models/obd_deep_scan_result.dart';
+import '../models/toyota_tnga_profile.dart';
 
 class CarObdService {
   static final CarObdService _instance = CarObdService._internal();
@@ -13,6 +14,9 @@ class CarObdService {
 
   static const String _prefLastDeviceAddress = 'obd_last_device_address';
   static const String _prefLastDeviceName = 'obd_last_device_name';
+
+  /// 当前生效的车型协议数据集配置文件
+  String get currentProfileName => ToyotaTngaHybridProfile.profileName;
 
   // --- 响应式状态通知 ---
   final ValueNotifier<ObdTelemetry> telemetryNotifier =
@@ -415,19 +419,40 @@ class CarObdService {
         ));
   }
 
-  // Tier 2: 丰田混动 0x7E2 / 21C3 (SoC, 电池总压, 充放电流, 逆变器温度)
-  // 及 21C4 (升压前VL, 升压后VH)
+  // Tier 2: 丰田混动 (支持 TNGA Mode 22 DID 与老款 Mode 21)
+  // Header 0x7E2 / 221024 (SoC, 电池总压, 充放电流) & 221100 (升压VL/VH, 逆变器温度)
+  // Header 0x7EB / 222884 (电芯压差) & 222885 (6点温感)
   Future<void> _queryToyotaHybridTier2() async {
-    // 切换至混动 ECU 寻址
+    // 1. 混动核心电脑 0x7E2
     await sendRawCommand('ATSH7E2');
+    final c221024 = await sendRawCommand('221024');
+    _parseToyotaTnga221024(c221024);
 
-    // 1. 发送 21C3 (混动动力系统核心遥测)
-    final c3Resp = await sendRawCommand('21C3');
-    _parseToyota21C3(c3Resp);
+    final c221100 = await sendRawCommand('221100');
+    _parseToyotaTnga221100(c221100);
 
-    // 2. 发送 21C4 (变压升压与扭矩)
-    final c4Resp = await sendRawCommand('21C4');
-    _parseToyota21C4(c4Resp);
+    // 兼容老款车型 (Prius 3代 Mode 21)
+    if (!c221024.contains('621024')) {
+      final c3Resp = await sendRawCommand('21C3');
+      _parseToyota21C3(c3Resp);
+    }
+    if (!c221100.contains('621100')) {
+      final c4Resp = await sendRawCommand('21C4');
+      _parseToyota21C4(c4Resp);
+    }
+
+    // 2. 动力电池电脑 0x7EB
+    await sendRawCommand('ATSH7EB');
+    final c222884 = await sendRawCommand('222884');
+    _parseToyotaTnga222884(c222884);
+
+    final c222885 = await sendRawCommand('222885');
+    _parseToyotaTnga222885(c222885);
+
+    // 3. 发动机 ECM 0x7E0 (电子水泵等)
+    await sendRawCommand('ATSH7E0');
+    final c221234 = await sendRawCommand('221234');
+    _parseToyotaTnga221234(c221234);
 
     // 切回标准广播报头
     await sendRawCommand('ATSH7DF');
@@ -435,9 +460,13 @@ class CarObdService {
 
   // Tier 3: 辅助 12V 电池、机油温度、节气门与进气
   Future<void> _queryToyotaEngineAndAuxTier3() async {
-    // 1. 读取 12V 电池电压 (AT RV 或 0142)
-    final rvResp = await sendRawCommand('ATRV');
-    final auxV = _parseAtRv(rvResp);
+    // 1. 读取 12V 电池电压 (优先标准 Mode 01 PID 0142，失败走 ATRV)
+    final resp0142 = await sendRawCommand('0142');
+    double? auxV = _parseStandardModuleVoltage(resp0142);
+    if (auxV == null) {
+      final rvResp = await sendRawCommand('ATRV');
+      auxV = _parseAtRv(rvResp);
+    }
 
     // 2. 读取节气门开度 (0111) 与 发动机负荷 (0104)
     final thResp = await sendRawCommand('0111');
@@ -446,29 +475,51 @@ class CarObdService {
     final loadResp = await sendRawCommand('0104');
     final load = _parsePercent(loadResp);
 
-    // 3. 进气温度 (010F)
+    // 3. 进气温度 (010F) 与 发动机机油温度 (015C)
     final iatResp = await sendRawCommand('010F');
     final iat = _parseStandardTemp(iatResp);
+
+    final oilResp = await sendRawCommand('015C');
+    final oilTemp = _parseStandardTemp(oilResp);
 
     _updateTelemetry((t) => t.copyWith(
           aux12vVoltage: auxV ?? t.aux12vVoltage,
           throttlePosition: throttle ?? t.throttlePosition,
           engineLoad: load ?? t.engineLoad,
           intakeAirTemp: iat ?? t.intakeAirTemp,
+          engineOilTemp: oilTemp ?? t.engineOilTemp,
+          lastUpdated: DateTime.now(),
         ));
   }
 
-  // Tier 4: 里程 (ODO) 与 剩余油位
+  // Tier 4: 里程 (ODO)、催化转化器温与低频专用传感器
   Future<void> _queryLowFrequencyTier4() async {
-    // 切换至发动机 ECM 0x7E0
-    await sendRawCommand('ATSH7E0');
+    // 1. 读取仪表累计总里程 (01A6)
+    final odoResp = await sendRawCommand('01A6');
+    final odo = _parseStandardOdometer(odoResp);
 
-    // 发动机 ECM 机油温度与专用传感器 (21CE 或 221234)
-    final ecmResp = await sendRawCommand('21CE');
-    _parseToyotaEcm21CE(ecmResp);
+    // 2. 读取催化转化器温度 (013C)
+    final catResp = await sendRawCommand('013C');
+    final catTemp = _parseStandardCatTemp(catResp);
+
+    // 3. 切换至发动机 ECM 0x7E0
+    await sendRawCommand('ATSH7E0');
+    final ecm221234 = await sendRawCommand('221234');
+    _parseToyotaTnga221234(ecm221234);
+
+    if (!ecm221234.contains('621234')) {
+      final ecmResp = await sendRawCommand('21CE');
+      _parseToyotaEcm21CE(ecmResp);
+    }
 
     // 切回标准广播报头
     await sendRawCommand('ATSH7DF');
+
+    _updateTelemetry((t) => t.copyWith(
+          totalOdometerKm: odo ?? t.totalOdometerKm,
+          catalystTemp: catTemp ?? t.catalystTemp,
+          lastUpdated: DateTime.now(),
+        ));
   }
 
   // --- 5. 数据解码器 (Parser 实现) ---
@@ -500,10 +551,10 @@ class CarObdService {
     return null;
   }
 
-  // 0105 / 010F / 0146: 41 XX YY -> YY - 40
+  // 0105 / 010F / 0146 / 015C: 41 XX YY -> YY - 40
   double? _parseStandardTemp(String resp) {
     final clean = _cleanHex(resp);
-    final match = RegExp(r'41(05|0F|46)([0-9A-F]{2})').firstMatch(clean);
+    final match = RegExp(r'41(05|0F|46|5C)([0-9A-F]{2})').firstMatch(clean);
     if (match != null) {
       final val = int.tryParse(match.group(2)!, radix: 16);
       if (val != null) return val - 40.0;
@@ -516,10 +567,10 @@ class CarObdService {
     return null;
   }
 
-  // 0111 / 0104 / 012F: (XX * 100) / 255
+  // 0111 / 0104 / 012F / 0149 / 014A / 014C: (XX * 100) / 255
   double? _parsePercent(String resp) {
     final clean = _cleanHex(resp);
-    final match = RegExp(r'41(11|04|2F)([0-9A-F]{2})').firstMatch(clean);
+    final match = RegExp(r'41(11|04|2F|49|4A|4C)([0-9A-F]{2})').firstMatch(clean);
     if (match != null) {
       final val = int.tryParse(match.group(2)!, radix: 16);
       if (val != null) return (val * 100.0) / 255.0;
@@ -528,6 +579,80 @@ class CarObdService {
       final hexVal = clean.substring(clean.length - 2);
       final val = int.tryParse(hexVal, radix: 16);
       if (val != null) return (val * 100.0) / 255.0;
+    }
+    return null;
+  }
+
+  // 0142: 41 42 AA BB -> ((AA * 256) + BB) / 1000 (V)
+  double? _parseStandardModuleVoltage(String resp) {
+    final clean = _cleanHex(resp);
+    final idx = clean.indexOf('4142');
+    if (idx != -1 && clean.length >= idx + 8) {
+      final hexA = clean.substring(idx + 4, idx + 6);
+      final hexB = clean.substring(idx + 6, idx + 8);
+      final valA = int.tryParse(hexA, radix: 16);
+      final valB = int.tryParse(hexB, radix: 16);
+      if (valA != null && valB != null) {
+        return ((valA * 256) + valB) / 1000.0;
+      }
+    }
+    return null;
+  }
+
+  // 01A6: 41 A6 AA BB CC DD -> ((AA * 16^6) + (BB * 16^4) + (CC * 16^2) + DD) / 10 (km)
+  double? _parseStandardOdometer(String resp) {
+    final clean = _cleanHex(resp);
+    final idx = clean.indexOf('41A6');
+    if (idx != -1 && clean.length >= idx + 12) {
+      final hexOdo = clean.substring(idx + 4, idx + 12);
+      final rawVal = int.tryParse(hexOdo, radix: 16);
+      if (rawVal != null) {
+        return rawVal / 10.0;
+      }
+    }
+    return null;
+  }
+
+  // 0110: 41 10 AA BB -> ((AA * 256) + BB) / 100 (g/s)
+  double? _parseStandardMaf(String resp) {
+    final clean = _cleanHex(resp);
+    final idx = clean.indexOf('4110');
+    if (idx != -1 && clean.length >= idx + 8) {
+      final hexA = clean.substring(idx + 4, idx + 6);
+      final hexB = clean.substring(idx + 6, idx + 8);
+      final valA = int.tryParse(hexA, radix: 16);
+      final valB = int.tryParse(hexB, radix: 16);
+      if (valA != null && valB != null) {
+        return ((valA * 256) + valB) / 100.0;
+      }
+    }
+    return null;
+  }
+
+  // 0133: 41 33 AA -> AA (kPa)
+  double? _parseStandardBaro(String resp) {
+    final clean = _cleanHex(resp);
+    final idx = clean.indexOf('4133');
+    if (idx != -1 && clean.length >= idx + 6) {
+      final hexA = clean.substring(idx + 4, idx + 6);
+      final val = int.tryParse(hexA, radix: 16);
+      if (val != null) return val.toDouble();
+    }
+    return null;
+  }
+
+  // 013C: 41 3C AA BB -> (((AA * 256) + BB) / 10) - 40 (°C)
+  double? _parseStandardCatTemp(String resp) {
+    final clean = _cleanHex(resp);
+    final idx = clean.indexOf('413C');
+    if (idx != -1 && clean.length >= idx + 8) {
+      final hexA = clean.substring(idx + 4, idx + 6);
+      final hexB = clean.substring(idx + 6, idx + 8);
+      final valA = int.tryParse(hexA, radix: 16);
+      final valB = int.tryParse(hexB, radix: 16);
+      if (valA != null && valB != null) {
+        return (((valA * 256) + valB) / 10.0) - 40.0;
+      }
     }
     return null;
   }
@@ -541,13 +666,145 @@ class CarObdService {
     return null;
   }
 
+  // --- 丰田 TNGA 第四代 THS-II UDS Mode 22 DID 解码器 ---
+
+  // 221024: 混动高压电池遥测 (SOC %, 总压 V, 充放电流 A, 功率 kW)
+  void _parseToyotaTnga221024(String resp) {
+    final bytes = _extractPayloadBytes(resp, '621024');
+    if (bytes == null || bytes.isEmpty) return;
+
+    try {
+      double? soc;
+      double? vb;
+      double? ib;
+
+      // SoC (Byte 0): (Byte * 100) / 255
+      if (bytes.isNotEmpty) {
+        soc = (bytes[0] * 100.0) / 255.0;
+      }
+
+      // 电池总压 (Bytes 1-2): ((A << 8) | B) * 0.1 V
+      if (bytes.length > 2) {
+        final rawV = (bytes[1] << 8) | bytes[2];
+        vb = rawV * 0.1;
+      }
+
+      // 充放电实时电流 (Bytes 3-4): 有符号 16-bit 偏移 32768, 精度 0.01 A
+      if (bytes.length > 4) {
+        final rawI = (bytes[3] << 8) | bytes[4];
+        ib = (rawI - 32768) * 0.01;
+      }
+
+      double? powerKw;
+      if (vb != null && ib != null) {
+        powerKw = (vb * ib) / 1000.0;
+      }
+
+      _updateTelemetry((t) => t.copyWith(
+            batterySoc: soc ?? t.batterySoc,
+            batteryVoltage: vb ?? t.batteryVoltage,
+            batteryCurrent: ib ?? t.batteryCurrent,
+            batteryPowerKw: powerKw ?? t.batteryPowerKw,
+            lastUpdated: DateTime.now(),
+          ));
+    } catch (e) {
+      log('解析 TNGA 221024 失败: $e');
+    }
+  }
+
+  // 221100: 升压变压器与逆变器热管理 (VL, VH, MG1/MG2 逆变器温, 变速箱油温)
+  void _parseToyotaTnga221100(String resp) {
+    final bytes = _extractPayloadBytes(resp, '621100');
+    if (bytes == null || bytes.length < 6) return;
+
+    try {
+      final vl = (((bytes[0] << 8) | bytes[1]) * 0.1);
+      final vh = (((bytes[2] << 8) | bytes[3]) * 0.1);
+      final mg1T = (bytes[4] - 40).toDouble();
+      final mg2T = (bytes[5] - 40).toDouble();
+      double? transOil;
+      if (bytes.length > 6) {
+        transOil = (bytes[6] - 40).toDouble();
+      }
+
+      _updateTelemetry((t) => t.copyWith(
+            voltageBeforeBoost: vl,
+            voltageAfterBoost: vh,
+            mg1InverterTemp: mg1T,
+            mg2InverterTemp: mg2T,
+            transaxleOilTemp: transOil ?? t.transaxleOilTemp,
+            lastUpdated: DateTime.now(),
+          ));
+    } catch (e) {
+      log('解析 TNGA 221100 失败: $e');
+    }
+  }
+
+  // 222884: 动力电池极值与单体压差 (最高单体 V, 最低单体 V, 压差 Delta V)
+  void _parseToyotaTnga222884(String resp) {
+    final bytes = _extractPayloadBytes(resp, '622884');
+    if (bytes == null || bytes.length < 4) return;
+
+    try {
+      final maxCell = (((bytes[0] << 8) | bytes[1]) / 1000.0);
+      final minCell = (((bytes[2] << 8) | bytes[3]) / 1000.0);
+      final delta = maxCell - minCell;
+
+      _updateTelemetry((t) => t.copyWith(
+            maxCellVoltage: maxCell,
+            minCellVoltage: minCell,
+            cellDeltaVoltage: delta,
+            lastUpdated: DateTime.now(),
+          ));
+    } catch (e) {
+      log('解析 TNGA 222884 失败: $e');
+    }
+  }
+
+  // 222885: 动力电池包 6 点温感监控
+  void _parseToyotaTnga222885(String resp) {
+    final bytes = _extractPayloadBytes(resp, '622885');
+    if (bytes == null || bytes.isEmpty) return;
+
+    try {
+      final temps = <double>[];
+      for (int i = 0; i < bytes.length && i < 6; i++) {
+        temps.add((bytes[i] - 40).toDouble());
+      }
+      _updateTelemetry((t) => t.copyWith(
+            batteryTemperatures: temps,
+            lastUpdated: DateTime.now(),
+          ));
+    } catch (e) {
+      log('解析 TNGA 222885 失败: $e');
+    }
+  }
+
+  // 221234: 电子冷却水泵转速与高阶热管理
+  void _parseToyotaTnga221234(String resp) {
+    final bytes = _extractPayloadBytes(resp, '621234');
+    if (bytes == null || bytes.length < 2) return;
+
+    try {
+      final actualRpm = ((bytes[0] << 8) | bytes[1]).toDouble();
+      double? oilT;
+      if (bytes.length > 4) {
+        oilT = (bytes[4] - 40).toDouble();
+      }
+
+      _updateTelemetry((t) => t.copyWith(
+            electricWaterPumpRpm: actualRpm,
+            engineOilTemp: oilT ?? t.engineOilTemp,
+            lastUpdated: DateTime.now(),
+          ));
+    } catch (e) {
+      log('解析 TNGA 221234 失败: $e');
+    }
+  }
+
+  // --- 兼容旧版第三代混动 Mode 21 解码器 ---
+
   // 丰田混动 21C3 解码:
-  // 响应格式典型以 61 C3 开头的一串 HEX 字节:
-  // Byte 18 (S): 动力电池 SoC: 0.392 * S (范围 0~100%)
-  // Byte 24 (Y): MG1 逆变器温度: Y - 50 (°C)
-  // Byte 25 (Z): MG2 逆变器温度: Z - 50 (°C)
-  // Byte 28 (AC): 动力电池总压 VB: 2 * AC (V)
-  // Byte 30 (AE): 动力电池电流 IB: 2 * AE - 256 (A, 负放正充)
   void _parseToyota21C3(String resp) {
     final bytes = _extractPayloadBytes(resp, '61C3');
     if (bytes == null || bytes.length < 20) return;
@@ -588,6 +845,7 @@ class CarObdService {
             batteryPowerKw: powerKw ?? t.batteryPowerKw,
             mg1InverterTemp: mg1T ?? t.mg1InverterTemp,
             mg2InverterTemp: mg2T ?? t.mg2InverterTemp,
+            lastUpdated: DateTime.now(),
           ));
     } catch (e) {
       log('解析 21C3 失败: $e');
@@ -595,9 +853,6 @@ class CarObdService {
   }
 
   // 丰田混动 21C4 解码:
-  // 响应以 61 C4 开头:
-  // Byte 3 (D): VL 升压前电压: 2 * D (V)
-  // Byte 4 (E): VH 升压后电压: 2 * E (V)
   void _parseToyota21C4(String resp) {
     final bytes = _extractPayloadBytes(resp, '61C4');
     if (bytes == null || bytes.length < 6) return;
@@ -609,6 +864,7 @@ class CarObdService {
       _updateTelemetry((t) => t.copyWith(
             voltageBeforeBoost: vl,
             voltageAfterBoost: vh,
+            lastUpdated: DateTime.now(),
           ));
     } catch (e) {
       log('解析 21C4 失败: $e');
@@ -621,9 +877,11 @@ class CarObdService {
     if (bytes == null || bytes.isEmpty) return;
 
     try {
-      // 常见机油温度位于前序字节 Byte 0 或 1: Val - 40
       final oilTemp = (bytes[0] - 40).toDouble();
-      _updateTelemetry((t) => t.copyWith(engineOilTemp: oilTemp));
+      _updateTelemetry((t) => t.copyWith(
+            engineOilTemp: oilTemp,
+            lastUpdated: DateTime.now(),
+          ));
     } catch (e) {
       log('解析 21CE 失败: $e');
     }
@@ -644,7 +902,11 @@ class CarObdService {
   }
 
   String _cleanHex(String raw) {
-    return raw
+    // 过滤掉 ELM327 多帧行标号 (如 "0: ", "1: ", "014\n0: ...")
+    final withoutFrameIndex = raw.replaceAll(
+        RegExp(r'(?:^|[\r\n])\s*[0-9A-F]{1,3}\s*:\s*', caseSensitive: false),
+        ' ');
+    return withoutFrameIndex
         .replaceAll(RegExp(r'[\r\n\s>:]'), '')
         .toUpperCase();
   }
@@ -958,25 +1220,79 @@ class CarObdService {
   String? _formatSampleValue(String cmd, String raw) {
     if (cmd == '010D') {
       final s = _parseStandardSpeed(raw);
-      if (s != null) return '${s.toInt()} km/h';
+      if (s != null) return '${s.toInt()} km/h (车速)';
     } else if (cmd == '010C') {
       final r = _parseStandardRpm(raw);
-      if (r != null) return '${r.toInt()} rpm';
+      if (r != null) return '${r.toInt()} rpm (转速)';
     } else if (cmd == '0105') {
       final c = _parseStandardTemp(raw);
       if (c != null) return '${c.toInt()} °C (水温)';
-    } else if (cmd == '21C3') {
-      return '混动核心遥测 (包含电池SoC/总电压/充放电流/逆变器温)';
-    } else if (cmd == '21C4') {
-      return '升压变压器与扭矩 (包含升压前VL/升压后VH)';
-    } else if (cmd == '21CE') {
-      return '油温与动力总成高阶参数';
+    } else if (cmd == '0142') {
+      final v = _parseStandardModuleVoltage(raw);
+      if (v != null) return '${v.toStringAsFixed(2)} V (控制模块供电)';
+    } else if (cmd == '01A6') {
+      final odo = _parseStandardOdometer(raw);
+      if (odo != null) return '${odo.toStringAsFixed(1)} km (仪表累计总里程)';
+    } else if (cmd == '015C') {
+      final c = _parseStandardTemp(raw);
+      if (c != null) return '${c.toInt()} °C (发动机机油温)';
     } else if (cmd == '0111') {
       final p = _parsePercent(raw);
-      if (p != null) return '${p.toStringAsFixed(1)}% (节气门)';
-    } else if (cmd == '0142') {
-      final v = _parseAtRv(raw);
-      if (v != null) return '${v.toStringAsFixed(2)} V (12V小电池)';
+      if (p != null) return '${p.toStringAsFixed(1)}% (节气门开度)';
+    } else if (cmd == '0149') {
+      final p = _parsePercent(raw);
+      if (p != null) return '${p.toStringAsFixed(1)}% (油门踏板D)';
+    } else if (cmd == '014A') {
+      final p = _parsePercent(raw);
+      if (p != null) return '${p.toStringAsFixed(1)}% (油门踏板E)';
+    } else if (cmd == '0110') {
+      final m = _parseStandardMaf(raw);
+      if (m != null) return '${m.toStringAsFixed(2)} g/s (进气空气流量)';
+    } else if (cmd == '0133') {
+      final b = _parseStandardBaro(raw);
+      if (b != null) return '${b.toInt()} kPa (大气压强)';
+    } else if (cmd == '013C') {
+      final t = _parseStandardCatTemp(raw);
+      if (t != null) return '${t.toStringAsFixed(1)} °C (催化转化器温1)';
+    } else if (cmd == '221024') {
+      final bytes = _extractPayloadBytes(raw, '621024');
+      if (bytes != null && bytes.length >= 3) {
+        final soc = (bytes[0] * 100.0 / 255.0).toStringAsFixed(1);
+        final v = (((bytes[1] << 8) | bytes[2]) * 0.1).toStringAsFixed(1);
+        return 'TNGA核心: SOC $soc%, 电池总压 $v V';
+      }
+      return 'TNGA混动核心遥测 (包含电池SoC/总电压/充放电流)';
+    } else if (cmd == '221100') {
+      final bytes = _extractPayloadBytes(raw, '621100');
+      if (bytes != null && bytes.length >= 4) {
+        final vl = (((bytes[0] << 8) | bytes[1]) * 0.1).toStringAsFixed(1);
+        final vh = (((bytes[2] << 8) | bytes[3]) * 0.1).toStringAsFixed(1);
+        return 'TNGA升压: VL $vl V -> VH $vh V';
+      }
+      return 'TNGA升压变压器与逆变器热管理';
+    } else if (cmd == '222884') {
+      final bytes = _extractPayloadBytes(raw, '622884');
+      if (bytes != null && bytes.length >= 4) {
+        final maxV = (((bytes[0] << 8) | bytes[1]) / 1000.0).toStringAsFixed(2);
+        final minV = (((bytes[2] << 8) | bytes[3]) / 1000.0).toStringAsFixed(2);
+        return 'TNGA电芯: 最高 $maxV V, 最低 $minV V';
+      }
+      return 'TNGA动力电芯极值与单体压差';
+    } else if (cmd == '222885') {
+      return 'TNGA动力电池包 6 点温感监控';
+    } else if (cmd == '221234') {
+      final bytes = _extractPayloadBytes(raw, '621234');
+      if (bytes != null && bytes.length >= 2) {
+        final rpm = (bytes[0] << 8) | bytes[1];
+        return '电子水泵实际转速 $rpm rpm';
+      }
+      return 'TNGA电子水泵与高阶热管理';
+    } else if (cmd == '21C3') {
+      return '旧版混动遥测 (Prius 3代兼容)';
+    } else if (cmd == '21C4') {
+      return '旧版升压遥测 (Prius 3代兼容)';
+    } else if (cmd == '21CE') {
+      return '油温与动力总成高阶参数';
     } else if (cmd == '0902') {
       return '车辆 VIN 码';
     }
@@ -1033,34 +1349,21 @@ class CarObdService {
       _ProbeEntry('车辆信息', null, '0906', '标定验证号 (CVN)'),
       _ProbeEntry('车辆信息', null, '090A', 'ECU 模块名称 (ECU Name)'),
 
-      // 3. 丰田专有混动系统 (Header 0x7E2 / 0x7E3)
-      _ProbeEntry('丰田混动', '7E2', '2101', '混动综合状态基础块 (HV Base Data)'),
-      _ProbeEntry('丰田混动', '7E2', '2181', '动力电池单体/模组电压 (HV Cell Voltages)'),
-      _ProbeEntry('丰田混动', '7E2', '2182', '动力电池单体内阻 (HV Internal Resistance)'),
-      _ProbeEntry('丰田混动', '7E2', '2187', '动力电池包 6 点温感 (HV Temperatures)'),
-      _ProbeEntry('丰田混动', '7E2', '21C3', '混动核心三电矩阵 (SOC, VB, IB, MG1/MG2)'),
-      _ProbeEntry('丰田混动', '7E2', '21C4', '升压变压器与扭矩 (VL, VH, Boost Temp)'),
-      _ProbeEntry('丰田混动', '7E2', '21CE', '混动变速箱/电驱桥油温 (Transaxle Oil Temp)'),
-      _ProbeEntry('丰田混动', '7E2', '21CF', '双电机转子/定子温度 (Motor Temp)'),
-      _ProbeEntry('丰田混动', '7E2', '21D0', '再生制动与刹车踏板力 (Regen Brake Torque)'),
-      _ProbeEntry('丰田混动', '7E2', '220101', 'UDS 混动电池包扩充遥测 (Battery Pack Ext)'),
-      _ProbeEntry('丰田混动', '7E2', '221024', 'UDS 混动系统功率限值 (Hybrid System Limits)'),
-      _ProbeEntry('丰田混动', '7E2', '222006', 'UDS 车辆总里程 (HV Total Odometer)'),
-      _ProbeEntry('丰田混动', '7E2', '222884', 'UDS 锂电池寿命与电量 (Battery Pack Life)'),
-      _ProbeEntry('丰田混动', '7E2', '22F190', 'UDS 车辆底盘与 VIN 标识'),
-      _ProbeEntry('丰田混动', '7E2', '22F187', 'UDS 混动电脑零件号 (Spare Part Number)'),
-      _ProbeEntry('丰田混动', '7E2', '22F189', 'UDS 混动固件版本号 (ECU Software Version)'),
+      // 3. 丰田 TNGA 第四代 THS-II 混动核心 (Header 0x7E2 / 0x7EB)
+      _ProbeEntry('TNGA混动', '7E2', '221024', 'TNGA 电池遥测 (SOC, VB, IB, 充放功率)'),
+      _ProbeEntry('TNGA混动', '7E2', '221100', 'TNGA 升压与逆变器温 (VL, VH, MG1/MG2, 油温)'),
+      _ProbeEntry('TNGA电池', '7EB', '222884', 'TNGA 电芯极值 (最高单体, 最低单体, 压差)'),
+      _ProbeEntry('TNGA电池', '7EB', '222885', 'TNGA 电池包 6 点温感监控 (Pack Temperatures)'),
+      _ProbeEntry('TNGA混动', '7E2', '222006', 'UDS 混动系统记录里程 (HV Total Odometer)'),
+      _ProbeEntry('TNGA混动', '7E2', '220101', 'UDS 混动电池包扩充遥测 (Battery Pack Ext)'),
+      _ProbeEntry('TNGA混动', '7E2', '21C3', '兼容旧版混动矩阵 (Legacy Prius 21C3)'),
+      _ProbeEntry('TNGA混动', '7E2', '21C4', '兼容旧版升压变压器 (Legacy Prius 21C4)'),
 
-      // 4. 丰田专出发动机 ECM (Header 0x7E0)
-      _ProbeEntry('发动机ECM', '7E0', '2101', '发动机 ECM 综合遥测块 (Engine Pack)'),
-      _ProbeEntry('发动机ECM', '7E0', '21CE', '机油温度与机油压力 (Oil Temp & Pressure)'),
-      _ProbeEntry('发动机ECM', '7E0', '21D4', '电子冷却水泵目标/实际转速 (Water Pump RPM)'),
-      _ProbeEntry('发动机ECM', '7E0', '21D5', '进气电驱可变凸轮 VVT-iE 角度 (VVT-iE Angle)'),
-      _ProbeEntry('发动机ECM', '7E0', '21D6', '排气凸轮轴 VVT 角度 (Exhaust VVT Angle)'),
-      _ProbeEntry('发动机ECM', '7E0', '21D8', '燃油喷油嘴喷射脉宽 (Injector Pulse Width)'),
-      _ProbeEntry('发动机ECM', '7E0', '221234', 'ECM 专有复合传感器块 (Extended Sensors)'),
-      _ProbeEntry('发动机ECM', '7E0', '222006', 'ECM 记录总里程 (ECM Total Odometer)'),
-      _ProbeEntry('发动机ECM', '7E0', '222008', '累计燃油消耗总量 (Total Fuel Consumed L)'),
+      // 4. 丰田 TNGA 发动机 ECM (Header 0x7E0)
+      _ProbeEntry('TNGA发动机', '7E0', '221234', '电子冷却水泵实际/目标转速与机油温'),
+      _ProbeEntry('TNGA发动机', '7E0', '222006', 'ECM 记录总里程 (ECM Total Odometer)'),
+      _ProbeEntry('TNGA发动机', '7E0', '222008', '累计燃油消耗总量 (Total Fuel Consumed L)'),
+      _ProbeEntry('TNGA发动机', '7E0', '21CE', '兼容旧版机油温度与压力 (Legacy ECM 21CE)'),
     ];
   }
 
@@ -1274,6 +1577,42 @@ class CarObdService {
 
   @visibleForTesting
   double? parsePercent(String resp) => _parsePercent(resp);
+
+  @visibleForTesting
+  double? parseStandardModuleVoltage(String resp) =>
+      _parseStandardModuleVoltage(resp);
+
+  @visibleForTesting
+  double? parseStandardOdometer(String resp) => _parseStandardOdometer(resp);
+
+  @visibleForTesting
+  double? parseStandardMaf(String resp) => _parseStandardMaf(resp);
+
+  @visibleForTesting
+  double? parseStandardBaro(String resp) => _parseStandardBaro(resp);
+
+  @visibleForTesting
+  double? parseStandardCatTemp(String resp) => _parseStandardCatTemp(resp);
+
+  @visibleForTesting
+  void parseToyotaTnga221024ForTesting(String resp) =>
+      _parseToyotaTnga221024(resp);
+
+  @visibleForTesting
+  void parseToyotaTnga221100ForTesting(String resp) =>
+      _parseToyotaTnga221100(resp);
+
+  @visibleForTesting
+  void parseToyotaTnga222884ForTesting(String resp) =>
+      _parseToyotaTnga222884(resp);
+
+  @visibleForTesting
+  void parseToyotaTnga222885ForTesting(String resp) =>
+      _parseToyotaTnga222885(resp);
+
+  @visibleForTesting
+  void parseToyotaTnga221234ForTesting(String resp) =>
+      _parseToyotaTnga221234(resp);
 
   @visibleForTesting
   Future<void> pollCycleForTesting() => _pollCycle();
