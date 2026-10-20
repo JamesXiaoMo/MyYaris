@@ -420,7 +420,7 @@ class CarObdService {
   }
 
   // Tier 2: 丰田混动 (支持 TNGA Mode 22 DID 与老款 Mode 21)
-  // Header 0x7E2 / 221024 (SoC, 电池总压, 充放电流) & 221100 (升压VL/VH, 逆变器温度)
+  // Header 0x7E2 / 221024 (SoC, 电池总压, 充放电流) & 221100 (升压VL/VH, 逆变器温度) & 221102 (双电机转速/扭矩)
   // Header 0x7EB / 222884 (电芯压差) & 222885 (6点温感)
   Future<void> _queryToyotaHybridTier2() async {
     // 1. 混动核心电脑 0x7E2
@@ -430,6 +430,9 @@ class CarObdService {
 
     final c221100 = await sendRawCommand('221100');
     _parseToyotaTnga221100(c221100);
+
+    final c221102 = await sendRawCommand('221102');
+    _parseToyotaTnga221102(c221102);
 
     // 兼容老款车型 (Prius 3代 Mode 21)
     if (!c221024.contains('621024')) {
@@ -482,12 +485,52 @@ class CarObdService {
     final oilResp = await sendRawCommand('015C');
     final oilTemp = _parseStandardTemp(oilResp);
 
+    // 4. 进气空气质量流量 MAF (0110) 与 绝对大气压 (0133)
+    final mafResp = await sendRawCommand('0110');
+    final maf = _parseStandardMaf(mafResp);
+
+    final baroResp = await sendRawCommand('0133');
+    final baro = _parseStandardBaro(baroResp);
+
+    // 5. 短期燃油修正 STFT (0106) 与 长期燃油修正 LTFT (0107)
+    final stftResp = await sendRawCommand('0106');
+    final stft = _parseFuelTrim(stftResp);
+
+    final ltftResp = await sendRawCommand('0107');
+    final ltft = _parseFuelTrim(ltftResp);
+
+    // 6. 空燃比当量比 Lambda (0134)
+    final lambdaResp = await sendRawCommand('0134');
+    final lambda = _parseLambda(lambdaResp);
+
+    // 7. 油门踏板位置 (0149 Pedal D, 014A Pedal E) 与节气门作动器指令 (014C)
+    final pedalDResp = await sendRawCommand('0149');
+    final pedalD = _parsePercent(pedalDResp);
+
+    final pedalEResp = await sendRawCommand('014A');
+    final pedalE = _parsePercent(pedalEResp);
+
+    final thActResp = await sendRawCommand('014C');
+    final thAct = _parsePercent(thActResp);
+
+    final relThResp = await sendRawCommand('0145');
+    final relTh = _parsePercent(relThResp);
+
     _updateTelemetry((t) => t.copyWith(
           aux12vVoltage: auxV ?? t.aux12vVoltage,
           throttlePosition: throttle ?? t.throttlePosition,
+          relativeThrottlePosition: relTh ?? t.relativeThrottlePosition,
+          commandedThrottleActuator: thAct ?? t.commandedThrottleActuator,
+          pedalPositionD: pedalD ?? t.pedalPositionD,
+          pedalPositionE: pedalE ?? t.pedalPositionE,
           engineLoad: load ?? t.engineLoad,
           intakeAirTemp: iat ?? t.intakeAirTemp,
           engineOilTemp: oilTemp ?? t.engineOilTemp,
+          mafGramsPerSec: maf ?? t.mafGramsPerSec,
+          barometricPressureKpa: baro ?? t.barometricPressureKpa,
+          shortTermFuelTrim: stft ?? t.shortTermFuelTrim,
+          longTermFuelTrim: ltft ?? t.longTermFuelTrim,
+          equivalenceRatio: lambda ?? t.equivalenceRatio,
           lastUpdated: DateTime.now(),
         ));
   }
@@ -498,11 +541,26 @@ class CarObdService {
     final odoResp = await sendRawCommand('01A6');
     final odo = _parseStandardOdometer(odoResp);
 
-    // 2. 读取催化转化器温度 (013C)
+    // 2. 读取催化转化器温度 (013C & 013D)
     final catResp = await sendRawCommand('013C');
     final catTemp = _parseStandardCatTemp(catResp);
 
-    // 3. 切换至发动机 ECM 0x7E0
+    final cat2Resp = await sendRawCommand('013D');
+    final catTemp2 = _parseStandardCatTemp(cat2Resp);
+
+    // 3. 读取发动机本次运行时间 (011F) 与 车外环境空气温度 (0146)
+    final runResp = await sendRawCommand('011F');
+    final runTime = _parseRunTime(runResp);
+
+    final ambResp = await sendRawCommand('0146');
+    final ambTemp = _parseStandardTemp(ambResp);
+
+    // 4. 切换至混动 0x7E2 读 HV 里程 (222006)
+    await sendRawCommand('ATSH7E2');
+    final hvOdoResp = await sendRawCommand('222006');
+    _parseToyotaTnga222006(hvOdoResp);
+
+    // 5. 切换至发动机 ECM 0x7E0
     await sendRawCommand('ATSH7E0');
     final ecm221234 = await sendRawCommand('221234');
     _parseToyotaTnga221234(ecm221234);
@@ -518,6 +576,9 @@ class CarObdService {
     _updateTelemetry((t) => t.copyWith(
           totalOdometerKm: odo ?? t.totalOdometerKm,
           catalystTemp: catTemp ?? t.catalystTemp,
+          catalystTemp2: catTemp2 ?? t.catalystTemp2,
+          runTimeSeconds: runTime ?? t.runTimeSeconds,
+          ambientAirTemp: ambTemp ?? t.ambientAirTemp,
           lastUpdated: DateTime.now(),
         ));
   }
@@ -567,10 +628,10 @@ class CarObdService {
     return null;
   }
 
-  // 0111 / 0104 / 012F / 0149 / 014A / 014C: (XX * 100) / 255
+  // 0111 / 0104 / 012F / 0145 / 0149 / 014A / 014C: (XX * 100) / 255
   double? _parsePercent(String resp) {
     final clean = _cleanHex(resp);
-    final match = RegExp(r'41(11|04|2F|49|4A|4C)([0-9A-F]{2})').firstMatch(clean);
+    final match = RegExp(r'41(11|04|2F|45|49|4A|4C)([0-9A-F]{2})').firstMatch(clean);
     if (match != null) {
       final val = int.tryParse(match.group(2)!, radix: 16);
       if (val != null) return (val * 100.0) / 255.0;
@@ -579,6 +640,52 @@ class CarObdService {
       final hexVal = clean.substring(clean.length - 2);
       final val = int.tryParse(hexVal, radix: 16);
       if (val != null) return (val * 100.0) / 255.0;
+    }
+    return null;
+  }
+
+  // 0106 / 0107: 41 06 XX -> (XX - 128) * 100 / 128 (%)
+  double? _parseFuelTrim(String resp) {
+    final clean = _cleanHex(resp);
+    final match = RegExp(r'41(06|07)([0-9A-F]{2})').firstMatch(clean);
+    if (match != null) {
+      final val = int.tryParse(match.group(2)!, radix: 16);
+      if (val != null) return ((val - 128) * 100.0) / 128.0;
+    }
+    return null;
+  }
+
+  // 010E: 41 0E XX -> (XX - 128) / 2 (°)
+  double? _parseTimingAdvance(String resp) {
+    final clean = _cleanHex(resp);
+    final idx = clean.indexOf('410E');
+    if (idx != -1 && clean.length >= idx + 6) {
+      final hexA = clean.substring(idx + 4, idx + 6);
+      final val = int.tryParse(hexA, radix: 16);
+      if (val != null) return (val - 128) / 2.0;
+    }
+    return null;
+  }
+
+  // 011F: 41 1F AA BB -> (AA * 256) + BB (s)
+  int? _parseRunTime(String resp) {
+    final clean = _cleanHex(resp);
+    final idx = clean.indexOf('411F');
+    if (idx != -1 && clean.length >= idx + 8) {
+      final hexVal = clean.substring(idx + 4, idx + 8);
+      return int.tryParse(hexVal, radix: 16);
+    }
+    return null;
+  }
+
+  // 0134: 41 34 AA BB -> ((AA * 256) + BB) / 32768 (Lambda)
+  double? _parseLambda(String resp) {
+    final clean = _cleanHex(resp);
+    final idx = clean.indexOf('4134');
+    if (idx != -1 && clean.length >= idx + 8) {
+      final hexVal = clean.substring(idx + 4, idx + 8);
+      final raw = int.tryParse(hexVal, radix: 16);
+      if (raw != null) return raw / 32768.0;
     }
     return null;
   }
@@ -641,9 +748,17 @@ class CarObdService {
     return null;
   }
 
-  // 013C: 41 3C AA BB -> (((AA * 256) + BB) / 10) - 40 (°C)
+  // 013C / 013D: 41 3C/3D AA BB -> (((AA * 256) + BB) / 10) - 40 (°C)
   double? _parseStandardCatTemp(String resp) {
     final clean = _cleanHex(resp);
+    final match = RegExp(r'41(3C|3D)([0-9A-F]{4})').firstMatch(clean);
+    if (match != null) {
+      final hexVal = match.group(2)!;
+      final rawVal = int.tryParse(hexVal, radix: 16);
+      if (rawVal != null) {
+        return (rawVal / 10.0) - 40.0;
+      }
+    }
     final idx = clean.indexOf('413C');
     if (idx != -1 && clean.length >= idx + 8) {
       final hexA = clean.substring(idx + 4, idx + 6);
@@ -740,7 +855,45 @@ class CarObdService {
     }
   }
 
-  // 222884: 动力电池极值与单体压差 (最高单体 V, 最低单体 V, 压差 Delta V)
+  // 221102: 双电机工况与扭矩 (MG1 RPM, MG2 RPM, MG2 扭矩, 再生制动力矩)
+  void _parseToyotaTnga221102(String resp) {
+    final bytes = _extractPayloadBytes(resp, '621102');
+    if (bytes == null || bytes.length < 4) return;
+
+    try {
+      int rawMg1 = (bytes[0] << 8) | bytes[1];
+      if (rawMg1 > 32767) rawMg1 -= 65536;
+
+      int rawMg2 = (bytes[2] << 8) | bytes[3];
+      if (rawMg2 > 32767) rawMg2 -= 65536;
+
+      double? mg2T;
+      if (bytes.length >= 6) {
+        int rawT = (bytes[4] << 8) | bytes[5];
+        if (rawT > 32767) rawT -= 65536;
+        mg2T = rawT / 8.0;
+      }
+
+      double? regenT;
+      if (bytes.length >= 8) {
+        int rawR = (bytes[6] << 8) | bytes[7];
+        if (rawR > 32767) rawR -= 65536;
+        regenT = rawR / 8.0;
+      }
+
+      _updateTelemetry((t) => t.copyWith(
+            mg1Rpm: rawMg1.toDouble(),
+            mg2Rpm: rawMg2.toDouble(),
+            mg2Torque: mg2T ?? t.mg2Torque,
+            regenBrakingTorque: regenT ?? t.regenBrakingTorque,
+            lastUpdated: DateTime.now(),
+          ));
+    } catch (e) {
+      log('解析 TNGA 221102 失败: $e');
+    }
+  }
+
+  // 222884: 动力电池极值与单体压差 (最高单体 V, 最低单体 V, 压差 Delta V, 平均单体 V)
   void _parseToyotaTnga222884(String resp) {
     final bytes = _extractPayloadBytes(resp, '622884');
     if (bytes == null || bytes.length < 4) return;
@@ -749,10 +902,19 @@ class CarObdService {
       final maxCell = (((bytes[0] << 8) | bytes[1]) / 1000.0);
       final minCell = (((bytes[2] << 8) | bytes[3]) / 1000.0);
       final delta = maxCell - minCell;
+      double? avgCell;
+      if (bytes.length >= 6) {
+        final rawAvg = ((bytes[4] << 8) | bytes[5]);
+        if (rawAvg > 0) {
+          avgCell = rawAvg / 1000.0;
+        }
+      }
+      avgCell ??= (maxCell + minCell) / 2.0;
 
       _updateTelemetry((t) => t.copyWith(
             maxCellVoltage: maxCell,
             minCellVoltage: minCell,
+            avgCellVoltage: avgCell,
             cellDeltaVoltage: delta,
             lastUpdated: DateTime.now(),
           ));
@@ -787,6 +949,10 @@ class CarObdService {
 
     try {
       final actualRpm = ((bytes[0] << 8) | bytes[1]).toDouble();
+      double? targetRpm;
+      if (bytes.length >= 4) {
+        targetRpm = ((bytes[2] << 8) | bytes[3]).toDouble();
+      }
       double? oilT;
       if (bytes.length > 4) {
         oilT = (bytes[4] - 40).toDouble();
@@ -794,11 +960,32 @@ class CarObdService {
 
       _updateTelemetry((t) => t.copyWith(
             electricWaterPumpRpm: actualRpm,
+            electricWaterPumpTargetRpm: targetRpm ?? t.electricWaterPumpTargetRpm,
             engineOilTemp: oilT ?? t.engineOilTemp,
             lastUpdated: DateTime.now(),
           ));
     } catch (e) {
       log('解析 TNGA 221234 失败: $e');
+    }
+  }
+
+  // 222006: 混动系统记录总里程
+  void _parseToyotaTnga222006(String resp) {
+    final bytes = _extractPayloadBytes(resp, '622006');
+    if (bytes == null || bytes.length < 3) return;
+
+    try {
+      int raw = 0;
+      for (final b in bytes.take(4)) {
+        raw = (raw << 8) | b;
+      }
+      final odo = raw / 10.0;
+      _updateTelemetry((t) => t.copyWith(
+            totalOdometerKm: t.totalOdometerKm ?? odo,
+            lastUpdated: DateTime.now(),
+          ));
+    } catch (e) {
+      log('解析 TNGA 222006 失败: $e');
     }
   }
 
@@ -1254,6 +1441,33 @@ class CarObdService {
     } else if (cmd == '013C') {
       final t = _parseStandardCatTemp(raw);
       if (t != null) return '${t.toStringAsFixed(1)} °C (催化转化器温1)';
+    } else if (cmd == '013D') {
+      final t = _parseStandardCatTemp(raw);
+      if (t != null) return '${t.toStringAsFixed(1)} °C (催化转化器温2)';
+    } else if (cmd == '0106') {
+      final val = _parseFuelTrim(raw);
+      if (val != null) return '${val.toStringAsFixed(1)}% (短期燃油修正 STFT)';
+    } else if (cmd == '0107') {
+      final val = _parseFuelTrim(raw);
+      if (val != null) return '${val.toStringAsFixed(1)}% (长期燃油修正 LTFT)';
+    } else if (cmd == '010E') {
+      final val = _parseTimingAdvance(raw);
+      if (val != null) return '${val.toStringAsFixed(1)}° (点火提前角)';
+    } else if (cmd == '011F') {
+      final s = _parseRunTime(raw);
+      if (s != null) return '$s s (本次运行时间)';
+    } else if (cmd == '0134') {
+      final lambda = _parseLambda(raw);
+      if (lambda != null) return '${lambda.toStringAsFixed(3)} λ (空燃比当量比)';
+    } else if (cmd == '0145') {
+      final p = _parsePercent(raw);
+      if (p != null) return '${p.toStringAsFixed(1)}% (相对节气门开度)';
+    } else if (cmd == '0146') {
+      final c = _parseStandardTemp(raw);
+      if (c != null) return '${c.toInt()} °C (车外环境温度)';
+    } else if (cmd == '014C') {
+      final p = _parsePercent(raw);
+      if (p != null) return '${p.toStringAsFixed(1)}% (节气门作动器指令)';
     } else if (cmd == '221024') {
       final bytes = _extractPayloadBytes(raw, '621024');
       if (bytes != null && bytes.length >= 3) {
@@ -1270,6 +1484,16 @@ class CarObdService {
         return 'TNGA升压: VL $vl V -> VH $vh V';
       }
       return 'TNGA升压变压器与逆变器热管理';
+    } else if (cmd == '221102') {
+      final bytes = _extractPayloadBytes(raw, '621102');
+      if (bytes != null && bytes.length >= 4) {
+        int rawMg1 = (bytes[0] << 8) | bytes[1];
+        if (rawMg1 > 32767) rawMg1 -= 65536;
+        int rawMg2 = (bytes[2] << 8) | bytes[3];
+        if (rawMg2 > 32767) rawMg2 -= 65536;
+        return 'TNGA双电机: MG1 $rawMg1 rpm, MG2 $rawMg2 rpm';
+      }
+      return 'TNGA双电机工况与再生制动力矩';
     } else if (cmd == '222884') {
       final bytes = _extractPayloadBytes(raw, '622884');
       if (bytes != null && bytes.length >= 4) {
@@ -1287,6 +1511,16 @@ class CarObdService {
         return '电子水泵实际转速 $rpm rpm';
       }
       return 'TNGA电子水泵与高阶热管理';
+    } else if (cmd == '222006') {
+      final bytes = _extractPayloadBytes(raw, '622006');
+      if (bytes != null && bytes.length >= 3) {
+        int rawOdo = 0;
+        for (final b in bytes.take(4)) {
+          rawOdo = (rawOdo << 8) | b;
+        }
+        return '总里程: ${(rawOdo / 10.0).toStringAsFixed(1)} km';
+      }
+      return '系统记录总里程';
     } else if (cmd == '21C3') {
       return '旧版混动遥测 (Prius 3代兼容)';
     } else if (cmd == '21C4') {
@@ -1352,6 +1586,7 @@ class CarObdService {
       // 3. 丰田 TNGA 第四代 THS-II 混动核心 (Header 0x7E2 / 0x7EB)
       _ProbeEntry('TNGA混动', '7E2', '221024', 'TNGA 电池遥测 (SOC, VB, IB, 充放功率)'),
       _ProbeEntry('TNGA混动', '7E2', '221100', 'TNGA 升压与逆变器温 (VL, VH, MG1/MG2, 油温)'),
+      _ProbeEntry('TNGA混动', '7E2', '221102', 'TNGA 双电机与再生力矩 (MG1/MG2 RPM, MG2/再生扭矩)'),
       _ProbeEntry('TNGA电池', '7EB', '222884', 'TNGA 电芯极值 (最高单体, 最低单体, 压差)'),
       _ProbeEntry('TNGA电池', '7EB', '222885', 'TNGA 电池包 6 点温感监控 (Pack Temperatures)'),
       _ProbeEntry('TNGA混动', '7E2', '222006', 'UDS 混动系统记录里程 (HV Total Odometer)'),
@@ -1613,6 +1848,26 @@ class CarObdService {
   @visibleForTesting
   void parseToyotaTnga221234ForTesting(String resp) =>
       _parseToyotaTnga221234(resp);
+
+  @visibleForTesting
+  double? parseFuelTrim(String resp) => _parseFuelTrim(resp);
+
+  @visibleForTesting
+  double? parseTimingAdvance(String resp) => _parseTimingAdvance(resp);
+
+  @visibleForTesting
+  int? parseRunTime(String resp) => _parseRunTime(resp);
+
+  @visibleForTesting
+  double? parseLambda(String resp) => _parseLambda(resp);
+
+  @visibleForTesting
+  void parseToyotaTnga221102ForTesting(String resp) =>
+      _parseToyotaTnga221102(resp);
+
+  @visibleForTesting
+  void parseToyotaTnga222006ForTesting(String resp) =>
+      _parseToyotaTnga222006(resp);
 
   @visibleForTesting
   Future<void> pollCycleForTesting() => _pollCycle();

@@ -383,6 +383,10 @@ class _ObdDashboardPageState extends State<ObdDashboardPage> {
 
                         // 3. 升压母线、逆变器与整车小电瓶卡片
                         _buildInverterAndAuxCard(tel),
+                        const SizedBox(height: 10),
+
+                        // 4. TNGA 双电机工况、扭矩与进气燃烧卡片
+                        _buildMotorsAndEmissionsCard(tel),
                       ],
                     ),
                   ),
@@ -761,7 +765,7 @@ class _ObdDashboardPageState extends State<ObdDashboardPage> {
                         border: Border.all(color: Colors.white10),
                       ),
                       child: Text(
-                        '电芯压差: ${(tel.cellDeltaVoltage! * 1000).toInt()} mV (${tel.minCellVoltage?.toStringAsFixed(2)}V ~ ${tel.maxCellVoltage?.toStringAsFixed(2)}V)',
+                        '电芯压差: ${(tel.cellDeltaVoltage! * 1000).toInt()} mV (${tel.minCellVoltage?.toStringAsFixed(2)}V ~ ${tel.maxCellVoltage?.toStringAsFixed(2)}V${tel.avgCellVoltage != null ? " • 均压 ${tel.avgCellVoltage!.toStringAsFixed(2)}V" : ""})',
                         style: const TextStyle(color: Colors.tealAccent, fontSize: 10.5),
                       ),
                     ),
@@ -814,11 +818,30 @@ class _ObdDashboardPageState extends State<ObdDashboardPage> {
                   ),
                 ],
               ),
-              if (tel.totalOdometerKm != null)
-                Text(
-                  '总里程: ${tel.totalOdometerKm!.toStringAsFixed(1)} km',
-                  style: const TextStyle(color: Colors.white70, fontSize: 11, fontWeight: FontWeight.bold),
-                ),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (tel.runTimeSeconds != null) ...[
+                    Text(
+                      '运行: ${tel.runTimeSeconds! ~/ 60}分${tel.runTimeSeconds! % 60}秒',
+                      style: const TextStyle(color: Colors.tealAccent, fontSize: 10.5),
+                    ),
+                    const SizedBox(width: 8),
+                  ],
+                  if (tel.ambientAirTemp != null) ...[
+                    Text(
+                      '车外: ${tel.ambientAirTemp!.toInt()}°C',
+                      style: const TextStyle(color: Colors.lightBlueAccent, fontSize: 10.5),
+                    ),
+                    const SizedBox(width: 8),
+                  ],
+                  if (tel.totalOdometerKm != null)
+                    Text(
+                      '总里程: ${tel.totalOdometerKm!.toStringAsFixed(1)} km',
+                      style: const TextStyle(color: Colors.white70, fontSize: 11, fontWeight: FontWeight.bold),
+                    ),
+                ],
+              ),
             ],
           ),
           const SizedBox(height: 10),
@@ -920,12 +943,22 @@ class _ObdDashboardPageState extends State<ObdDashboardPage> {
                 color: Colors.tealAccent,
               ),
               _buildMetricItem(
+                label: '变速箱油温',
+                value: tel.transaxleOilTemp != null ? '${tel.transaxleOilTemp!.toInt()} °C' : '--',
+                icon: Icons.water_drop,
+                color: Colors.amberAccent,
+                subtext: 'DID 221100',
+              ),
+              _buildMetricItem(
                 label: '电子水泵转速',
                 value: tel.electricWaterPumpRpm != null
                     ? '${tel.electricWaterPumpRpm!.toInt()} rpm'
                     : '--',
                 icon: Icons.water,
                 color: Colors.lightBlueAccent,
+                subtext: tel.electricWaterPumpTargetRpm != null
+                    ? '目标 ${tel.electricWaterPumpTargetRpm!.toInt()} rpm'
+                    : null,
               ),
               _buildMetricItem(
                 label: '12V 辅助蓄电池',
@@ -938,6 +971,145 @@ class _ObdDashboardPageState extends State<ObdDashboardPage> {
               ),
             ],
           ),
+        ],
+      ),
+    );
+  }
+
+  // 4. TNGA 双电机工况、扭矩与进气燃烧卡片
+  Widget _buildMotorsAndEmissionsCard(ObdTelemetry tel) {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1B202B),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.purpleAccent.withValues(alpha: 0.3)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Row(
+                children: [
+                  Icon(Icons.electric_meter, color: Colors.purpleAccent, size: 18),
+                  SizedBox(width: 6),
+                  Text(
+                    'TNGA 双电机工况、扭矩与燃烧排放',
+                    style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold),
+                  ),
+                ],
+              ),
+              Text(
+                'DID 221102 / 0110 / 0134 / 013C / 0106',
+                style: TextStyle(color: Colors.purpleAccent.withValues(alpha: 0.8), fontSize: 10),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              _buildMetricItem(
+                label: 'MG1 发电机转速',
+                value: tel.mg1Rpm != null ? '${tel.mg1Rpm!.toInt()} rpm' : '--',
+                icon: Icons.cached,
+                color: Colors.cyanAccent,
+              ),
+              _buildMetricItem(
+                label: 'MG2 驱动电机转速',
+                value: tel.mg2Rpm != null ? '${tel.mg2Rpm!.toInt()} rpm' : '--',
+                icon: Icons.autorenew,
+                color: Colors.greenAccent,
+              ),
+              _buildMetricItem(
+                label: 'MG2 实时扭矩',
+                value: tel.mg2Torque != null ? '${tel.mg2Torque!.toStringAsFixed(1)} Nm' : '--',
+                icon: Icons.offline_bolt,
+                color: (tel.mg2Torque ?? 0) >= 0 ? Colors.orangeAccent : Colors.tealAccent,
+                subtext: (tel.mg2Torque ?? 0) >= 0 ? '正向驱动' : '再生回充',
+              ),
+              _buildMetricItem(
+                label: '再生制动力矩',
+                value: tel.regenBrakingTorque != null
+                    ? '${tel.regenBrakingTorque!.toStringAsFixed(1)} Nm'
+                    : '--',
+                icon: Icons.electric_car,
+                color: Colors.tealAccent,
+              ),
+              _buildMetricItem(
+                label: '进气质量流量 MAF',
+                value: tel.mafGramsPerSec != null
+                    ? '${tel.mafGramsPerSec!.toStringAsFixed(2)} g/s'
+                    : '--',
+                icon: Icons.air,
+                color: Colors.lightBlueAccent,
+              ),
+              _buildMetricItem(
+                label: '空燃比当量比',
+                value: tel.equivalenceRatio != null
+                    ? '${tel.equivalenceRatio!.toStringAsFixed(3)} λ'
+                    : '--',
+                icon: Icons.science,
+                color: Colors.amberAccent,
+                subtext: 'Lambda (0134)',
+              ),
+            ],
+          ),
+          if (tel.shortTermFuelTrim != null ||
+              tel.catalystTemp != null ||
+              tel.pedalPositionD != null) ...[
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                if (tel.shortTermFuelTrim != null || tel.longTermFuelTrim != null)
+                  Expanded(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      decoration: BoxDecoration(
+                        color: Colors.black12,
+                        borderRadius: BorderRadius.circular(4),
+                        border: Border.all(color: Colors.white10),
+                      ),
+                      child: Text(
+                        '燃油修正: STFT ${tel.shortTermFuelTrim != null ? "${tel.shortTermFuelTrim!.toStringAsFixed(1)}%" : "--"} • LTFT ${tel.longTermFuelTrim != null ? "${tel.longTermFuelTrim!.toStringAsFixed(1)}%" : "--"}',
+                        style: const TextStyle(color: Colors.lightGreenAccent, fontSize: 10.5),
+                      ),
+                    ),
+                  ),
+                if (tel.catalystTemp != null || tel.catalystTemp2 != null) ...[
+                  const SizedBox(width: 8),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: Colors.black12,
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(color: Colors.white10),
+                    ),
+                    child: Text(
+                      '三元催化温度: ${tel.catalystTemp?.toInt() ?? "--"}°C / ${tel.catalystTemp2?.toInt() ?? "--"}°C',
+                      style: const TextStyle(color: Colors.deepOrangeAccent, fontSize: 10.5),
+                    ),
+                  ),
+                ],
+                if (tel.pedalPositionD != null) ...[
+                  const SizedBox(width: 8),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: Colors.black12,
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(color: Colors.white10),
+                    ),
+                    child: Text(
+                      '油门踏板: ${tel.pedalPositionD!.toStringAsFixed(1)}%${tel.commandedThrottleActuator != null ? " (作动器 ${tel.commandedThrottleActuator!.toStringAsFixed(1)}%)" : ""}',
+                      style: const TextStyle(color: Colors.amberAccent, fontSize: 10.5),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ],
         ],
       ),
     );

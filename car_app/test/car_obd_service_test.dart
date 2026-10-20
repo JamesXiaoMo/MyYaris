@@ -313,15 +313,17 @@ void main() {
       expect(tel.transaxleOilTemp, equals(45.0));
     });
 
-    test('TNGA 222884 Battery Cell Extremes (Max 3.631V, Min 3.620V, Delta 11mV)', () {
+    test('TNGA 222884 Battery Cell Extremes and Avg Voltage (Max 3.631V, Min 3.620V, Avg 3.625V, Delta 11mV)', () {
       // 62 28 84:
       // Bytes 0-1: 0x0E2F (3631) -> 3.631 V
       // Bytes 2-3: 0x0E24 (3620) -> 3.620 V
-      obd.parseToyotaTnga222884ForTesting('62 28 84 0E 2F 0E 24');
+      // Bytes 4-5: 0x0E29 (3625) -> 3.625 V
+      obd.parseToyotaTnga222884ForTesting('62 28 84 0E 2F 0E 24 0E 29');
       final tel = obd.telemetryNotifier.value;
 
       expect(tel.maxCellVoltage, closeTo(3.631, 0.001));
       expect(tel.minCellVoltage, closeTo(3.620, 0.001));
+      expect(tel.avgCellVoltage, closeTo(3.625, 0.001));
       expect(tel.cellDeltaVoltage, closeTo(0.011, 0.001));
     });
 
@@ -334,13 +336,66 @@ void main() {
       expect(tel.batteryTemperatures, equals([26.0, 27.0, 28.0, 27.0, 26.0, 27.0]));
     });
 
-    test('TNGA 221234 Electric Water Pump (1700 RPM, Oil Temp 24°C)', () {
-      // 62 12 34: Bytes 0-1: 0x06A4 (1700 rpm), Byte 4: 0x40 (24 °C)
+    test('TNGA 221234 Electric Water Pump (Actual 1700 RPM, Target 1680 RPM, Oil Temp 24°C)', () {
+      // 62 12 34: Bytes 0-1: 0x06A4 (1700 rpm), Bytes 2-3: 0x0690 (1680 rpm), Byte 4: 0x40 (24 °C)
       obd.parseToyotaTnga221234ForTesting('62 12 34 06 A4 06 90 40');
       final tel = obd.telemetryNotifier.value;
 
       expect(tel.electricWaterPumpRpm, equals(1700.0));
+      expect(tel.electricWaterPumpTargetRpm, equals(1680.0));
       expect(tel.engineOilTemp, equals(24.0));
+    });
+
+    test('TNGA 221102 Dual Motor Status & Torques (MG1 -2500 rpm, MG2 4200 rpm, MG2 Torque +45.5 Nm, Regen Torque -30.0 Nm)', () {
+      // 62 11 02:
+      // MG1: -2500 -> 0xF63C (65536 - 2500 = 63036 = 0xF63C)
+      // MG2: 4200 -> 0x1068 (4200)
+      // MG2 Torque: 45.5 Nm * 8 = 364 -> 0x016C
+      // Regen Torque: -30.0 Nm * 8 = -240 -> 65536 - 240 = 65296 -> 0xFF10
+      obd.parseToyotaTnga221102ForTesting('62 11 02 F6 3C 10 68 01 6C FF 10');
+      final tel = obd.telemetryNotifier.value;
+
+      expect(tel.mg1Rpm, equals(-2500.0));
+      expect(tel.mg2Rpm, equals(4200.0));
+      expect(tel.mg2Torque, closeTo(45.5, 0.1));
+      expect(tel.regenBrakingTorque, closeTo(-30.0, 0.1));
+    });
+
+    test('TNGA 222006 HV Total Odometer (77827.2 km)', () {
+      // 62 20 06: 0x000BE020 (778272) -> 77827.2 km
+      obd.parseToyotaTnga222006ForTesting('62 20 06 00 0B E0 20');
+      final tel = obd.telemetryNotifier.value;
+
+      expect(tel.totalOdometerKm, closeTo(77827.2, 0.1));
+    });
+
+    test('Expanded Standard Mode 01 decoders (STFT, LTFT, Timing, RunTime, Lambda, CatTemp2, RelThrottle, Actuator)', () {
+      // 0106 STFT: 0x80 (128) -> 0.0%, 0x8A (138) -> (10 * 100 / 128) = +7.81%
+      expect(obd.parseFuelTrim('41 06 80'), closeTo(0.0, 0.1));
+      expect(obd.parseFuelTrim('41 06 8A'), closeTo(7.81, 0.1));
+
+      // 0107 LTFT: 0x7A (122) -> (-6 * 100 / 128) = -4.68%
+      expect(obd.parseFuelTrim('41 07 7A'), closeTo(-4.68, 0.1));
+
+      // 010E Timing Advance: 0x80 (128) -> 0.0°, 0x94 (148) -> (20 / 2) = +10.0°
+      expect(obd.parseTimingAdvance('41 0E 80'), equals(0.0));
+      expect(obd.parseTimingAdvance('41 0E 94'), equals(10.0));
+
+      // 011F Run Time: 0x012C (300) -> 300 s
+      expect(obd.parseRunTime('41 1F 01 2C'), equals(300));
+
+      // 0134 Lambda: 0x8000 (32768) -> 1.000 λ, 0x7CCD (31949) -> 0.975 λ
+      expect(obd.parseLambda('41 34 80 00'), closeTo(1.0, 0.001));
+      expect(obd.parseLambda('41 34 7C CD'), closeTo(0.975, 0.001));
+
+      // 013D Cat Temp 2: 0x163B -> 529.1 °C
+      expect(obd.parseStandardCatTemp('41 3D 16 3B'), closeTo(529.1, 0.1));
+
+      // 0145 Relative Throttle: 0x33 (51) -> 20.0%
+      expect(obd.parsePercent('41 45 33'), closeTo(20.0, 0.1));
+
+      // 014C Commanded Throttle Actuator: 0x80 (128) -> 50.2%
+      expect(obd.parsePercent('41 4C 80'), closeTo(50.2, 0.1));
     });
   });
 
