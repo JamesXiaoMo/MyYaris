@@ -3,6 +3,8 @@ import 'package:audio_service/audio_service.dart';
 import 'package:flutter/foundation.dart';
 import 'package:just_audio/just_audio.dart';
 import 'built_in_player_service.dart';
+import 'car_music_sync_service.dart';
+import 'car_music_queue_controller.dart';
 
 /// System MediaSession & Notification AudioHandler implementation for MyYaris.
 /// Bridges BuiltInPlayerService (just_audio) to Android MediaSession,
@@ -102,50 +104,40 @@ class CarAudioHandler extends BaseAudioHandler with SeekHandler {
       updatePosition: player.position,
       bufferedPosition: player.bufferedPosition,
       speed: player.speed,
-      queueIndex: player.currentIndex,
+      queueIndex: CarMusicQueueController().currentIndex,
     ));
   }
 
   @override
-  Future<void> play() async => await _playerService.play();
+  Future<void> play() => CarMusicSyncService().requestLocalCommand('resume');
 
   @override
-  Future<void> pause() async => await _playerService.pause();
+  Future<void> pause() => CarMusicSyncService().requestLocalCommand('pause');
 
   @override
-  Future<void> stop() async => await _playerService.stop();
+  Future<void> stop() => CarMusicSyncService().requestLocalCommand('stop');
 
   @override
-  Future<void> seek(Duration position) async => await _playerService.seek(position);
+  Future<void> seek(Duration position) => CarMusicSyncService().requestLocalCommand('seek', {'position_ms': position.inMilliseconds});
 
   @override
-  Future<void> skipToNext() async => await _playerService.skipToNext();
+  Future<void> skipToNext() => CarMusicSyncService().requestLocalCommand('next');
 
   @override
-  Future<void> skipToPrevious() async => await _playerService.skipToPrevious();
+  Future<void> skipToPrevious() => CarMusicSyncService().requestLocalCommand('prev');
 
   @override
   Future<void> setRepeatMode(AudioServiceRepeatMode repeatMode) async {
-    switch (repeatMode) {
-      case AudioServiceRepeatMode.none:
-        await _playerService.setLoopModeString('off');
-        break;
-      case AudioServiceRepeatMode.one:
-        await _playerService.setLoopModeString('one');
-        break;
-      case AudioServiceRepeatMode.all:
-      case AudioServiceRepeatMode.group:
-        await _playerService.setLoopModeString('all');
-        break;
-    }
+    await CarMusicSyncService().requestLocalCommand('set_playback_mode', {
+      'mode': repeatMode == AudioServiceRepeatMode.one ? 'single_loop' : 'list_loop',
+    });
   }
 
   @override
-  Future<void> setShuffleMode(AudioServiceShuffleMode shuffleMode) async {
-    final enabled = shuffleMode == AudioServiceShuffleMode.all ||
-        shuffleMode == AudioServiceShuffleMode.group;
-    await _playerService.setShuffle(enabled);
-  }
+  Future<void> setShuffleMode(AudioServiceShuffleMode shuffleMode) =>
+    CarMusicSyncService().requestLocalCommand('set_playback_mode', {
+      'mode': shuffleMode == AudioServiceShuffleMode.all || shuffleMode == AudioServiceShuffleMode.group ? 'shuffle' : 'list_loop',
+    });
 
   @override
   Future<void> customAction(String name, [Map<String, dynamic>? extras]) async {

@@ -1,4 +1,6 @@
-import 'package:flutter/services.dart';
+import 'built_in_player_service.dart';
+import 'car_music_queue_controller.dart';
+import 'car_music_sync_service.dart';
 
 class CustomActionItem {
   final String action;
@@ -93,101 +95,34 @@ class PlaybackInfo {
   }
 }
 
+/// Home-page adapter for the same backend/controller/engine pipeline.
 class MusicService {
-  static const MethodChannel _channel = MethodChannel('com.myyaris.my_yaris/music');
-
-  Future<bool> isNotificationAccessGranted() async {
-    try {
-      final res = await _channel.invokeMethod<bool>('isNotificationAccessGranted');
-      return res ?? false;
-    } catch (_) {
-      return false;
-    }
-  }
-
-  Future<bool> openNotificationAccessSettings() async {
-    try {
-      final res = await _channel.invokeMethod<bool>('openNotificationAccessSettings');
-      return res ?? false;
-    } catch (_) {
-      return false;
-    }
-  }
+  Future<bool> isNotificationAccessGranted() async => true;
+  Future<bool> openNotificationAccessSettings() async => false;
 
   Future<PlaybackInfo> getPlaybackInfo() async {
-    try {
-      final res = await _channel.invokeMethod<Map<dynamic, dynamic>>('getPlaybackInfo');
-      if (res != null) {
-        return PlaybackInfo.fromMap(res);
-      }
-      return const PlaybackInfo(hasPermission: false, sessionFound: false, message: '返回为空');
-    } catch (e) {
-      return PlaybackInfo(
-        hasPermission: false,
-        sessionFound: false,
-        message: '调用异常: $e',
-      );
-    }
+    final service = BuiltInPlayerService();
+    final ctrl = CarMusicQueueController();
+    final current = service.currentTrack;
+    return PlaybackInfo(hasPermission: true, sessionFound: current.id.isNotEmpty,
+      title: current.title, artist: current.artist, album: current.tag,
+      stateCode: service.stopped ? 1 : service.player.playing ? 3 : 2,
+      stateName: service.stopped ? '停止' : service.player.playing ? '播放中' : '已暂停',
+      positionMs: service.player.position.inMilliseconds,
+      repeatMode: ctrl.appliedMode.value == 'single_loop' ? 1 : 2,
+      shuffleMode: ctrl.appliedMode.value == 'shuffle' ? 1 : 0,
+      message: ctrl.errorDetail ?? '未选择来源时，点播放将使用完整喜欢歌单');
   }
 
-  Future<Map<String, dynamic>> togglePlayPause() async {
-    try {
-      final res = await _channel.invokeMethod<Map<dynamic, dynamic>>('togglePlayPause');
-      return Map<String, dynamic>.from(res ?? {});
-    } catch (e) {
-      return {'success': false, 'message': '操作失败: $e'};
-    }
+  Future<Map<String, dynamic>> _request(String action, [Map<String, dynamic> params = const {}]) async {
+    final sync = CarMusicSyncService();
+    await sync.requestLocalCommand(action, params);
+    // Submission is distinct from car execution; never return fabricated success.
+    return {'message': sync.lastCommandNotifier.value};
   }
 
-  Future<Map<String, dynamic>> skipToNext() async {
-    try {
-      final res = await _channel.invokeMethod<Map<dynamic, dynamic>>('skipToNext');
-      return Map<String, dynamic>.from(res ?? {});
-    } catch (e) {
-      return {'success': false, 'message': '操作失败: $e'};
-    }
-  }
-
-  Future<Map<String, dynamic>> skipToPrevious() async {
-    try {
-      final res = await _channel.invokeMethod<Map<dynamic, dynamic>>('skipToPrevious');
-      return Map<String, dynamic>.from(res ?? {});
-    } catch (e) {
-      return {'success': false, 'message': '操作失败: $e'};
-    }
-  }
-
-  Future<Map<String, dynamic>> sendCustomAction(String action, [Map<String, String>? extras]) async {
-    try {
-      final res = await _channel.invokeMethod<Map<dynamic, dynamic>>('sendCustomAction', {
-        'action': action,
-        'extras': ?extras,
-      });
-      return Map<String, dynamic>.from(res ?? {});
-    } catch (e) {
-      return {'success': false, 'message': '发送失败: $e'};
-    }
-  }
-
-  Future<Map<String, dynamic>> openSongPage(String input) async {
-    try {
-      final res = await _channel.invokeMethod<Map<dynamic, dynamic>>('openSongPage', {
-        'input': input,
-      });
-      return Map<String, dynamic>.from(res ?? {});
-    } catch (e) {
-      return {'success': false, 'message': '打开失败: $e'};
-    }
-  }
-
-  Future<Map<String, dynamic>> openPlaylistPage(String input) async {
-    try {
-      final res = await _channel.invokeMethod<Map<dynamic, dynamic>>('openPlaylistPage', {
-        'input': input,
-      });
-      return Map<String, dynamic>.from(res ?? {});
-    } catch (e) {
-      return {'success': false, 'message': '打开失败: $e'};
-    }
-  }
+  Future<Map<String, dynamic>> togglePlayPause() =>
+    _request(BuiltInPlayerService().player.playing ? 'pause' : 'resume');
+  Future<Map<String, dynamic>> skipToNext() => _request('next');
+  Future<Map<String, dynamic>> skipToPrevious() => _request('prev');
 }

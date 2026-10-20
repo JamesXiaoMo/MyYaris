@@ -601,6 +601,9 @@ class BackendClient {
     required String token,
     required String requestId,
     required int seedSongId,
+    String? deviceId,
+    String? queueId,
+    int? queueVersion,
     int? playlistId,
     int batchIndex = 0,
     int count = 30,
@@ -616,6 +619,9 @@ class BackendClient {
     }
     final payload = <String, dynamic>{
       'request_id': requestId,
+      'device_id': ?deviceId,
+      'queue_id': ?queueId,
+      'queue_version': ?queueVersion,
       'seed_song_id': seedSongId,
       'batch_index': batchIndex,
       'count': count,
@@ -631,6 +637,28 @@ class BackendClient {
       return jsonDecode(responseBody) as Map<String, dynamic>;
     }
     throw BackendException(res.statusCode, responseBody);
+  }
+
+  Future<Map<String, dynamic>> fetchMusicStatus({required String baseUrl, required String token, required String deviceId}) async {
+    final uri = Uri.parse('${_normalizeUrl(baseUrl)}/api/v1/music/control/status').replace(queryParameters: {'device_id': deviceId});
+    final req = await _httpClient.getUrl(uri);
+    req.headers.set('X-Device-Token', token);
+    final res = await req.close().timeout(const Duration(seconds: 10));
+    final body = await utf8.decodeStream(res);
+    if (res.statusCode != 200) throw BackendException(res.statusCode, 'Cannot read playback snapshot');
+    return jsonDecode(body) as Map<String, dynamic>;
+  }
+
+  Future<void> requestMusicCommand({required String baseUrl, required String token,
+    required String deviceId, required String action, Map<String, dynamic> params = const {}}) async {
+    final req = await _httpClient.postUrl(Uri.parse('${_normalizeUrl(baseUrl)}/api/v1/music/control/command'));
+    req.headers.contentType = ContentType.json;
+    req.headers.set('X-Device-Token', token);
+    req.add(utf8.encode(jsonEncode({'device_id': deviceId,
+      'command_id': 'cmd_car_${DateTime.now().microsecondsSinceEpoch}', 'action': action, 'params': params})));
+    final res = await req.close().timeout(const Duration(seconds: 20));
+    final body = await utf8.decodeStream(res);
+    if (res.statusCode != 200) throw BackendException(res.statusCode, body);
   }
 
   /// Reports command execution acknowledgement via HTTP fallback (POST /api/v1/music/control/command/{command_id}/ack)

@@ -39,6 +39,13 @@ class FakeAudioPlayerPlatform extends AudioPlayerPlatform {
 
   FakeAudioPlayerPlatform(super.id);
 
+  void complete() => _eventController.add(PlaybackEventMessage(
+    processingState: ProcessingStateMessage.completed, updateTime: DateTime.now(),
+    updatePosition: const Duration(seconds: 180), bufferedPosition: const Duration(seconds: 180),
+    duration: const Duration(seconds: 180), icyMetadata: null, currentIndex: 0, androidAudioSessionId: 1,
+  ));
+
+
   @override
   Stream<PlaybackEventMessage> get playbackEventMessageStream => _eventController.stream;
 
@@ -150,6 +157,9 @@ class FakeBackendClient extends BackendClient {
     required String token,
     required String requestId,
     required int seedSongId,
+    String? deviceId,
+    String? queueId,
+    int? queueVersion,
     int? playlistId,
     int batchIndex = 0,
     int count = 30,
@@ -157,6 +167,9 @@ class FakeBackendClient extends BackendClient {
     if (onPostIntelligence != null) {
       final res = await onPostIntelligence!({
         'request_id': requestId,
+        'device_id': deviceId,
+        'queue_id': queueId,
+        'queue_version': queueVersion,
         'seed_song_id': seedSongId,
         'playlist_id': playlistId,
         'batch_index': batchIndex,
@@ -941,7 +954,7 @@ void main() {
       });
 
       expect(ackStatus, 'failed');
-      expect(ackErrorCode, 'COMMAND_EXECUTION_ERROR');
+      expect(ackErrorCode, 'QUEUE_VERSION_CONFLICT');
       // Applied mode must remain untouched (listLoop)
       expect(CarMusicQueueController().appliedMode, PlaybackMode.listLoop);
     });
@@ -1502,7 +1515,7 @@ void main() {
           'code': 200,
           'queue_id': 'q_bad_stream',
           'queue_version': 1,
-          'source': 'netease_favorite',
+          'source': 'netease_intelligence',
           'total': 1,
           'is_complete': true,
           'queue_state': 'ready',
@@ -1514,7 +1527,7 @@ void main() {
               'track_id': 'netease_bad_url',
               'song_id': 9999,
               'title': 'Bad URL Track',
-              'stream_url': 'http://999.999.999.999:9999/invalid-stream',
+              'stream_url': 'https://backend.example.ts.net/api/v1/music/stream/invalid-stream',
               'queue_index': 0,
             },
           ],
@@ -1570,7 +1583,7 @@ void main() {
           'mode': 'intelligence',
           'queue_id': 'q_bad_stream',
           'queue_version': 1,
-          'source': 'netease_favorite',
+          'source': 'netease_intelligence',
         },
       });
 
@@ -1581,6 +1594,9 @@ void main() {
       expect(CarMusicQueueController().queueId, 'q_orig_safe');
       expect(CarMusicQueueController().appliedMode, PlaybackMode.listLoop);
       expect(CarMusicQueueController().currentTrack?.trackId, 'netease_orig_safe');
+      expect(BuiltInPlayerService().currentTrack.id, 'netease_orig_safe');
+      expect(BuiltInPlayerService().player.position.inMilliseconds, greaterThanOrEqualTo(30000));
+      expect(BuiltInPlayerService().player.playing, true);
     });
   });
 }

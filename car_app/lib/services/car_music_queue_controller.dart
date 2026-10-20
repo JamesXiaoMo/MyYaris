@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import '../models/music_queue_models.dart';
@@ -384,7 +383,7 @@ class CarMusicQueueController {
         if (buffer.length != total) {
           throw BackendException(422, 'Buffer track count mismatch: expected $total, got ${buffer.length}');
         }
-        if (!isComplete) {
+        if (!isComplete && source != QueueSource.neteaseIntelligence) {
           throw BackendException(409, 'Queue snapshot is not complete (is_complete=false)');
         }
         if (queueState != 'ready') {
@@ -405,7 +404,8 @@ class CarMusicQueueController {
           source: source,
           name: firstPage.name ?? (source == QueueSource.neteaseFavorite ? '我喜欢的音乐' : '播放队列'),
           total: total,
-          isComplete: true,
+          isComplete: isComplete,
+          batchIndex: firstPage.batchIndex,
           queueState: 'ready',
           offset: 0,
           limit: total,
@@ -447,8 +447,9 @@ class CarMusicQueueController {
     _queueSource = snapshot.source;
     _queueName = snapshot.name;
     _total = snapshot.total;
-    _isComplete = true;
-    _isFullyLoaded = true;
+    _isComplete = snapshot.isComplete;
+    _isFullyLoaded = _tracks.length == snapshot.total;
+    _intelligenceBatchIndex = snapshot.batchIndex;
 
     if (targetIndex >= 0 && targetIndex < _tracks.length) {
       _currentIndex = targetIndex;
@@ -539,6 +540,11 @@ class CarMusicQueueController {
   /// Preserves playing/paused status (does not start or pause audio engine).
   bool setPlaybackMode(PlaybackMode mode, {int? seedSongId}) {
     _requestedMode = mode;
+    if ((mode == PlaybackMode.listLoop || mode == PlaybackMode.shuffle) &&
+        (_queueSource != QueueSource.neteaseFavorite || !_isFullyLoaded)) {
+      return false;
+    }
+    if (mode == PlaybackMode.intelligence && _queueSource != QueueSource.neteaseIntelligence) return false;
 
     switch (mode) {
       case PlaybackMode.listLoop:
@@ -559,7 +565,9 @@ class CarMusicQueueController {
           appliedModeNotifier.value = _appliedMode;
           return false;
         }
-        _generateShuffleOrder(seedIndex: _currentIndex);
+        if (_appliedMode != PlaybackMode.shuffle || _shuffleIndices.length != _tracks.length) {
+          _generateShuffleOrder(seedIndex: _currentIndex);
+        }
         _appliedMode = PlaybackMode.shuffle;
         appliedModeNotifier.value = _appliedMode;
         return true;
@@ -644,7 +652,7 @@ class CarMusicQueueController {
     if (_tracks.isEmpty) return null;
 
     // Single track mode: completion means STOP
-    if (_queueSource == QueueSource.singleTrack) {
+    if (_queueSource == QueueSource.singleTrack && _appliedMode != PlaybackMode.singleLoop) {
       debugPrint('[CarMusicQueue] Single track completed. Queue finished -> stopped.');
       return null;
     }
@@ -663,7 +671,7 @@ class CarMusicQueueController {
         // Complete shuffle loop finished, re-shuffle
         final lastIdx = _shuffleIndices.isNotEmpty ? _shuffleIndices.last : 0;
         _generateShuffleOrder(seedIndex: lastIdx);
-        _shufflePosition = 0;
+        _shufflePosition = _tracks.length > 1 ? 1 : 0;
       }
 
       final nextIdx = _shuffleIndices[_shufflePosition];
@@ -676,11 +684,6 @@ class CarMusicQueueController {
       if (_currentIndex + 1 < _tracks.length) {
         _currentIndex++;
         currentTrackNotifier.value = currentTrack;
-
-        // Dynamic streaming continuation trigger: less than 5 tracks remaining
-        if (_currentIndex >= _tracks.length - 5 && !_isContinuingIntelligence) {
-          unawaited(_continueIntelligenceBatch());
-        }
 
         return currentTrack;
       } else {
@@ -696,6 +699,14 @@ class CarMusicQueueController {
     _currentIndex = (_currentIndex + 1) % _tracks.length;
     currentTrackNotifier.value = currentTrack;
     return currentTrack;
+  }
+
+  Future<NeteaseQueueTrackItem?> nextTrackForPlayback() async {
+    if (_appliedMode == PlaybackMode.intelligence && _queueSource == QueueSource.neteaseIntelligence &&
+        _currentIndex >= _tracks.length - 5) {
+      await _continueIntelligenceBatch();
+    }
+    return getNextTrack();
   }
 
   /// Calculates previous track based on appliedMode.
@@ -765,6 +776,8 @@ class CarMusicQueueController {
     if (_backendClient == null || _baseUrl.isEmpty || _tracks.isEmpty) return;
 
     _isContinuingIntelligence = true;
+    final originalQueueId = _queueId;
+    final originalVersion = _queueVersion;
     try {
       final nextBatchIndex = _intelligenceBatchIndex + 1;
       final seedSongId = _tracks.last.songId > 0 ? _tracks.last.songId : (currentTrack?.songId ?? 0);
@@ -781,12 +794,16 @@ class CarMusicQueueController {
         baseUrl: _baseUrl,
         token: _token,
         requestId: requestId,
+        deviceId: _deviceId,
+        queueId: originalQueueId,
+        queueVersion: originalVersion,
         seedSongId: seedSongId,
         playlistId: _intelligencePlaylistId,
         batchIndex: nextBatchIndex,
         count: 30,
       );
 
+      if (_queueId != originalQueueId || _queueVersion != originalVersion || _appliedMode != PlaybackMode.intelligence) return;
       final returnedMode = res['mode']?.toString();
       if (returnedMode != 'intelligence') {
         throw BackendException(422, 'Invalid intelligence mode response: $returnedMode');
@@ -798,7 +815,7 @@ class CarMusicQueueController {
       }
 
       final newVersion = (res['queue_version'] as num?)?.toInt();
-      if (newVersion == null || newVersion <= 0) {
+      if (newVersion == null || newVersion <= originalVersion) {
         throw BackendException(422, 'Invalid or missing queue_version in intelligence response');
       }
 
@@ -810,6 +827,9 @@ class CarMusicQueueController {
         }
       }
 
+      if (parsedTracks.isEmpty) throw BackendException(503, 'INTELLIGENCE_QUEUE_EXHAUSTED');
+      // Validate before mutation, including appended-batch responses.
+      final oldTracks = List<NeteaseQueueTrackItem>.from(_tracks);
       // Check whether server returned the full updated list or just the appended batch
       if (parsedTracks.length >= _tracks.length && parsedTracks.isNotEmpty && parsedTracks[0].trackId == _tracks[0].trackId) {
         // Full list returned: verify old prefix is 100% intact
@@ -844,9 +864,10 @@ class CarMusicQueueController {
             throw BackendException(422, 'Duplicate track_id in replenishment batch: ${parsedTracks[i].trackId}');
           }
           seenIds.add(parsedTracks[i].trackId);
-          _tracks.add(parsedTracks[i]);
         }
+        _tracks.addAll(parsedTracks);
       }
+      if (_tracks.length <= oldTracks.length) throw BackendException(503, 'INTELLIGENCE_QUEUE_EXHAUSTED');
 
       _total = _tracks.length;
       _queueVersion = newVersion;
@@ -856,6 +877,7 @@ class CarMusicQueueController {
       queueVersionNotifier.value = _queueVersion;
       debugPrint('[CarMusicQueue] Intelligence replenishment succeeded: batch=$nextBatchIndex, total=$_total, v$_queueVersion');
     } on BackendException catch (e) {
+      if (_queueId != originalQueueId || _appliedMode != PlaybackMode.intelligence) return;
       debugPrint('[CarMusicQueue] BackendException in intelligence continuation: ${e.statusCode} ${e.message}');
       if (e.statusCode == 503 || e.message.contains('INTELLIGENCE_QUEUE_EXHAUSTED')) {
         _errorCode = 'INTELLIGENCE_QUEUE_EXHAUSTED';
@@ -911,6 +933,8 @@ class CarMusicQueueController {
   /// Records a playback failure and evaluates the circuit breaker.
   CircuitBreakerAction recordPlaybackFailure(String reason) {
     _consecutiveFailures++;
+    _errorCode = 'TRACK_UNPLAYABLE';
+    _errorDetail = '歌曲不可播放（连续失败 $_consecutiveFailures/3）';
     debugPrint('[CarMusicQueue] Playback failure recorded: count=$_consecutiveFailures/$maxConsecutiveFailures, reason=$reason');
 
     if (_consecutiveFailures >= maxConsecutiveFailures) {

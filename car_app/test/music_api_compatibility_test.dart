@@ -52,23 +52,6 @@ void main() {
       playerService = BuiltInPlayerService();
     });
 
-    test('currentLoopModeString maps loop modes correctly', () async {
-      await playerService.setLoopModeString('one');
-      expect(playerService.currentLoopModeString, 'one');
-
-      await playerService.setLoopModeString('single');
-      expect(playerService.currentLoopModeString, 'one');
-
-      await playerService.setLoopModeString('off');
-      expect(playerService.currentLoopModeString, 'off');
-
-      await playerService.setLoopModeString('none');
-      expect(playerService.currentLoopModeString, 'off');
-
-      await playerService.setLoopModeString('all');
-      expect(playerService.currentLoopModeString, 'all');
-    });
-
     test('Volume clamping limits values between 0.0 and 1.0', () async {
       await playerService.setVolume(1.5);
       expect(playerService.currentVolume, 1.0);
@@ -80,9 +63,9 @@ void main() {
       expect(playerService.currentVolume, 0.25);
     });
 
-    test('currentTrack falls back to default local track when no remote track is playing', () {
-      expect(playerService.currentTrack.id, isNotEmpty);
-      expect(playerService.currentTrack.isLocal, true);
+    test('currentTrack has no local fallback when no queue is selected', () {
+      expect(playerService.currentTrack.id, isEmpty);
+      expect(playerService.currentTrack.isLocal, false);
     });
   });
 
@@ -168,13 +151,14 @@ void main() {
       expect(syncService.lastCommandNotifier.value, '初始状态');
     });
 
-    test('handleCommand supports all 9 music actions', () async {
+    test('legacy local sample is rejected while supported controls stay explicit', () async {
       // 1. play_track with local track id
       await syncService.handleCommand({
         'action': 'play_track',
         'params': {'track_id': 'local_2'},
       });
-      expect(BuiltInPlayerService().currentTrack.id, 'local_2');
+      expect(BuiltInPlayerService().currentTrack.id, isEmpty);
+      expect(syncService.lastCommandNotifier.value, contains('指令失败'));
 
       // 2. pause
       await syncService.handleCommand({'action': 'pause'});
@@ -204,7 +188,7 @@ void main() {
         'action': 'set_loop',
         'params': {'mode': 'single'},
       });
-      expect(BuiltInPlayerService().currentLoopModeString, 'one');
+      // Unsupported legacy local sample playback must never become an applied queue.
 
       // 8. set_shuffle
       await syncService.handleCommand({

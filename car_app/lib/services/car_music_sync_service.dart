@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/foundation.dart';
 import 'backend_client.dart';
 import 'built_in_player_service.dart';
@@ -32,6 +33,8 @@ class CarMusicSyncService {
   static final CarMusicSyncService _instance = CarMusicSyncService._internal();
   factory CarMusicSyncService() => _instance;
   CarMusicSyncService._internal();
+  @visibleForTesting
+  CarMusicSyncService.forTesting();
 
   final BuiltInPlayerService _playerService = BuiltInPlayerService();
   BackendClient? _backendClient;
@@ -60,7 +63,15 @@ class CarMusicSyncService {
   final Map<String, CommandHistoryEntry> _commandHistory = {};
   final Set<String> _executingCommands = {};
 
+  int _restoredPositionMs = 0;
+  int _connectionEpoch = 0;
+  bool _pollingInFlight = false;
+  bool _httpRestored = false;
   int _statusSeq = 1;
+  Future<void> _statusBuildTail = Future.value();
+
+  @visibleForTesting
+  Future<Map<String, dynamic>> statusSnapshotForTesting() => _buildStatusData();
   String? _lastAppliedCommandId;
 
   void start({
@@ -72,6 +83,8 @@ class CarMusicSyncService {
     bool autoConnect = true,
   }) {
     if (_isRunning) stop();
+    _connectionEpoch++;
+    _httpRestored = false;
 
     _baseUrl = baseUrl.trim();
     while (_baseUrl.endsWith('/')) {
@@ -87,6 +100,8 @@ class CarMusicSyncService {
         );
     _isRunning = true;
 
+    _playerService.requestUserCommand = requestLocalCommand;
+    _playerService.onStateSettled = () { unawaited(sendCurrentStatus()); };
     _playerService.setServerConfig(
       baseUrl: _baseUrl,
       token: _token,
@@ -99,11 +114,7 @@ class CarMusicSyncService {
     );
 
     if (autoConnect) {
-      // Coldstart zero auto-play: load metadata in background, player remains stopped/paused
-      if (CarMusicQueueController().tracks.isEmpty) {
-        unawaited(CarMusicQueueController().loadFullFavoriteQueue());
-      }
-
+      // Connection/restoration reads no playback source and never touches the engine.
       InAppAudioStreamProxy().configure(
         backendClient: _backendClient,
         defaultToken: _token,
@@ -118,6 +129,7 @@ class CarMusicSyncService {
 
   void stop() {
     _isRunning = false;
+    _connectionEpoch++;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     _pollingTimer?.cancel();
@@ -164,10 +176,12 @@ class CarMusicSyncService {
   Future<void> _connectWebSocket() async {
     if (!_isRunning) return;
 
+    final epoch = _connectionEpoch;
     final wsUri = _buildWebSocketUri();
-    debugPrint('[CarMusicSync] Connecting WebSocket: $wsUri');
+    debugPrint('[CarMusicSync] Connecting WebSocket');
 
     try {
+      WebSocket connection;
       final headers = <String, dynamic>{
         'client_type': 'car',
         'X-Device-Token': _token,
@@ -175,18 +189,20 @@ class CarMusicSyncService {
 
       final client = _backendClient;
       if (client != null) {
-        _webSocket = await client.connectWebSocket(
+        connection = await client.connectWebSocket(
           wsUri,
           headers: headers,
           timeout: const Duration(seconds: 8),
         );
       } else {
-        _webSocket = await WebSocket.connect(
+        connection = await WebSocket.connect(
           wsUri.toString(),
           headers: headers,
         ).timeout(const Duration(seconds: 8));
       }
 
+      if (!_isRunning || epoch != _connectionEpoch) { await connection.close(); return; }
+      _webSocket = connection;
       _syncMode = MusicSyncMode.websocket;
       syncModeNotifier.value = _syncMode;
       debugPrint('[CarMusicSync] WebSocket connected successfully.');
@@ -195,8 +211,7 @@ class CarMusicSyncService {
       _pollingTimer?.cancel();
       _pollingTimer = null;
 
-      // Broadcast initial status upon connection
-      sendCurrentStatus();
+      // Wait for the server snapshot before reporting a cold, empty cursor.
 
       // Start periodic status broadcast / heartbeat
       _statusHeartbeatTimer?.cancel();
@@ -206,21 +221,21 @@ class CarMusicSyncService {
 
       _webSocket!.listen(
         (data) {
-          _handleIncomingMessage(data);
+          if (epoch == _connectionEpoch) _handleIncomingMessage(data);
         },
         onError: (err) {
           debugPrint('[CarMusicSync] WebSocket error: $err');
-          _onWebSocketDisconnected();
+          if (epoch == _connectionEpoch) _onWebSocketDisconnected();
         },
         onDone: () {
           debugPrint('[CarMusicSync] WebSocket closed.');
-          _onWebSocketDisconnected();
+          if (epoch == _connectionEpoch) _onWebSocketDisconnected();
         },
         cancelOnError: true,
       );
     } catch (e) {
-      debugPrint('[CarMusicSync] WebSocket connect failed: $e. Falling back to HTTP polling.');
-      _onWebSocketDisconnected();
+      debugPrint('[CarMusicSync] WebSocket connection failed; using HTTP polling.');
+      if (epoch == _connectionEpoch) _onWebSocketDisconnected();
     }
   }
 
@@ -248,13 +263,23 @@ class CarMusicSyncService {
   void _startHttpPollingFallback() {
     _pollingTimer?.cancel();
     _pollingTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
-      if (!_isRunning || _syncMode != MusicSyncMode.httpPolling) return;
+      if (!_isRunning || _syncMode != MusicSyncMode.httpPolling || _pollingInFlight) return;
+      final epoch = _connectionEpoch;
+      _pollingInFlight = true;
       try {
         final client = _backendClient;
         if (client == null) return;
 
+        if (!_httpRestored) {
+          final status = await client.fetchMusicStatus(baseUrl: _baseUrl, token: _token, deviceId: _deviceId);
+          if (!_isRunning || epoch != _connectionEpoch) return;
+          await restoreStatusSnapshot(status);
+          _httpRestored = true;
+        }
         // 1. Report current status via HTTP
-        final statusData = _buildStatusData();
+        if (_playerService.isTransitioning) return;
+        final statusData = await _buildStatusData();
+        if (_playerService.isTransitioning) return;
         await client.reportMusicStatus(
           baseUrl: _baseUrl,
           token: _token,
@@ -268,12 +293,12 @@ class CarMusicSyncService {
           token: _token,
           timeoutSeconds: 4,
         );
-        if (cmd != null) {
+        if (cmd != null && _isRunning && epoch == _connectionEpoch) {
           await handleCommand(cmd);
         }
       } catch (e) {
         debugPrint('[CarMusicSync] HTTP Polling error: $e');
-      }
+      } finally { _pollingInFlight = false; }
     });
   }
 
@@ -300,7 +325,8 @@ class CarMusicSyncService {
           return;
         }
         if (msgType == 'status_snapshot') {
-          debugPrint('[CarMusicSync] Received initial status snapshot from server.');
+          final snapshot = json['data'] is Map<String, dynamic> ? json['data'] as Map<String, dynamic> : json;
+          unawaited(restoreStatusSnapshot(snapshot));
           return;
         }
         if (msgType == 'status_update') {
@@ -313,6 +339,23 @@ class CarMusicSyncService {
       debugPrint('[CarMusicSync] Failed to parse incoming message: $e');
     }
   }
+
+  /// Metadata/cursor restoration never loads a media stream or starts/pauses audio.
+  Future<void> restoreStatusSnapshot(Map<String, dynamic> status) => _playerService.serialize(() async {
+    final ctrl = CarMusicQueueController();
+    if (ctrl.tracks.isNotEmpty || _playerService.activeRemoteTrack != null) return;
+    final queueId = status['queue_id'] as String?;
+    final version = (status['queue_version'] as num?)?.toInt();
+    final source = status['queue_source'] as String?;
+    if (queueId == null || version == null || source == null) return;
+    _restoredPositionMs = (status['position_ms'] as num?)?.toInt() ?? 0;
+    final candidate = await ctrl.fetchAndValidateQueueSnapshot(queueId: queueId, queueVersion: version, source: source, maxRetries: 1);
+    if (candidate == null) return;
+    final found = candidate.tracks.indexWhere((t) => t.trackId == status['current_track_id']);
+    final index = found >= 0 ? found : ((status['current_index'] as num?)?.toInt() ?? 0);
+    ctrl.applyQueueSnapshot(candidate, targetIndex: index, mode: source == QueueSource.neteaseIntelligence ? PlaybackMode.intelligence : PlaybackMode.fromString(status['applied_mode']?.toString()));
+    _restoredPositionMs = (status['position_ms'] as num?)?.toInt() ?? 0;
+  });
 
   /// Prune expired command IDs from deduplication cache (10 min TTL, max 500 entries)
   void _pruneExpiredCommands() {
@@ -329,7 +372,47 @@ class CarMusicSyncService {
   }
 
   /// Public handler for remote commands (invoked from WebSocket or HTTP polling fallback)
-  Future<void> handleCommand(Map<String, dynamic> rawMsg) async {
+  Future<void> requestLocalCommand(String action, [Map<String, dynamic> params = const {}]) async {
+    if (!_isRunning || _backendClient == null) {
+      lastCommandNotifier.value = '播控不可用：请先连接后端';
+      return;
+    }
+    try {
+      if (action == 'set_playback_mode' && params['mode'] == 'intelligence' && params['seed_song_id'] == null) {
+        final page = await _backendClient!.fetchMusicQueuePage(baseUrl: _baseUrl, token: _token,
+          deviceId: _deviceId, source: QueueSource.neteaseFavorite);
+        if (page.tracks.isEmpty) throw StateError('喜欢歌单为空');
+        params = {...params, 'seed_song_id': page.tracks.first.songId};
+      }
+      await _backendClient!.requestMusicCommand(baseUrl: _baseUrl, token: _token,
+        deviceId: _deviceId, action: action, params: params);
+      lastCommandNotifier.value = '已请求 $action，等待实际执行';
+    } catch (_) { lastCommandNotifier.value = '播控请求失败，请检查权限、服务和车机能力'; }
+  }
+
+  Future<int> _preparePlayableTrack(List<NeteaseQueueTrackItem> tracks, int index,
+      {required String source, Duration initialPosition = Duration.zero}) async {
+    final limit = source == QueueSource.singleTrack ? 1 : tracks.length.clamp(1, 3);
+    for (var attempt = 0; attempt < limit; attempt++) {
+      final target = (index + attempt) % tracks.length;
+      // Intelligence never wraps exhausted recommendations to an unrelated source.
+      if (source == QueueSource.neteaseIntelligence && index + attempt >= tracks.length) break;
+      try {
+        await _playerService.playQueueTrack(tracks[target],
+          initialPosition: attempt == 0 ? initialPosition : Duration.zero, rethrowOnError: true);
+        if (attempt > 0) lastCommandNotifier.value = '已跳过 $attempt 首不可播曲目';
+        return target;
+      } catch (_) {
+        lastCommandNotifier.value = '歌曲不可播放（连续失败 ${attempt + 1}/3）';
+      }
+    }
+    throw BackendException(503, 'PLAYBACK_CONSECUTIVE_FAILURES');
+  }
+
+  Future<void> handleCommand(Map<String, dynamic> rawMsg) =>
+      _playerService.serialize(() => _handleCommand(rawMsg));
+
+  Future<void> _handleCommand(Map<String, dynamic> rawMsg) async {
     // 1. Unpack envelope: support {"type": "music_command", "data": {...}} and root {...}
     final Map<String, dynamic> cmdData = (rawMsg['data'] is Map<String, dynamic>)
         ? rawMsg['data'] as Map<String, dynamic>
@@ -406,7 +489,7 @@ class CarMusicSyncService {
       params = cmdData;
     }
 
-    debugPrint('[CarMusicSync] Executing command: action=$action, command_id=$commandId, params=$params');
+    debugPrint('[CarMusicSync] Executing command: action=$action, command_id=$commandId');
     lastCommandNotifier.value = '收到指令: $action';
 
     final queueCtrl = CarMusicQueueController();
@@ -416,6 +499,7 @@ class CarMusicSyncService {
     final wasPlaying = _playerService.player.playing;
     final prevPosition = _playerService.player.position;
     final prevActiveTrack = _playerService.activeRemoteTrack;
+    final previousSource = _playerService.player.audioSource;
 
     // Prepared queue parameters (never fallback to expected preconditions!)
     final serverQueueId = (params['queue_id'] ?? params['prepared_queue_id'])?.toString();
@@ -439,87 +523,34 @@ class CarMusicSyncService {
       switch (action) {
         case 'set_playback_mode':
           final modeStr = (params['mode'] ?? params['playback_mode'])?.toString();
+          if (!PlaybackMode.values.any((m) => m.value == modeStr)) throw BackendException(422, 'Unsupported playback mode');
           final requestedMode = PlaybackMode.fromString(modeStr);
-
-          // Determine target source: list_loop and shuffle MUST be netease_favorite!
-          String targetSource;
-          if (params['source'] != null && (params['source'] as String).isNotEmpty) {
-            targetSource = params['source'].toString();
-          } else if (requestedMode == PlaybackMode.intelligence) {
-            targetSource = QueueSource.neteaseIntelligence;
-          } else if (requestedMode == PlaybackMode.listLoop || requestedMode == PlaybackMode.shuffle) {
-            targetSource = QueueSource.neteaseFavorite;
-          } else if (requestedMode == PlaybackMode.singleLoop) {
-            targetSource = queueCtrl.queueSource.isNotEmpty ? queueCtrl.queueSource : QueueSource.neteaseFavorite;
-          } else {
-            targetSource = queueCtrl.queueSource.isNotEmpty ? queueCtrl.queueSource : QueueSource.neteaseFavorite;
+          final targetSource = requestedMode == PlaybackMode.intelligence
+              ? QueueSource.neteaseIntelligence
+              : requestedMode == PlaybackMode.singleLoop ? queueCtrl.queueSource : QueueSource.neteaseFavorite;
+          if (params['source'] != null && params['source'] != targetSource) {
+            throw BackendException(422, 'Playback mode source mismatch');
           }
-
-          if (serverQueueId != null && serverQueueId.isNotEmpty) {
-            if (serverQueueId != queueCtrl.queueId || (serverQueueVersion != null && serverQueueVersion != queueCtrl.queueVersion)) {
-              final candidate = await queueCtrl.fetchAndValidateQueueSnapshot(
-                queueId: serverQueueId,
-                queueVersion: serverQueueVersion,
-                source: targetSource,
-              );
-              if (candidate == null) {
-                throw BackendException(500, 'Failed to load prepared queue $serverQueueId: ${queueCtrl.errorDetail}');
-              }
-              if (candidate.source != targetSource) {
-                throw BackendException(422, 'Loaded snapshot source ${candidate.source} does not match target source $targetSource');
-              }
-              final candidateTrack = candidate.tracks.isNotEmpty ? candidate.tracks[0] : null;
-              if (candidateTrack != null) {
-                if (wasPlaying) {
-                  if (candidateTrack.trackId != backup.currentTrack?.trackId) {
-                    await _playerService.playQueueTrack(candidateTrack, startPlaying: true, rethrowOnError: true);
-                  }
-                } else {
-                  await _playerService.playQueueTrack(candidateTrack, startPlaying: false, rethrowOnError: true);
-                }
-              }
-              queueCtrl.applyQueueSnapshot(candidate, targetIndex: 0, mode: requestedMode);
-              if (requestedMode == PlaybackMode.intelligence) {
-                queueCtrl.setIntelligencePlaylistId((params['playlist_id'] as num?)?.toInt());
-              }
-            }
-          } else if ((requestedMode == PlaybackMode.listLoop || requestedMode == PlaybackMode.shuffle) &&
-              (queueCtrl.queueSource != QueueSource.neteaseFavorite || !queueCtrl.isFullyLoaded)) {
-            final candidate = await queueCtrl.fetchAndValidateQueueSnapshot(source: QueueSource.neteaseFavorite);
-            if (candidate == null) {
-              throw BackendException(409, 'Favorite queue not fully ready for $modeStr: ${queueCtrl.errorDetail}');
-            }
-            final prevTrackId = backup.currentTrack?.trackId;
-            final favIdx = candidate.tracks.indexWhere((t) => t.trackId == prevTrackId);
-            final targetIdx = favIdx >= 0 ? favIdx : 0;
-            final candidateTrack = candidate.tracks[targetIdx];
-
-            if (wasPlaying) {
-              if (candidateTrack.trackId != prevTrackId) {
-                await _playerService.playQueueTrack(candidateTrack, startPlaying: true, rethrowOnError: true);
-              }
-            } else {
-              if (candidateTrack.trackId != prevTrackId) {
-                await _playerService.playQueueTrack(candidateTrack, startPlaying: false, rethrowOnError: true);
-              }
-            }
-            queueCtrl.applyQueueSnapshot(candidate, targetIndex: targetIdx, mode: requestedMode);
-          } else {
-            final applied = queueCtrl.setPlaybackMode(requestedMode);
-            if (!applied) {
-              throw BackendException(422, 'Cannot apply playback mode ${requestedMode.value}');
-            }
+          if (requestedMode == PlaybackMode.intelligence && (serverQueueId == null || serverQueueId.isEmpty)) {
+            throw BackendException(422, 'Authentic intelligence requires a prepared server queue');
           }
-
-          // Synchronize loop/shuffle mode on player engine
-          if (requestedMode == PlaybackMode.singleLoop) {
-            await _playerService.setLoopModeString('one');
-          } else if (requestedMode == PlaybackMode.listLoop) {
-            await _playerService.setLoopModeString('all');
-            await _playerService.setShuffle(false);
-          } else if (requestedMode == PlaybackMode.shuffle) {
-            await _playerService.setShuffle(true);
+          if ((serverQueueId != null && (serverQueueId != queueCtrl.queueId || serverQueueVersion != queueCtrl.queueVersion)) ||
+              queueCtrl.queueSource != targetSource || !queueCtrl.isFullyLoaded) {
+            final candidate = await queueCtrl.fetchAndValidateQueueSnapshot(
+              queueId: serverQueueId, queueVersion: serverQueueVersion, source: targetSource);
+            if (candidate == null) throw BackendException(409, 'Prepared queue unavailable');
+            final sameIndex = candidate.tracks.indexWhere((t) => t.trackId == prevActiveTrack?.id);
+            final targetIndex = sameIndex >= 0 ? sameIndex : 0;
+            final target = candidate.tracks[targetIndex];
+            if (target.trackId != prevActiveTrack?.id) {
+              await _playerService.playQueueTrack(target, startPlaying: wasPlaying, rethrowOnError: true);
+            }
+            queueCtrl.applyQueueSnapshot(candidate, targetIndex: targetIndex, mode: requestedMode);
+          } else if (!queueCtrl.setPlaybackMode(requestedMode)) {
+            throw BackendException(422, 'Queue does not support requested mode');
           }
+          queueCtrl.setIntelligencePlaylistId((params['playlist_id'] as num?)?.toInt());
+          await _playerService.setLoopModeString(requestedMode.value);
           break;
 
         case 'switch_queue':
@@ -559,9 +590,12 @@ class CarMusicSyncService {
 
           if (candidate.tracks.isNotEmpty) {
             final targetTrack = candidate.tracks[targetIdx];
-            await _playerService.playQueueTrack(targetTrack, startPlaying: wasPlaying, rethrowOnError: true);
+            if (targetTrack.trackId != prevActiveTrack?.id) {
+              await _playerService.playQueueTrack(targetTrack, startPlaying: wasPlaying, rethrowOnError: true);
+            }
           }
-          queueCtrl.applyQueueSnapshot(candidate, targetIndex: targetIdx);
+          queueCtrl.applyQueueSnapshot(candidate, targetIndex: targetIdx,
+            mode: source == QueueSource.neteaseIntelligence ? PlaybackMode.intelligence : PlaybackMode.listLoop);
           break;
 
         case 'play_track':
@@ -608,24 +642,13 @@ class CarMusicSyncService {
               throw BackendException(404, 'Index $targetIdx out of bounds in prepared queue $serverQueueId');
             }
 
-            final candidateTrack = candidate.tracks[targetIdx];
-            await _playerService.playQueueTrack(
-              candidateTrack,
-              initialPosition: Duration(milliseconds: seekMs),
-              startPlaying: true,
-              rethrowOnError: true,
-            );
-            queueCtrl.applyQueueSnapshot(candidate, targetIndex: targetIdx);
+            targetIdx = await _preparePlayableTrack(candidate.tracks, targetIdx,
+              source: targetSource, initialPosition: Duration(milliseconds: seekMs));
+            queueCtrl.applyQueueSnapshot(candidate, targetIndex: targetIdx,
+              mode: targetSource == QueueSource.neteaseIntelligence ? PlaybackMode.intelligence :
+                targetSource == QueueSource.neteaseFavorite && backup.queueSource == targetSource && backup.appliedMode == PlaybackMode.shuffle
+                  ? PlaybackMode.shuffle : PlaybackMode.listLoop);
           } else {
-            // Controlled local test asset compatibility
-            if (trackId != null && trackId.startsWith('local_')) {
-              final localIdx = _playerService.tracks.indexWhere((t) => t.id == trackId);
-              if (localIdx >= 0) {
-                await _playerService.selectTrack(localIdx);
-                break;
-              }
-            }
-
             int targetIdx = -1;
             if (trackId != null && queueCtrl.tracks.any((t) => t.trackId == trackId)) {
               targetIdx = queueCtrl.tracks.indexWhere((t) => t.trackId == trackId);
@@ -646,112 +669,33 @@ class CarMusicSyncService {
           break;
 
         case 'resume':
-          final trackId = (params['track_id'] ?? params['song_id'])?.toString();
-          final queueIndex = (params['queue_index'] as num?)?.toInt();
-          final seekMs = (params['seek_ms'] ?? params['seek_position_ms'] ?? params['position_ms'] as num?)?.toInt() ?? 0;
-
-          if (serverQueueId != null && serverQueueId.isNotEmpty) {
-            String targetSource;
-            if (params['source'] != null && (params['source'] as String).isNotEmpty) {
-              targetSource = params['source'].toString();
-            } else if (serverQueueId.startsWith('q_fav_')) {
-              targetSource = QueueSource.neteaseFavorite;
-            } else if (serverQueueId.startsWith('q_intel_')) {
-              targetSource = QueueSource.neteaseIntelligence;
-            } else if (serverQueueId.startsWith('q_single_')) {
-              targetSource = QueueSource.singleTrack;
+          final seek = params['seek_position_ms'] ?? params['seek_ms'] ?? params['position_ms'];
+          final sameQueue = (serverQueueId == null || serverQueueId == queueCtrl.queueId) &&
+              (serverQueueVersion == null || serverQueueVersion == queueCtrl.queueVersion);
+          if (sameQueue && queueCtrl.currentTrack != null) {
+            if (prevActiveTrack?.id == queueCtrl.currentTrack?.trackId) {
+              if (seek is num) await _playerService.seek(Duration(milliseconds: seek.toInt()));
+              await _playerService.play();
             } else {
-              targetSource = queueCtrl.queueSource.isNotEmpty ? queueCtrl.queueSource : QueueSource.neteaseFavorite;
+              final position = seek ?? params['restore_position_ms'] ?? _restoredPositionMs;
+              final index = await _preparePlayableTrack(queueCtrl.tracks, queueCtrl.currentIndex,
+                source: queueCtrl.queueSource, initialPosition: Duration(milliseconds: (position as num).toInt()));
+              queueCtrl.selectTrackByIndex(index);
             }
-
-            final candidate = await queueCtrl.fetchAndValidateQueueSnapshot(
-              queueId: serverQueueId,
-              queueVersion: serverQueueVersion,
-              source: targetSource,
-            );
-            if (candidate == null) {
-              throw BackendException(500, 'Failed to load prepared queue $serverQueueId on resume: ${queueCtrl.errorDetail}');
-            }
-            if (candidate.source != targetSource) {
-              throw BackendException(422, 'Loaded snapshot source ${candidate.source} does not match target source $targetSource');
-            }
-
-            int targetIdx = queueIndex ?? 0;
-            if (trackId != null && trackId.isNotEmpty) {
-              final found = candidate.tracks.indexWhere((t) => t.trackId == trackId);
-              if (found >= 0) targetIdx = found;
-            }
-            targetIdx = targetIdx.clamp(0, candidate.tracks.isNotEmpty ? candidate.tracks.length - 1 : 0);
-
-            if (candidate.tracks.isNotEmpty) {
-              final candidateTrack = candidate.tracks[targetIdx];
-              await _playerService.playQueueTrack(
-                candidateTrack,
-                initialPosition: Duration(milliseconds: seekMs),
-                startPlaying: true,
-                rethrowOnError: true,
-              );
-            }
-            queueCtrl.applyQueueSnapshot(candidate, targetIndex: targetIdx);
-          } else if (queueCtrl.tracks.isEmpty) {
-            // Cold queue: load default favorite queue
-            final candidate = await queueCtrl.fetchAndValidateQueueSnapshot(source: QueueSource.neteaseFavorite);
-            if (candidate == null || candidate.tracks.isEmpty) {
-              throw BackendException(409, 'No active queue and failed to load favorite queue on resume: ${queueCtrl.errorDetail}');
-            }
-            int targetIdx = queueIndex ?? 0;
-            if (trackId != null && trackId.isNotEmpty) {
-              final found = candidate.tracks.indexWhere((t) => t.trackId == trackId);
-              if (found >= 0) targetIdx = found;
-            }
-            targetIdx = targetIdx.clamp(0, candidate.tracks.length - 1);
-
-            final candidateTrack = candidate.tracks[targetIdx];
-            await _playerService.playQueueTrack(
-              candidateTrack,
-              initialPosition: Duration(milliseconds: seekMs),
-              startPlaying: true,
-              rethrowOnError: true,
-            );
-            queueCtrl.applyQueueSnapshot(candidate, targetIndex: targetIdx);
           } else {
-            // Resuming active queue
-            if (trackId != null && trackId.isNotEmpty) {
-              final idx = queueCtrl.tracks.indexWhere((t) => t.trackId == trackId);
-              if (idx < 0) throw BackendException(404, 'Track $trackId not found in active queue');
-              queueCtrl.selectTrackByIndex(idx);
-              await _playerService.playQueueTrack(
-                queueCtrl.currentTrack!,
-                initialPosition: Duration(milliseconds: seekMs),
-                startPlaying: true,
-                rethrowOnError: true,
-              );
-            } else if (queueIndex != null) {
-              if (queueIndex < 0 || queueIndex >= queueCtrl.tracks.length) {
-                throw BackendException(404, 'Index $queueIndex out of bounds');
-              }
-              queueCtrl.selectTrackByIndex(queueIndex);
-              await _playerService.playQueueTrack(
-                queueCtrl.currentTrack!,
-                initialPosition: Duration(milliseconds: seekMs),
-                startPlaying: true,
-                rethrowOnError: true,
-              );
-            } else {
-              if (seekMs > 0) {
-                await _playerService.seek(Duration(milliseconds: seekMs));
-              }
-              if (_playerService.activeRemoteTrack == null && queueCtrl.currentTrack != null) {
-                await _playerService.playQueueTrack(
-                  queueCtrl.currentTrack!,
-                  initialPosition: Duration(milliseconds: seekMs),
-                  startPlaying: true,
-                  rethrowOnError: true,
-                );
-              } else {
-                await _playerService.play();
-              }
-            }
+            final source = params['source']?.toString() ?? QueueSource.neteaseFavorite;
+            final candidate = await queueCtrl.fetchAndValidateQueueSnapshot(
+              queueId: serverQueueId, queueVersion: serverQueueVersion, source: source);
+            if (candidate == null || candidate.tracks.isEmpty) throw BackendException(409, 'No complete queue for resume');
+            final trackId = params['track_id']?.toString();
+            final found = candidate.tracks.indexWhere((t) => t.trackId == trackId);
+            var targetIndex = found >= 0 ? found : ((params['queue_index'] as num?)?.toInt() ?? 0).clamp(0, candidate.tracks.length - 1);
+            final position = seek ?? params['restore_position_ms'] ?? _restoredPositionMs;
+            targetIndex = await _preparePlayableTrack(candidate.tracks, targetIndex,
+              source: source, initialPosition: Duration(milliseconds: (position as num).toInt()));
+            final mode = source == QueueSource.neteaseIntelligence ? PlaybackMode.intelligence :
+              source == QueueSource.singleTrack ? PlaybackMode.listLoop : PlaybackMode.fromString(params['mode']?.toString());
+            queueCtrl.applyQueueSnapshot(candidate, targetIndex: targetIndex, mode: mode);
           }
           break;
 
@@ -794,8 +738,7 @@ class CarMusicSyncService {
           break;
 
         default:
-          debugPrint('[CarMusicSync] Unknown action ignored: $action');
-          break;
+          throw BackendException(422, 'Unsupported command action');
       }
 
       if (commandId != null && commandId.isNotEmpty) {
@@ -815,12 +758,12 @@ class CarMusicSyncService {
       }
       sendCurrentStatus();
     } catch (e) {
-      debugPrint('[CarMusicSync] Error executing command $action: $e');
-      lastCommandNotifier.value = '指令失败: $action ($e)';
+      debugPrint('[CarMusicSync] Error executing command $action');
+      lastCommandNotifier.value = '指令失败: $action（已保留原队列）';
 
       // TRANSACTIONAL ROLLBACK: Restore controller state and player
       queueCtrl.restoreBackup(backup);
-      if (prevActiveTrack != null && _playerService.activeRemoteTrack?.id != prevActiveTrack.id) {
+      if (prevActiveTrack != null && _playerService.player.audioSource != previousSource) {
         try {
           final restoredTrack = backup.currentTrack;
           if (restoredTrack != null) {
@@ -828,16 +771,18 @@ class CarMusicSyncService {
               restoredTrack,
               initialPosition: prevPosition,
               startPlaying: wasPlaying,
+              rethrowOnError: true,
             );
           }
         } catch (_) {}
       }
+      if (prevActiveTrack == null && _playerService.player.audioSource != previousSource) await _playerService.stop();
       if (!wasPlaying && _playerService.player.playing) {
         await _playerService.pause();
       }
 
       String errorCode = 'COMMAND_EXECUTION_ERROR';
-      String errorDetail = e.toString();
+      String errorDetail = '播放器执行失败，已保留原队列';
       if (e is BackendException) {
         if (e.statusCode == 409) {
           errorCode = e.message.contains('Precondition') ? 'QUEUE_PRECONDITION_FAILED' : 'QUEUE_VERSION_CONFLICT';
@@ -847,6 +792,10 @@ class CarMusicSyncService {
           errorCode = 'INVALID_QUEUE_PAYLOAD';
         }
         errorDetail = e.message;
+        if (e.message == 'PLAYBACK_CONSECUTIVE_FAILURES') {
+          errorCode = e.message;
+          errorDetail = '连续最多 3 首歌曲不可播放，已保留原队列';
+        }
       }
 
       if (commandId != null && commandId.isNotEmpty) {
@@ -924,30 +873,41 @@ class CarMusicSyncService {
   }
 
   /// Builds standard CarStatusReportRequest payload matching V2.2 backend schema
-  Map<String, dynamic> _buildStatusData() {
+  Future<Map<String, dynamic>> _buildStatusData() {
+    final pending = _statusBuildTail.then((_) => _createStatusData());
+    _statusBuildTail = pending.then<void>((_) {}).catchError((Object _) {});
+    return pending;
+  }
+
+  Future<Map<String, dynamic>> _createStatusData() async {
+    final prefs = await SharedPreferences.getInstance();
+    final key = 'music_status_seq_$_deviceId';
+    final stored = prefs.getInt(key) ?? 0;
+    final now = DateTime.now().microsecondsSinceEpoch;
+    _statusSeq = [stored + 1, _statusSeq + 1, now].reduce((a, b) => a > b ? a : b);
+    final statusSeq = _statusSeq;
+    if (!await prefs.setInt(key, statusSeq)) throw StateError('Cannot persist playback sequence');
     final player = _playerService.player;
     final isPlaying = player.playing;
-    final stateStr = isPlaying ? 'playing' : (player.position > Duration.zero ? 'paused' : 'stopped');
+    final stateStr = _playerService.stopped ? 'stopped' : isPlaying ? 'playing' : 'paused';
     final curTrack = _playerService.currentTrack;
     final queueCtrl = CarMusicQueueController();
-
-    final statusSeq = _statusSeq++;
 
     return {
       'device_id': _deviceId,
       'status_seq': statusSeq,
       'last_applied_command_id': _lastAppliedCommandId,
       'playback_state': stateStr,
-      'applied_mode': queueCtrl.appliedMode.value,
-      'requested_mode': queueCtrl.requestedMode.value,
+      'applied_mode': queueCtrl.queueId.isEmpty ? null : queueCtrl.appliedMode.value,
+      'requested_mode': queueCtrl.queueId.isEmpty ? null : queueCtrl.requestedMode.value,
       'queue_id': queueCtrl.queueId.isNotEmpty ? queueCtrl.queueId : null,
       'queue_version': queueCtrl.queueVersion > 0 ? queueCtrl.queueVersion : null,
-      'queue_source': queueCtrl.queueSource,
-      'current_index': queueCtrl.currentIndex,
-      'current_track_id': curTrack.id,
+      'queue_source': queueCtrl.queueId.isEmpty ? null : queueCtrl.queueSource,
+      'current_index': queueCtrl.queueId.isEmpty ? null : queueCtrl.currentIndex,
+      'current_track_id': curTrack.id.isEmpty ? null : curTrack.id,
       'title': curTrack.title,
       'artist': curTrack.artist,
-      'position_ms': player.position.inMilliseconds,
+      'position_ms': _playerService.activeRemoteTrack == null ? _restoredPositionMs : player.position.inMilliseconds,
       'duration_ms': player.duration?.inMilliseconds ?? 0,
       'software_volume': _playerService.currentVolume,
       'consecutive_failures': queueCtrl.consecutiveFailures,
@@ -959,17 +919,18 @@ class CarMusicSyncService {
         'full_favorite_shuffle',
       ],
       'loop_mode': _playerService.currentLoopModeString,
-      'shuffle': player.shuffleModeEnabled,
+      'shuffle': queueCtrl.appliedMode == PlaybackMode.shuffle,
       'updated_at': DateTime.now().millisecondsSinceEpoch,
     };
   }
 
 
   /// Sends status payload over WebSocket wrapped in {"type": "status_update", "data": {...}}
-  void sendCurrentStatus() {
-    if (!_isRunning) return;
+  Future<void> sendCurrentStatus() async {
+    if (!_isRunning || _syncMode == MusicSyncMode.disconnected || _playerService.isTransitioning) return;
 
-    final statusData = _buildStatusData();
+    final statusData = await _buildStatusData();
+    if (!_isRunning || _playerService.isTransitioning) return;
 
     if (_syncMode == MusicSyncMode.websocket && _webSocket != null) {
       try {

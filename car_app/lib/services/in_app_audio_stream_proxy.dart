@@ -99,7 +99,7 @@ class InAppAudioStreamProxy {
         path: '/stream',
         queryParameters: qParams,
       );
-      debugPrint('[InAppStreamProxy] Rewrote "$originalUrl" -> "$proxyUri"');
+      debugPrint('[InAppStreamProxy] Routed HTTPS media through loopback');
       return proxyUri.toString();
     }
 

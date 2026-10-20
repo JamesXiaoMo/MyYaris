@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
 import '../services/built_in_player_service.dart';
+import '../services/car_music_queue_controller.dart';
+import '../models/music_queue_models.dart';
 import '../services/car_music_sync_service.dart';
 
 class BuiltInPlayerPage extends StatefulWidget {
@@ -325,7 +327,7 @@ class _BuiltInPlayerPageState extends State<BuiltInPlayerPage> {
               IconButton(
                 iconSize: 28,
                 icon: const Icon(Icons.skip_previous, color: Colors.white),
-                onPressed: () => _service.skipToPrevious(),
+                onPressed: () => CarMusicSyncService().requestLocalCommand('prev'),
                 tooltip: '上一曲',
               ),
               const SizedBox(width: 14),
@@ -343,9 +345,9 @@ class _BuiltInPlayerPageState extends State<BuiltInPlayerPage> {
                     ),
                     onPressed: () {
                       if (playing) {
-                        _service.pause();
+                        CarMusicSyncService().requestLocalCommand('pause');
                       } else {
-                        _service.play();
+                        CarMusicSyncService().requestLocalCommand('resume');
                       }
                     },
                     child: Icon(
@@ -360,86 +362,33 @@ class _BuiltInPlayerPageState extends State<BuiltInPlayerPage> {
               IconButton(
                 iconSize: 28,
                 icon: const Icon(Icons.skip_next, color: Colors.white),
-                onPressed: () => _service.skipToNext(),
+                onPressed: () => CarMusicSyncService().requestLocalCommand('next'),
                 tooltip: '下一曲',
               ),
               const SizedBox(width: 10),
               IconButton(
                 iconSize: 24,
                 icon: const Icon(Icons.stop, color: Colors.white70),
-                onPressed: () => _service.stop(),
+                onPressed: () => CarMusicSyncService().requestLocalCommand('stop'),
                 tooltip: '停止',
               ),
             ],
           ),
 
-          // Loop Mode, Shuffle & Safe Test Row
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-            children: [
-              // Real Loop Mode Button
-              StreamBuilder<LoopMode>(
-                stream: _service.player.loopModeStream,
-                builder: (context, snap) {
-                  final mode = snap.data ?? LoopMode.all;
-                  IconData icon = Icons.repeat;
-                  String label = '列表循环';
-                  Color col = Colors.tealAccent;
-
-                  if (mode == LoopMode.one) {
-                    icon = Icons.repeat_one;
-                    label = '单曲循环';
-                    col = Colors.amberAccent;
-                  } else if (mode == LoopMode.off) {
-                    icon = Icons.trending_flat;
-                    label = '顺序单次';
-                    col = Colors.white54;
-                  }
-
-                  return OutlinedButton.icon(
-                    style: OutlinedButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                      side: BorderSide(color: col.withValues(alpha: 0.5)),
-                    ),
-                    icon: Icon(icon, size: 14, color: col),
-                    label: Text(label, style: TextStyle(color: col, fontSize: 10.5)),
-                    onPressed: () => _service.cycleLoopMode(),
-                  );
-                },
-              ),
-
-              // Real Shuffle Mode Button
-              StreamBuilder<bool>(
-                stream: _service.player.shuffleModeEnabledStream,
-                builder: (context, snap) {
-                  final enabled = snap.data ?? false;
-                  final col = enabled ? Colors.cyanAccent : Colors.white54;
-                  return OutlinedButton.icon(
-                    style: OutlinedButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                      side: BorderSide(color: col.withValues(alpha: 0.5)),
-                    ),
-                    icon: Icon(Icons.shuffle, size: 14, color: col),
-                    label: Text(enabled ? '随机: 开' : '随机: 关', style: TextStyle(color: col, fontSize: 10.5)),
-                    onPressed: () => _service.toggleShuffle(),
-                  );
-                },
-              ),
-
-              // Safe 3-Second Test Playback
-              ElevatedButton.icon(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF2E3846),
-                  foregroundColor: Colors.tealAccent,
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                ),
-                icon: const Icon(Icons.timer_outlined, size: 14),
-                label: const Text('3秒安全试播', style: TextStyle(fontSize: 10.5, fontWeight: FontWeight.bold)),
-                onPressed: () {
-                  _service.testShortPlayback(duration: const Duration(seconds: 3));
-                },
-              ),
-            ],
+          ValueListenableBuilder<PlaybackMode>(
+            valueListenable: CarMusicQueueController().appliedModeNotifier,
+            builder: (context, mode, _) => Wrap(
+              spacing: 8,
+              children: [
+                for (final entry in const {
+                  'list_loop': '喜欢循环', 'shuffle': '喜欢随机', 'intelligence': '网易云心动',
+                }.entries)
+                  OutlinedButton(
+                    onPressed: () => CarMusicSyncService().requestLocalCommand('set_playback_mode', {'mode': entry.key}),
+                    child: Text('${mode.value == entry.key ? "✓ " : ""}${entry.value}'),
+                  ),
+              ],
+            ),
           ),
 
           // Safe Volume Control
@@ -493,7 +442,7 @@ class _BuiltInPlayerPageState extends State<BuiltInPlayerPage> {
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               const Text(
-                '音频样本列表 (点击即切歌)',
+                '当前播放队列（点击点播）',
                 style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold),
               ),
               Container(
@@ -509,10 +458,10 @@ class _BuiltInPlayerPageState extends State<BuiltInPlayerPage> {
           const SizedBox(height: 6),
           // Tracks List
           Expanded(
-            child: StreamBuilder<int?>(
-              stream: _service.player.currentIndexStream,
-              builder: (context, snapshot) {
-                final currentIdx = snapshot.data ?? 0;
+            child: ValueListenableBuilder(
+              valueListenable: CarMusicQueueController().currentTrackNotifier,
+              builder: (context, track, _) {
+                final currentIdx = CarMusicQueueController().currentIndex;
                 return ListView.builder(
                   itemCount: _service.tracks.length,
                   itemBuilder: (context, i) {

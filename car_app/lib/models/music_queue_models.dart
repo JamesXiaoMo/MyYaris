@@ -149,6 +149,7 @@ class MusicQueueSnapshot {
   final int total;
   final bool isComplete;
   final String queueState;
+  final int batchIndex;
   final int offset;
   final int limit;
   final bool hasMore;
@@ -163,6 +164,7 @@ class MusicQueueSnapshot {
     required this.total,
     required this.isComplete,
     this.queueState = 'ready',
+    this.batchIndex = 0,
     required this.offset,
     required this.limit,
     required this.hasMore,
@@ -191,6 +193,7 @@ class MusicQueueSnapshot {
       total: (json['total'] as num?)?.toInt() ?? tracks.length,
       isComplete: json['is_complete'] as bool? ?? false,
       queueState: json['queue_state']?.toString() ?? 'ready',
+      batchIndex: (json['batch_index'] as num?)?.toInt() ?? 0,
       offset: offset,
       limit: (json['limit'] as num?)?.toInt() ?? (tracks.isNotEmpty ? tracks.length : 50),
       hasMore: json['has_more'] as bool? ?? false,

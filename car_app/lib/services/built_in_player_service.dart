@@ -41,40 +41,34 @@ class BuiltInPlayerService {
   double _currentVolume = 0.25;
   double get currentVolume => _currentVolume;
 
-  final List<LocalTrackItem> tracks = const [
-    LocalTrackItem(
-      id: 'local_1',
-      title: '钟声清脆旋律 (Bell Melody)',
-      artist: 'MyYaris 自制合成样本',
-      assetPath: 'assets/audio/track1_bell_melody.wav',
-      isLocal: true,
-      durationDesc: '3.0秒 • 高频清亮',
-      tag: 'Track 1',
-    ),
-    LocalTrackItem(
-      id: 'local_2',
-      title: '低音律动节拍 (Bass Groove)',
-      artist: 'MyYaris 自制合成样本',
-      assetPath: 'assets/audio/track2_bass_groove.wav',
-      isLocal: true,
-      durationDesc: '3.0秒 • 低频脉冲',
-      tag: 'Track 2',
-    ),
-    LocalTrackItem(
-      id: 'local_3',
-      title: '温暖氛围和弦 (Ambient Pad)',
-      artist: 'MyYaris 自制合成样本',
-      assetPath: 'assets/audio/track3_ambient_pad.wav',
-      isLocal: true,
-      durationDesc: '4.0秒 • 弦乐铺底',
-      tag: 'Track 3',
-    ),
-  ];
+  List<LocalTrackItem> get tracks => CarMusicQueueController().tracks.map((t) => LocalTrackItem(
+    id: t.trackId, title: t.title, artist: t.artist, assetPath: t.streamUrl,
+    isLocal: false, durationDesc: '${t.durationMs ~/ 1000}秒', tag: '网易云')).toList();
+
+  Future<void> Function(String action, Map<String, dynamic> params)? requestUserCommand;
+  Future<void> _operationTail = Future.value();
+  bool _loadingSource = false;
+  bool _recovering = false;
+  bool _resumeAfterInterruption = false;
+  bool _stopped = true;
+  bool get stopped => _stopped;
+
+  bool isTransitioning = false;
+  void Function()? onStateSettled;
+
+  Future<void> serialize(Future<void> Function() operation) {
+    final result = _operationTail.then((_) async {
+      isTransitioning = true;
+      try { await operation(); }
+      finally { isTransitioning = false; onStateSettled?.call(); }
+    });
+    _operationTail = result.catchError((Object _) {});
+    return result;
+  }
 
   LocalTrackItem? _activeRemoteTrack;
   LocalTrackItem? get activeRemoteTrack => _activeRemoteTrack;
   final ValueNotifier<LocalTrackItem?> activeRemoteTrackNotifier = ValueNotifier(null);
-  int _selectedTrackIndex = 0;
 
   String _currentBaseUrl = '';
   String _currentDeviceToken = '';
@@ -102,14 +96,6 @@ class BuiltInPlayerService {
         tag: queueTrack.album ?? '网络歌单',
       );
     }
-    // Only if queue is completely uninitialized and empty (offline test mode), fallback to local test tracks
-    if (queueCtrl.tracks.isEmpty) {
-      final idx = _player.currentIndex ?? _selectedTrackIndex;
-      if (idx >= 0 && idx < tracks.length) {
-        return tracks[idx];
-      }
-      return tracks[0];
-    }
     return const LocalTrackItem(
       id: '',
       title: '无播放曲目',
@@ -134,6 +120,7 @@ class BuiltInPlayerService {
       session.interruptionEventStream.listen((event) {
         debugPrint('[BuiltInPlayer] Audio focus interruption event: begin=${event.begin}, type=${event.type}');
         if (event.begin) {
+          _resumeAfterInterruption = _player.playing;
           switch (event.type) {
             case AudioInterruptionType.duck:
               debugPrint('[BuiltInPlayer] Audio focus ducking: lowering volume from $_currentVolume to ${_currentVolume * 0.5}');
@@ -153,7 +140,8 @@ class BuiltInPlayerService {
               break;
             case AudioInterruptionType.pause:
               debugPrint('[BuiltInPlayer] Audio focus restored: resuming playback');
-              _player.play();
+              if (_resumeAfterInterruption) unawaited(_player.play().catchError((Object _) {}));
+              _resumeAfterInterruption = false;
               break;
             case AudioInterruptionType.unknown:
               break;
@@ -164,7 +152,12 @@ class BuiltInPlayerService {
       // Listen to player state: completed -> autonomous progression, playing -> record success
       _player.playerStateStream.listen((state) {
         if (state.processingState == ProcessingState.completed) {
-          _handleTrackCompleted();
+          if (!_loadingSource && !_stopped) {
+            final source = _player.audioSource;
+            unawaited(serialize(() async {
+              if (source == _player.audioSource && !_stopped) await _handleTrackCompleted();
+            }));
+          }
         } else if (state.playing && state.processingState == ProcessingState.ready) {
           CarMusicQueueController().recordPlaybackSuccess();
         }
@@ -173,22 +166,15 @@ class BuiltInPlayerService {
       _player.playbackEventStream.listen((event) {
         // Stream event received
       }, onError: (Object e) {
-        debugPrint('[BuiltInPlayer] Playback stream error: $e');
-        _handlePlaybackError(e.toString());
+        debugPrint('[BuiltInPlayer] Playback stream error');
+        if (!_loadingSource && !_recovering && !_stopped) {
+          unawaited(serialize(() => _handlePlaybackError('媒体流播放失败')));
+        }
       });
 
-      // 2. Load audio sources with local offline items
-      final audioSources = tracks.map<AudioSource>((t) {
-        if (t.isLocal) {
-          return AudioSource.asset(t.assetPath);
-        } else {
-          return AudioSource.uri(Uri.parse(t.assetPath));
-        }
-      }).toList();
-
-      await _player.setAudioSources(audioSources, initialIndex: 0, initialPosition: Duration.zero);
       await _player.setVolume(_currentVolume);
-      await _player.setLoopMode(LoopMode.all);
+      await _player.setLoopMode(LoopMode.off);
+      await _player.setShuffleModeEnabled(false);
 
       // 3. Start in-app loopback proxy for ExoPlayer network requests
       try {
@@ -209,7 +195,7 @@ class BuiltInPlayerService {
     debugPrint('[BuiltInPlayer] Track completed processingState. Checking next track in queue...');
     final queueCtrl = CarMusicQueueController();
     if (queueCtrl.tracks.isNotEmpty) {
-      final nextTrack = queueCtrl.getNextTrack();
+      final nextTrack = await queueCtrl.nextTrackForPlayback();
       if (nextTrack == null) {
         debugPrint('[BuiltInPlayer] No next track available. Stopping player.');
         await stop();
@@ -218,23 +204,30 @@ class BuiltInPlayerService {
         await playQueueTrack(nextTrack);
       }
     } else {
-      if (_player.hasNext) {
-        await _player.seekToNext();
-      } else {
-        await _player.seek(Duration.zero, index: 0);
-      }
+      await stop();
     }
   }
 
   Future<void> _handlePlaybackError(String reason) async {
-    final action = CarMusicQueueController().recordPlaybackFailure(reason);
-    if (action == CircuitBreakerAction.stopPlayer) {
-      debugPrint('[BuiltInPlayer] Circuit breaker triggered! Stopping player.');
-      await stop();
-    } else {
-      debugPrint('[BuiltInPlayer] Consecutive failure < 3. Skipping to next track...');
-      await skipToNext();
-    }
+    if (_recovering) return;
+    _recovering = true;
+    try {
+      final ctrl = CarMusicQueueController();
+      while (true) {
+        if (ctrl.recordPlaybackFailure(reason) == CircuitBreakerAction.stopPlayer) {
+          await stop();
+          return;
+        }
+        final next = await ctrl.nextTrackForPlayback();
+        if (next == null) { await stop(); return; }
+        try {
+          await playQueueTrack(next, rethrowOnError: true);
+          return;
+        } catch (_) {
+          reason = '媒体流不可播放';
+        }
+      }
+    } finally { _recovering = false; }
   }
 
   /// Plays an online track from the active CarMusicQueueController
@@ -247,12 +240,21 @@ class BuiltInPlayerService {
   }) async {
     if (!_isInitialized) await init();
 
+    _loadingSource = true;
     try {
+      if (track.playable == false) throw StateError('歌曲当前不可播放');
       String fullStreamUrl = track.streamUrl;
       if (fullStreamUrl.startsWith('/')) {
         fullStreamUrl = '$_currentBaseUrl$fullStreamUrl';
       }
 
+      final streamUri = Uri.parse(fullStreamUrl);
+      final backendUri = Uri.parse(_currentBaseUrl);
+      if (streamUri.scheme != 'https' || streamUri.host.isEmpty ||
+          streamUri.userInfo.isNotEmpty || streamUri.host != backendUri.host ||
+          streamUri.port != backendUri.port) {
+        throw StateError('媒体流地址不受信任，需要后端 HTTPS 代理');
+      }
       final token = headers?['X-Device-Token'] ??
           headers?['Authorization']?.replaceAll('Bearer ', '') ??
           _currentDeviceToken;
@@ -263,7 +265,12 @@ class BuiltInPlayerService {
       );
       final uri = Uri.parse(resolvedUrl);
       final source = AudioSource.uri(uri, headers: headers);
+      // setAudioSource retains just_audio's playing flag; pause before preparing a paused mode.
+      if (!startPlaying) await _player.pause();
+      await _player.setLoopMode(LoopMode.off);
+      await _player.setShuffleModeEnabled(false);
       await _player.setAudioSource(source, initialPosition: initialPosition ?? Duration.zero);
+      _stopped = false;
 
       _activeRemoteTrack = LocalTrackItem(
         id: track.trackId,
@@ -277,62 +284,33 @@ class BuiltInPlayerService {
       activeRemoteTrackNotifier.value = _activeRemoteTrack;
 
       if (startPlaying) {
-        unawaited(_player.play());
+        unawaited(_player.play().catchError((Object _) {}));
       }
     } catch (e) {
-      debugPrint('[BuiltInPlayer] Error loading queue track: $e');
+      debugPrint('[BuiltInPlayer] Queue media could not be prepared');
       if (rethrowOnError) {
         rethrow;
       }
-      await _handlePlaybackError(e.toString());
-    }
-  }
-
-  /// Plays a remote network audio stream URL (e.g. from R9000P /api/v1/music/stream or netease stream)
-  Future<void> playRemoteStream(
-    String streamUrl, {
-    required String trackId,
-    required String title,
-    String artist = 'R9000P 媒体流',
-    Map<String, String>? headers,
-    Duration? initialPosition,
-  }) async {
-    if (!_isInitialized) await init();
-
-    _activeRemoteTrack = LocalTrackItem(
-      id: trackId,
-      title: title,
-      artist: artist,
-      assetPath: streamUrl,
-      isLocal: false,
-      durationDesc: '网络流式音频',
-      tag: '远程播控',
-    );
-    activeRemoteTrackNotifier.value = _activeRemoteTrack;
-
-    final token = headers?['X-Device-Token'] ??
-        headers?['Authorization']?.replaceAll('Bearer ', '') ??
-        _currentDeviceToken;
-    final resolvedUrl = InAppAudioStreamProxy().resolveStreamUrl(
-      streamUrl,
-      token: token,
-    );
-    final uri = Uri.parse(resolvedUrl);
-    final source = AudioSource.uri(uri, headers: headers);
-    await _player.setAudioSource(source, initialPosition: initialPosition ?? Duration.zero);
-    unawaited(_player.play());
+      _loadingSource = false;
+      await _handlePlaybackError('媒体流不可播放');
+    } finally { _loadingSource = false; }
   }
 
   Future<void> play() async {
     if (!_isInitialized) await init();
-    unawaited(_player.play());
+    if (_activeRemoteTrack == null) throw StateError('请显式选择默认喜欢歌单播放');
+    _stopped = false;
+    unawaited(_player.play().catchError((Object _) {}));
   }
 
   Future<void> pause() async {
+    _resumeAfterInterruption = false;
     await _player.pause();
   }
 
   Future<void> stop() async {
+    _stopped = true;
+    await _player.pause();
     await _player.stop();
   }
 
@@ -343,133 +321,46 @@ class BuiltInPlayerService {
   Future<void> skipToNext() async {
     final queueCtrl = CarMusicQueueController();
     if (queueCtrl.tracks.isNotEmpty) {
-      final nextTrack = queueCtrl.getNextTrack();
+      final nextTrack = await queueCtrl.nextTrackForPlayback();
       if (nextTrack != null) {
-        await playQueueTrack(nextTrack);
+        await playQueueTrack(nextTrack, startPlaying: _player.playing);
       } else {
         await stop();
       }
       return;
     }
 
-    _activeRemoteTrack = null;
-    activeRemoteTrackNotifier.value = null;
-    _selectedTrackIndex = (_selectedTrackIndex + 1) % tracks.length;
-    if (_player.hasNext) {
-      await _player.seekToNext();
-    } else {
-      await _player.seek(Duration.zero, index: 0);
-    }
+    await stop();
   }
 
   Future<void> skipToPrevious() async {
-    final queueCtrl = CarMusicQueueController();
-    if (queueCtrl.tracks.isNotEmpty) {
-      final prevTrack = queueCtrl.getPreviousTrack();
-      if (prevTrack != null) {
-        await playQueueTrack(prevTrack);
-      } else {
-        await stop();
-      }
-      return;
-    }
-
-    _activeRemoteTrack = null;
-    activeRemoteTrackNotifier.value = null;
-    _selectedTrackIndex = (_selectedTrackIndex - 1 + tracks.length) % tracks.length;
-    if (_player.hasPrevious) {
-      await _player.seekToPrevious();
-    } else {
-      await _player.seek(Duration.zero, index: tracks.length - 1);
-    }
+    final previous = CarMusicQueueController().getPreviousTrack();
+    if (previous == null) { await stop(); return; }
+    await playQueueTrack(previous, startPlaying: _player.playing);
   }
-
 
   Future<void> selectTrack(int index) async {
-    _activeRemoteTrack = null;
-    activeRemoteTrackNotifier.value = null;
-    if (index >= 0 && index < tracks.length) {
-      _selectedTrackIndex = index;
-      await _player.seek(Duration.zero, index: index);
-      unawaited(_player.play());
-    }
+    if (index < 0 || index >= tracks.length) return;
+    await requestUserCommand?.call('play_track', {'source': CarMusicQueueController().queueSource,
+      'queue_id': CarMusicQueueController().queueId, 'queue_version': CarMusicQueueController().queueVersion,
+      'track_id': tracks[index].id, 'queue_index': index});
   }
 
-  String get currentLoopModeString {
-    switch (_player.loopMode) {
-      case LoopMode.off:
-        return 'off';
-      case LoopMode.one:
-        return 'one';
-      case LoopMode.all:
-        return 'all';
-    }
-  }
+  String get currentLoopModeString => CarMusicQueueController().appliedMode == PlaybackMode.singleLoop ? 'one' : 'all';
 
   Future<void> setLoopModeString(String mode) async {
-    final parsed = PlaybackMode.fromString(mode);
-    CarMusicQueueController().setPlaybackMode(parsed);
-    switch (mode.toLowerCase().trim()) {
-      case 'one':
-      case 'single':
-        await _player.setLoopMode(LoopMode.one);
-        break;
-      case 'off':
-      case 'none':
-        await _player.setLoopMode(LoopMode.off);
-        break;
-      case 'all':
-      default:
-        await _player.setLoopMode(LoopMode.all);
-        break;
+    if (!CarMusicQueueController().setPlaybackMode(PlaybackMode.fromString(mode))) {
+      throw StateError('当前队列无法使用该模式，请选择喜欢歌单或真实心动队列');
     }
+    await _player.setLoopMode(LoopMode.off);
+    await _player.setShuffleModeEnabled(false);
   }
 
-  Future<void> cycleLoopMode() async {
-    final current = _player.loopMode;
-    switch (current) {
-      case LoopMode.off:
-        await setLoopModeString('all');
-        break;
-      case LoopMode.all:
-        await setLoopModeString('one');
-        break;
-      case LoopMode.one:
-        await setLoopModeString('off');
-        break;
-    }
-  }
-
-  Future<void> setShuffle(bool enabled) async {
-    if (enabled) {
-      CarMusicQueueController().setPlaybackMode(PlaybackMode.shuffle);
-    } else {
-      CarMusicQueueController().setPlaybackMode(PlaybackMode.listLoop);
-    }
-    await _player.setShuffleModeEnabled(enabled);
-  }
-
-  Future<void> toggleShuffle() async {
-    final enabled = _player.shuffleModeEnabled;
-    await setShuffle(!enabled);
-  }
-
+  Future<void> setShuffle(bool enabled) => setLoopModeString(enabled ? 'shuffle' : 'list_loop');
 
   Future<void> setVolume(double val) async {
     _currentVolume = val.clamp(0.0, 1.0);
     await _player.setVolume(_currentVolume);
-  }
-
-  /// Safe temporary low-volume playback (runs for specified duration and auto-pauses)
-  Future<void> testShortPlayback({Duration duration = const Duration(seconds: 3)}) async {
-    if (!_isInitialized) await init();
-    await _player.setVolume(0.20); // 20% safe low volume
-    await _player.play();
-    Timer(duration, () async {
-      try {
-        await _player.pause();
-      } catch (_) {}
-    });
   }
 
   Future<void> dispose() async {
