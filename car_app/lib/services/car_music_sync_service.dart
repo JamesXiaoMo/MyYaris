@@ -960,7 +960,7 @@ class CarMusicSyncService {
       ],
       'loop_mode': _playerService.currentLoopModeString,
       'shuffle': player.shuffleModeEnabled,
-      'updated_at': DateTime.now().toUtc().toIso8601String(),
+      'updated_at': DateTime.now().millisecondsSinceEpoch,
     };
   }
 
