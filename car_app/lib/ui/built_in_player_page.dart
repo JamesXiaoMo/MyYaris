@@ -62,7 +62,7 @@ class _BuiltInPlayerPageState extends State<BuiltInPlayerPage> {
             Icon(Icons.graphic_eq, color: Colors.tealAccent, size: 20),
             SizedBox(width: 8),
             Text(
-              'MyYaris 内置音频播放器验证 (PoC)',
+              'MyYaris 音乐播放',
               style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
             ),
           ],
@@ -76,15 +76,15 @@ class _BuiltInPlayerPageState extends State<BuiltInPlayerPage> {
               switch (mode) {
                 case MusicSyncMode.websocket:
                   badgeColor = Colors.greenAccent;
-                  badgeText = 'WS播控';
+                  badgeText = '已连接';
                   break;
                 case MusicSyncMode.httpPolling:
                   badgeColor = Colors.amberAccent;
-                  badgeText = 'HTTP轮询';
+                  badgeText = '定时连接';
                   break;
                 case MusicSyncMode.disconnected:
                   badgeColor = Colors.grey;
-                  badgeText = '播控未连';
+                  badgeText = '未连接';
                   break;
               }
               return Container(
@@ -166,7 +166,7 @@ class _BuiltInPlayerPageState extends State<BuiltInPlayerPage> {
                   child: Padding(
                     padding: const EdgeInsets.all(20),
                     child: Text(
-                      '初始化错误: $_initError\n请检查音频资源配置',
+                      '播放器启动失败：$_initError\n请检查本地音频资源，或到“连接与调试”查看日志',
                       style: const TextStyle(color: Colors.redAccent, fontSize: 13),
                       textAlign: TextAlign.center,
                     ),
@@ -183,7 +183,7 @@ class _BuiltInPlayerPageState extends State<BuiltInPlayerPage> {
                         child: _buildControlsCard(),
                       ),
                       const SizedBox(width: 10),
-                      // Right Card: Track Playlist & Test Environment (Width ~340)
+                      // Right Card: Track Playlist (Width ~340)
                       Expanded(
                         flex: 9,
                         child: _buildPlaylistCard(),
@@ -417,7 +417,7 @@ class _BuiltInPlayerPageState extends State<BuiltInPlayerPage> {
                 ),
               ),
               Text(
-                '${(_service.currentVolume * 100).toInt()}% (安全低音量)',
+                '${(_service.currentVolume * 100).toInt()}%（安全音量）',
                 style: const TextStyle(color: Colors.white60, fontSize: 9.5),
               ),
             ],
@@ -442,16 +442,12 @@ class _BuiltInPlayerPageState extends State<BuiltInPlayerPage> {
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               const Text(
-                '当前播放队列（点击点播）',
+                '当前播放队列（点击播放）',
                 style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold),
               ),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                decoration: BoxDecoration(
-                  color: Colors.blueAccent.withValues(alpha: 0.2),
-                  borderRadius: BorderRadius.circular(4),
-                ),
-                child: const Text('ExoPlayer 解码', style: TextStyle(color: Colors.lightBlueAccent, fontSize: 9)),
+              const Text(
+                '手机可远程控制',
+                style: TextStyle(color: Colors.white54, fontSize: 9.5),
               ),
             ],
           ),
@@ -504,7 +500,7 @@ class _BuiltInPlayerPageState extends State<BuiltInPlayerPage> {
                           overflow: TextOverflow.ellipsis,
                         ),
                         subtitle: Text(
-                          '${item.durationDesc} • ${item.isLocal ? "离线资产" : "公网流"}',
+                          '${item.durationDesc} • ${item.isLocal ? "本地" : "在线"}',
                           style: const TextStyle(color: Colors.white54, fontSize: 9.5),
                         ),
                         trailing: Icon(
@@ -520,7 +516,7 @@ class _BuiltInPlayerPageState extends State<BuiltInPlayerPage> {
               },
             ),
           ),
-          // Environment and AudioFocus Notice
+          // Playback and navigation-audio notice
           Container(
             padding: const EdgeInsets.all(6),
             decoration: BoxDecoration(
@@ -532,15 +528,15 @@ class _BuiltInPlayerPageState extends State<BuiltInPlayerPage> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  '• 本地离线验证：前3首为自制WAV合成音，完全本地解码不受DNS影响',
+                  '• 前 3 首为内置测试音，可离线播放',
                   style: TextStyle(color: Colors.white70, fontSize: 9.5),
                 ),
                 Text(
-                  '• 焦点与导航保护：已配置 AudioSession.music，实测低音量不抢占系统',
+                  '• 默认保持安全音量，不抢占导航语音',
                   style: TextStyle(color: Colors.white70, fontSize: 9.5),
                 ),
                 Text(
-                  '• 远程播控支持：兼容 R9000P WebSocket (/api/v1/ws/music) 与 HTTP 206 流式接口',
+                  '• 手机可远程播放、暂停、切歌和切换模式',
                   style: TextStyle(color: Colors.tealAccent, fontSize: 9.5),
                 ),
               ],

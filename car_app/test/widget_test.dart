@@ -29,13 +29,17 @@ void main() {
     expect(find.text('MyYaris 车机助手'), findsOneWidget);
     expect(find.text('连接与调试 (后台与导航)'), findsOneWidget);
     expect(find.text('当前播放信息与播控'), findsOneWidget);
+    expect(find.text('指定歌曲页面'), findsNothing);
+    expect(find.text('指定歌单页面'), findsNothing);
+    expect(find.textContaining('长轮询'), findsNothing);
 
     // Tap to enter secondary debug & connection page
     await tester.tap(find.text('连接与调试 (后台与导航)'));
     await tester.pumpAndSettle();
 
-    // Verify secondary page contains connection poller controls
+    // Verify secondary page contains connection poller controls and live logs
     expect(find.text('启用轮询'), findsOneWidget);
+    expect(find.textContaining('实时活动与回执日志'), findsOneWidget);
 
     // Explicitly stop background services before invariant verification
     poller.stop();

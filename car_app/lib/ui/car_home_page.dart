@@ -181,7 +181,7 @@ class _CarHomePageState extends State<CarHomePage> {
                                 ),
                                 const SizedBox(width: 5),
                                 Text(
-                                  isRunning ? '导航轮询中' : '未启用接收',
+                                  isRunning ? '导航接收中' : '导航未接收',
                                   style: TextStyle(color: statusColor, fontSize: 10),
                                 ),
                               ],
@@ -189,7 +189,7 @@ class _CarHomePageState extends State<CarHomePage> {
                           ),
                         ],
                       ),
-                      // Top Action Buttons (Built-in Player PoC & Debug Page)
+                      // Top Action Buttons (Player & Debug Page)
                       Expanded(
                         child: SingleChildScrollView(
                           scrollDirection: Axis.horizontal,
@@ -205,15 +205,15 @@ class _CarHomePageState extends State<CarHomePage> {
                               switch (mode) {
                                 case MusicSyncMode.websocket:
                                   badgeColor = Colors.greenAccent;
-                                  badgeText = 'WS播控';
+                                  badgeText = '实时播控';
                                   break;
                                 case MusicSyncMode.httpPolling:
                                   badgeColor = Colors.amberAccent;
-                                  badgeText = 'HTTP播控';
+                                  badgeText = '定时播控';
                                   break;
                                 case MusicSyncMode.disconnected:
                                   badgeColor = Colors.grey;
-                                  badgeText = '播控离线';
+                                  badgeText = '播控未连接';
                                   break;
                               }
                               return Container(
@@ -387,8 +387,8 @@ class _CarHomePageState extends State<CarHomePage> {
                         Expanded(
                           child: Text(
                             _hasNotificationPermission
-                                ? '网易云播放 · 默认完整喜欢歌单 · 车机自主切歌'
-                                : '读取播放信息与播控需【通知使用权】（系统安全项），请在系统设置中开启授权',
+                                ? '网易云播放 · 完整喜欢歌单 · 车机可自主切歌'
+                                : '读取播放信息和控制音乐需要通知使用权，请在系统设置中开启授权',
                             style: TextStyle(
                               color: _hasNotificationPermission ? Colors.white70 : Colors.amberAccent,
                               fontSize: 10.5,
@@ -446,7 +446,7 @@ class _CarHomePageState extends State<CarHomePage> {
                                     IconButton(
                                       icon: const Icon(Icons.refresh, size: 16, color: Colors.blueAccent),
                                       onPressed: _checkPermissionAndRefreshInfo,
-                                      tooltip: '刷新会话信息',
+                                      tooltip: '刷新播放信息',
                                       padding: EdgeInsets.zero,
                                       constraints: const BoxConstraints(),
                                     ),
@@ -606,7 +606,7 @@ class _CarHomePageState extends State<CarHomePage> {
                           ),
                         ),
                         const SizedBox(width: 10),
-                        // Right Panel: Deep Link Testing
+                        // Right Panel: Music guidance
                         Expanded(
                           flex: 2,
                           child: Container(
@@ -629,57 +629,30 @@ class _CarHomePageState extends State<CarHomePage> {
                                   style: TextStyle(color: Colors.white38, fontSize: 9.5),
                                 ),
                                 const SizedBox(height: 8),
-                                // Two Large Buttons
-                                SizedBox(
-                                  width: double.infinity,
-                                  height: 44,
-                                  child: ElevatedButton.icon(
-                                    style: ElevatedButton.styleFrom(
-                                      backgroundColor: const Color(0xFF252B3A),
-                                      foregroundColor: Colors.white,
-                                      shape: RoundedRectangleBorder(
-                                        borderRadius: BorderRadius.circular(8),
-                                        side: const BorderSide(color: Colors.white24),
-                                      ),
-                                    ),
-                                    onPressed: null,
-                                    icon: const Icon(Icons.music_note, color: Colors.blueAccent, size: 18),
-                                    label: const Text('指定歌曲页面', style: TextStyle(fontSize: 12)),
-                                  ),
-                                ),
-                                const SizedBox(height: 8),
-                                SizedBox(
-                                  width: double.infinity,
-                                  height: 44,
-                                  child: ElevatedButton.icon(
-                                    style: ElevatedButton.styleFrom(
-                                      backgroundColor: const Color(0xFF252B3A),
-                                      foregroundColor: Colors.white,
-                                      shape: RoundedRectangleBorder(
-                                        borderRadius: BorderRadius.circular(8),
-                                        side: const BorderSide(color: Colors.white24),
-                                      ),
-                                    ),
-                                    onPressed: null,
-                                    icon: const Icon(Icons.queue_music, color: Colors.blueAccent, size: 18),
-                                    label: const Text('指定歌单页面', style: TextStyle(fontSize: 12)),
-                                  ),
-                                ),
-                                const SizedBox(height: 8),
                                 // Result feedback container
                                 Expanded(
                                   child: Container(
                                     width: double.infinity,
-                                    padding: const EdgeInsets.all(6),
+                                    padding: const EdgeInsets.all(8),
                                     decoration: BoxDecoration(
                                       color: Colors.black26,
                                       borderRadius: BorderRadius.circular(6),
                                       border: Border.all(color: Colors.white10),
                                     ),
                                     child: SingleChildScrollView(
-                                      child: Text(
-                                        '车机端暂不支持搜索点播。手机搜索结果作为独立单曲，结束后停止；循环和随机始终返回完整喜欢歌单。',
-                                        style: const TextStyle(color: Colors.white70, fontSize: 10),
+                                      child: Column(
+                                        crossAxisAlignment: CrossAxisAlignment.start,
+                                        children: [
+                                          const Text(
+                                            '在手机上搜索歌曲，或打开“我喜欢的音乐”选择歌曲，再发送到车机播放。',
+                                            style: TextStyle(color: Colors.white70, fontSize: 10.5),
+                                          ),
+                                          const SizedBox(height: 6),
+                                          const Text(
+                                            '手机搜索的单曲播放结束后会停止；循环和随机播放使用完整喜欢歌单。',
+                                            style: TextStyle(color: Colors.white38, fontSize: 9.5),
+                                          ),
+                                        ],
                                       ),
                                     ),
                                   ),
@@ -694,7 +667,7 @@ class _CarHomePageState extends State<CarHomePage> {
                   const SizedBox(height: 4),
                   // Footer info (no sensitive token shown)
                   const Text(
-                    'MyYaris v1.0.0 • 800x480 车机触控优化 • 敏感令牌仅在二级页处理 • 后台长轮询持续运行',
+                    'MyYaris v1.0.0 • 车机触控界面 • 连接与授权在“连接与调试”中设置',
                     style: TextStyle(color: Colors.white24, fontSize: 9.5),
                     textAlign: TextAlign.center,
                   ),
