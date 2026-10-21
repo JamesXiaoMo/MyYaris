@@ -391,15 +391,15 @@ class CarMusicSyncService {
   }
 
   Future<int> _preparePlayableTrack(List<NeteaseQueueTrackItem> tracks, int index,
-      {required String source, Duration initialPosition = Duration.zero}) async {
-    final limit = source == QueueSource.singleTrack ? 1 : tracks.length.clamp(1, 3);
+      {required String source, Duration initialPosition = Duration.zero, bool startPlaying = true}) async {
+    final limit = !startPlaying || source == QueueSource.singleTrack ? 1 : tracks.length.clamp(1, 3);
     for (var attempt = 0; attempt < limit; attempt++) {
       final target = (index + attempt) % tracks.length;
       // Intelligence never wraps exhausted recommendations to an unrelated source.
       if (source == QueueSource.neteaseIntelligence && index + attempt >= tracks.length) break;
       try {
         await _playerService.playQueueTrack(tracks[target],
-          initialPosition: attempt == 0 ? initialPosition : Duration.zero, rethrowOnError: true);
+          initialPosition: attempt == 0 ? initialPosition : Duration.zero, startPlaying: startPlaying, rethrowOnError: true);
         if (attempt > 0) lastCommandNotifier.value = '已跳过 $attempt 首不可播曲目';
         return target;
       } catch (_) {
@@ -642,12 +642,20 @@ class CarMusicSyncService {
               throw BackendException(404, 'Index $targetIdx out of bounds in prepared queue $serverQueueId');
             }
 
+            // Handoff prepare: autoplay=false loads the track at the requested position and stays paused,
+            // so a phone->car transfer can finish in order (never two audible outputs).
+            final autoplay = params['autoplay'] != false;
             targetIdx = await _preparePlayableTrack(candidate.tracks, targetIdx,
-              source: targetSource, initialPosition: Duration(milliseconds: seekMs));
+              source: targetSource, initialPosition: Duration(milliseconds: seekMs), startPlaying: autoplay);
+            // An explicit loop/shuffle mode is honoured for the Owner's favorite list; otherwise the earlier rules apply.
+            final requestedMode = params['mode'] is String ? PlaybackMode.fromString(params['mode'] as String) : null;
+            final explicitMode = requestedMode == PlaybackMode.singleLoop ? requestedMode : targetSource == QueueSource.neteaseFavorite &&
+                (requestedMode == PlaybackMode.shuffle || requestedMode == PlaybackMode.listLoop || requestedMode == PlaybackMode.singleLoop)
+                ? requestedMode : null;
             queueCtrl.applyQueueSnapshot(candidate, targetIndex: targetIdx,
-              mode: targetSource == QueueSource.neteaseIntelligence ? PlaybackMode.intelligence :
+              mode: explicitMode ?? (targetSource == QueueSource.neteaseIntelligence ? PlaybackMode.intelligence :
                 targetSource == QueueSource.neteaseFavorite && backup.queueSource == targetSource && backup.appliedMode == PlaybackMode.shuffle
-                  ? PlaybackMode.shuffle : PlaybackMode.listLoop);
+                  ? PlaybackMode.shuffle : PlaybackMode.listLoop));
           } else {
             int targetIdx = -1;
             if (trackId != null && queueCtrl.tracks.any((t) => t.trackId == trackId)) {
@@ -915,6 +923,7 @@ class CarMusicSyncService {
       'error_detail': queueCtrl.errorDetail,
       'capabilities': const [
         'queue_v2',
+        'handoff_v1',
         'intelligence_v1',
         'full_favorite_shuffle',
       ],

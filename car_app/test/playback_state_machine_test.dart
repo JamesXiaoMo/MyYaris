@@ -257,6 +257,61 @@ void main() {
     expect(engine.player.playing, true);
   });
 
+  test('phone to car handoff prepare loads paused at the position, keeps mode and cursor, and resume is the only sound', () async {
+    String? terminal;
+    int? actualIndex;
+    String? appliedMode;
+    start(support.FakeBackendClient(onFetchQueue: (_, query) => page(query),
+      onAck: (_, status, payload) { if (status != 'received') { terminal = status; actualIndex = payload['current_index'] as int?; appliedMode = payload['applied_mode'] as String?; } }));
+    await engine.init();
+    final observed = audio.latest, plays = observed?.plays ?? 0;
+    await sync.handleCommand({'command_id': 'ho_prepare_fav', 'action': 'play_track', 'params': {
+      'queue_id': 'q_fav_full', 'queue_version': 17, 'source': 'netease_favorite', 'track_id': 'netease_1090',
+      'queue_index': 90, 'seek_ms': 61000, 'autoplay': false, 'mode': 'shuffle'}});
+    expect(terminal, 'applied');
+    expect(actualIndex, 90);
+    expect(appliedMode, 'shuffle');
+    expect(ctrl.appliedMode.value, 'shuffle');
+    expect(ctrl.tracks.length, 137);
+    expect(engine.currentTrack.id, 'netease_1090');
+    expect(engine.player.position.inMilliseconds, 61000);
+    expect(engine.player.playing, false, reason: 'prepare must stay silent');
+    expect(audio.latest!.plays, identical(audio.latest, observed) ? plays : 0, reason: 'no play() call during prepare');
+    await sync.handleCommand({'command_id': 'ho_resume_fav', 'action': 'resume', 'params': {}});
+    expect(terminal, 'applied');
+    expect(engine.player.playing, true);
+    expect(engine.currentTrack.id, 'netease_1090');
+    expect(engine.player.position.inMilliseconds, greaterThanOrEqualTo(61000));
+    // Default play_track (no autoplay field) still starts immediately, and a loop request is honoured.
+    await sync.handleCommand({'command_id': 'plain_play', 'action': 'play_track', 'params': {
+      'queue_id': 'q_fav_full', 'queue_version': 17, 'source': 'netease_favorite', 'track_id': 'netease_1005',
+      'queue_index': 5, 'mode': 'list_loop'}});
+    expect(engine.player.playing, true);
+    expect(ctrl.appliedMode.value, 'list_loop');
+  });
+
+  test('a failed handoff prepare keeps the previous queue, cursor and silence', () async {
+    String? terminal;
+    var failing = false;
+    start(support.FakeBackendClient(onFetchQueue: (_, query) {
+      if (failing) throw BackendException(404, 'gone');
+      return page(query);
+    }, onAck: (_, status, payload) { if (status != 'received') terminal = status; }));
+    await engine.init();
+    await sync.handleCommand({'command_id': 'ho_base', 'action': 'play_track', 'params': {
+      'queue_id': 'q_fav_full', 'queue_version': 17, 'source': 'netease_favorite', 'track_id': 'netease_1010',
+      'queue_index': 10, 'autoplay': false, 'seek_ms': 5000}});
+    expect(terminal, 'applied');
+    failing = true;
+    await sync.handleCommand({'command_id': 'ho_prepare_broken', 'action': 'play_track', 'params': {
+      'queue_id': 'q_fav_other', 'queue_version': 19, 'source': 'netease_favorite', 'track_id': 'netease_1020',
+      'queue_index': 20, 'autoplay': false, 'seek_ms': 9000}});
+    expect(terminal, 'failed');
+    expect(ctrl.queueId, 'q_fav_full');
+    expect(ctrl.currentIndex, 10);
+    expect(engine.player.playing, false);
+  });
+
   test('status sequence persists across fresh services and clock watermark; concurrent snapshots are ordered', () async {
     SharedPreferences.setMockInitialValues({'music_status_seq_': 9000000000000000});
     final first = CarMusicSyncService.forTesting();
