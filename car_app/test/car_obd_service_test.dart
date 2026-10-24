@@ -209,6 +209,7 @@ void main() {
       expect(obd.parseAtRv('14.2V'), equals(14.2));
       expect(obd.parseAtRv('12.6 V\r>'), equals(12.6));
       expect(obd.parseAtRv('ERROR'), isNull);
+      expect(obd.parseAtRv('ERROR: TIMEOUT\n12.6V'), isNull);
     });
 
     test('Standard Percent 0111 / 0104 / 0149 / 014A parsing', () {
@@ -247,8 +248,9 @@ void main() {
 
       // 多帧换行与行号过滤测试 (0: / 1:)
       final odoMulti = obd.parseStandardOdometer('0: 41A6000B\r\n1: DF02\r\n>');
-      expect(odoMulti, isNotNull);
-      expect(odoMulti!, closeTo(77798.6, 0.1));
+      // No ELM total length: fragmented payload cannot be trusted.
+      expect(odoMulti, isNull);
+      expect(obd.parseStandardOdometer('7E8 06 41 A6 00 0B DF 02'), closeTo(77798.6, 0.1));
     });
 
     test('Standard Engine Oil Temp 015C parsing (0x40 -> 24 °C)', () {
@@ -385,8 +387,8 @@ void main() {
       expect(obd.parseRunTime('41 1F 01 2C'), equals(300));
 
       // 0134 Lambda: 0x8000 (32768) -> 1.000 λ, 0x7CCD (31949) -> 0.975 λ
-      expect(obd.parseLambda('41 34 80 00'), closeTo(1.0, 0.001));
-      expect(obd.parseLambda('41 34 7C CD'), closeTo(0.975, 0.001));
+      expect(obd.parseLambda('41 34 80 00 00 00'), closeTo(1.0, 0.001));
+      expect(obd.parseLambda('41 34 7C CD 00 00'), closeTo(0.975, 0.001));
 
       // 013D Cat Temp 2: 0x163B -> 529.1 °C
       expect(obd.parseStandardCatTemp('41 3D 16 3B'), closeTo(529.1, 0.1));

@@ -65,6 +65,7 @@ class MainActivity : AudioServiceActivity() {
         setupNavigationChannel(flutterEngine)
         setupMusicChannel(flutterEngine)
         setupSystemUiChannel(flutterEngine)
+        ObdReportExporter.register(this, flutterEngine)
     }
 
     private fun setupSystemUiChannel(flutterEngine: FlutterEngine) {

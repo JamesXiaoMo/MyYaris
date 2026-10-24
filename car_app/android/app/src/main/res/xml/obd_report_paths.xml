@@ -1,0 +1,3 @@
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <cache-path name="obd_reports" path="obd_reports/" />
+</paths>

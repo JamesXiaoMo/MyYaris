@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/obd_telemetry.dart';
+import '../models/elm_obd_response.dart';
 import '../models/obd_deep_scan_result.dart';
 import '../models/toyota_tnga_profile.dart';
 
@@ -11,6 +12,50 @@ class CarObdService {
   static final CarObdService _instance = CarObdService._internal();
   factory CarObdService() => _instance;
   CarObdService._internal();
+
+  /// Isolated instance exercising the real serial queue with a fake BLE writer.
+  @visibleForTesting
+  CarObdService.forTesting(Future<void> Function(List<int>) writer)
+    : _testWriter = writer {
+    _updateStatus(ObdConnectionStatus.ready);
+  }
+  Future<void> Function(List<int>)? _testWriter;
+  final Object _sequenceKey = Object();
+  Object? _sequenceOwner;
+  Completer<void>? _sequenceDone;
+  bool _serialSynchronized = true;
+  Completer<void>? _drained;
+  String? _knownHeader;
+  String? _knownDisplay;
+  String? _knownProtocol;
+  String? _knownFormatting;
+  bool _pollingSuspended = false;
+  bool _activeInterrupted = false;
+  bool _scanOwnsSerial = false;
+  bool _restoringScanState = false;
+  final List<Map<String, dynamic>> _scanLateReplies = [];
+
+  Future<T> _sequence<T>(Future<T> Function() work) async {
+    while (_sequenceDone != null) {
+      await _sequenceDone!.future;
+    }
+    final done = Completer<void>();
+    final owner = Object();
+    _sequenceDone = done;
+    _sequenceOwner = owner;
+    try {
+      return await runZoned(work, zoneValues: {_sequenceKey: owner});
+    } finally {
+      _sequenceOwner = null;
+      _sequenceDone = null;
+      done.complete();
+    }
+  }
+
+  @visibleForTesting
+  void receiveForTesting(String value) => _onDataReceived(ascii.encode(value));
+  @visibleForTesting
+  void disconnectForTesting() => _handleDisconnection();
 
   static const String _prefLastDeviceAddress = 'obd_last_device_address';
   static const String _prefLastDeviceName = 'obd_last_device_name';
@@ -43,8 +88,9 @@ class CarObdService {
   /// 是否开启标准 OBD (Mode 01) 周期轮询 (车速/转速/水温)
   /// 需在确认 PID 0100 有效响应后开启
   bool enableStandardPolling = false;
-  final ValueNotifier<bool> enableStandardPollingNotifier =
-      ValueNotifier<bool>(false);
+  final ValueNotifier<bool> enableStandardPollingNotifier = ValueNotifier<bool>(
+    false,
+  );
 
   bool _isDeepScanning = false;
   bool _cancelDeepScanRequested = false;
@@ -81,7 +127,9 @@ class CarObdService {
   }
 
   // --- 1. 扫描与设备发现 ---
-  Future<void> startScan({Duration timeout = const Duration(seconds: 8)}) async {
+  Future<void> startScan({
+    Duration timeout = const Duration(seconds: 8),
+  }) async {
     try {
       if (await FlutterBluePlus.isSupported == false) {
         log('❌ 当前系统不支持 Bluetooth LE');
@@ -98,7 +146,10 @@ class CarObdService {
 
       isScanningNotifier.value = true;
       scanResultsNotifier.value = [];
-      _updateStatus(ObdConnectionStatus.scanning, message: '正在扫描周边 OBD 蓝牙设备...');
+      _updateStatus(
+        ObdConnectionStatus.scanning,
+        message: '正在扫描周边 OBD 蓝牙设备...',
+      );
       log('🔍 开始 BLE 扫描...');
 
       _scanSubscription?.cancel();
@@ -181,6 +232,13 @@ class CarObdService {
         return false;
       }
 
+      _pollingSuspended = false;
+      _serialSynchronized = true;
+      _drained = null;
+      _knownHeader = null;
+      _knownDisplay = null;
+      _knownProtocol = null;
+      _knownFormatting = null;
       _writeCharacteristic = channel.writeCharacteristic;
       final notifyChar = channel.notifyCharacteristic;
 
@@ -193,7 +251,10 @@ class CarObdService {
       await notifyChar.setNotifyValue(true);
       _notifySubscription = notifyChar.onValueReceived.listen(_onDataReceived);
 
-      _updateStatus(ObdConnectionStatus.initializing, message: '正在初始化 ELM327 适配器...');
+      _updateStatus(
+        ObdConnectionStatus.initializing,
+        message: '正在初始化 ELM327 适配器...',
+      );
       log('⚙️ 开始 ELM327 指令握手初始化...');
 
       final initSuccess = await _initializeElm327();
@@ -241,7 +302,10 @@ class CarObdService {
   Future<bool> _initializeElm327() async {
     try {
       // 1. 复位适配器
-      var resp = await sendRawCommand('ATZ', timeout: const Duration(seconds: 2));
+      var resp = await sendRawCommand(
+        'ATZ',
+        timeout: const Duration(seconds: 2),
+      );
       log('ATZ 应答: $resp');
       // 给 ELM327 芯片 350ms 重新稳定内部波特率与缓冲区
       await Future.delayed(const Duration(milliseconds: 350));
@@ -260,13 +324,14 @@ class CarObdService {
       log('ATRV (12V 电瓶电压) 应答: $atrv');
       final battV = _parseAtRv(atrv);
       if (battV != null) {
-        _updateTelemetry((t) => t.copyWith(
-              aux12vVoltage: battV,
-            ));
+        _updateTelemetry((t) => t.copyWith(aux12vVoltage: battV));
       }
 
       // 5. 关闭空格加速传输
       await sendRawCommand('ATS0');
+      await sendRawCommand(
+        'ATCAF1',
+      ); // Explicit application request formatting; CFC is independent.
 
       // 6. 关闭多余报头 (标准 PID 模式)
       await sendRawCommand('ATH0');
@@ -282,7 +347,15 @@ class CarObdService {
       resp = await sendRawCommand('0100', timeout: const Duration(seconds: 3));
       log('0100 测试应答: $resp');
 
-      if (resp.contains('4100') || resp.contains('41 00')) {
+      if (ElmObdParser.classify(
+        ElmReply(
+          resp,
+          resp.startsWith('TIMEOUT') || resp.startsWith('ERROR')
+              ? 'incomplete'
+              : 'prompt',
+        ),
+        '0100',
+      ).positive) {
         canBusReady = true;
         canBusReadyNotifier.value = true;
         log('🎉 车辆 ECU 已成功响应 PID 0100，标准 CAN 总线已联机');
@@ -293,7 +366,8 @@ class CarObdService {
       }
 
       // 只要适配器能响应 AT 指令 (ATE0/ATI/ATRV 正常返回非 ERROR)，即认定适配器链路正常
-      final adapterOk = (ate0Resp.isNotEmpty && !ate0Resp.startsWith('ERROR')) ||
+      final adapterOk =
+          (ate0Resp.isNotEmpty && !ate0Resp.startsWith('ERROR')) ||
           (ati.isNotEmpty && !ati.startsWith('ERROR')) ||
           (atrv.isNotEmpty && !atrv.startsWith('ERROR'));
       return adapterOk;
@@ -306,6 +380,7 @@ class CarObdService {
   // --- 4. 周期调度与分级轮询引擎 ---
   void _startPolling() {
     _pollingTimer?.cancel();
+    if (!isConnected || _pollingSuspended || _testWriter != null) return;
     _pollCycleCount = 0;
     // 基础安全轮询周期 2.5 秒
     _pollingTimer = Timer.periodic(const Duration(milliseconds: 2500), (timer) {
@@ -314,7 +389,18 @@ class CarObdService {
   }
 
   Future<void> _pollCycle() async {
-    if (_isPollingBusy || !isConnected) return;
+    if (_isPollingBusy ||
+        !isConnected ||
+        _isDeepScanning ||
+        _pollingSuspended ||
+        _sequenceDone != null ||
+        _cmdQueue != null) {
+      return;
+    }
+    await _sequence(_pollCycleOwned);
+  }
+
+  Future<void> _pollCycleOwned() async {
     _isPollingBusy = true;
     _pollCycleCount++;
 
@@ -323,10 +409,9 @@ class CarObdService {
       final atrv = await sendRawCommand('ATRV');
       final battV = _parseAtRv(atrv);
       if (battV != null) {
-        _updateTelemetry((t) => t.copyWith(
-              aux12vVoltage: battV,
-              lastUpdated: DateTime.now(),
-            ));
+        _updateTelemetry(
+          (t) => t.copyWith(aux12vVoltage: battV, lastUpdated: DateTime.now()),
+        );
       }
 
       // 仅当车辆 CAN 总线已明确就绪 (PID 0100 有效响应) 且用户显式启用标准轮询时，才读取标准 Mode 01 PID
@@ -355,6 +440,14 @@ class CarObdService {
 
   /// 显式单次验证标准 Mode 01 PID (0100, 010D, 010C, 0105)
   Future<void> verifyStandardPidsExplicitly() async {
+    if (_isDeepScanning || _sequenceDone != null || _cmdQueue != null) {
+      log('扫描/轮询事务占用串口，拒绝单次验证');
+      return;
+    }
+    await _sequence(_verifyStandardPidsOwned);
+  }
+
+  Future<void> _verifyStandardPidsOwned() async {
     if (!isConnected) {
       log('⚠️ 适配器未连接，无法执行标准 PID 验证');
       return;
@@ -363,7 +456,15 @@ class CarObdService {
     final resp0100 = await sendRawCommand('0100');
     log('🔬 [显式验证] 0100 应答: $resp0100');
 
-    if (resp0100.contains('4100') || resp0100.contains('41 00')) {
+    if (ElmObdParser.classify(
+      ElmReply(
+        resp0100,
+        resp0100.startsWith('TIMEOUT') || resp0100.startsWith('ERROR')
+            ? 'incomplete'
+            : 'prompt',
+      ),
+      '0100',
+    ).positive) {
       canBusReady = true;
       canBusReadyNotifier.value = true;
       log('✅ 车辆 ECU 确认支持 Mode 01 标准协议，开始采集单次标准车况...');
@@ -411,12 +512,14 @@ class CarObdService {
     final coolantResp = await sendRawCommand('0105');
     final coolant = _parseStandardTemp(coolantResp);
 
-    _updateTelemetry((t) => t.copyWith(
-          speedKmh: speed ?? t.speedKmh,
-          engineRpm: rpm ?? t.engineRpm,
-          coolantTemp: coolant ?? t.coolantTemp,
-          lastUpdated: DateTime.now(),
-        ));
+    _updateTelemetry(
+      (t) => t.copyWith(
+        speedKmh: speed ?? t.speedKmh,
+        engineRpm: rpm ?? t.engineRpm,
+        coolantTemp: coolant ?? t.coolantTemp,
+        lastUpdated: DateTime.now(),
+      ),
+    );
   }
 
   // Tier 2: 丰田混动 (支持 TNGA Mode 22 DID 与老款 Mode 21)
@@ -516,23 +619,25 @@ class CarObdService {
     final relThResp = await sendRawCommand('0145');
     final relTh = _parsePercent(relThResp);
 
-    _updateTelemetry((t) => t.copyWith(
-          aux12vVoltage: auxV ?? t.aux12vVoltage,
-          throttlePosition: throttle ?? t.throttlePosition,
-          relativeThrottlePosition: relTh ?? t.relativeThrottlePosition,
-          commandedThrottleActuator: thAct ?? t.commandedThrottleActuator,
-          pedalPositionD: pedalD ?? t.pedalPositionD,
-          pedalPositionE: pedalE ?? t.pedalPositionE,
-          engineLoad: load ?? t.engineLoad,
-          intakeAirTemp: iat ?? t.intakeAirTemp,
-          engineOilTemp: oilTemp ?? t.engineOilTemp,
-          mafGramsPerSec: maf ?? t.mafGramsPerSec,
-          barometricPressureKpa: baro ?? t.barometricPressureKpa,
-          shortTermFuelTrim: stft ?? t.shortTermFuelTrim,
-          longTermFuelTrim: ltft ?? t.longTermFuelTrim,
-          equivalenceRatio: lambda ?? t.equivalenceRatio,
-          lastUpdated: DateTime.now(),
-        ));
+    _updateTelemetry(
+      (t) => t.copyWith(
+        aux12vVoltage: auxV ?? t.aux12vVoltage,
+        throttlePosition: throttle ?? t.throttlePosition,
+        relativeThrottlePosition: relTh ?? t.relativeThrottlePosition,
+        commandedThrottleActuator: thAct ?? t.commandedThrottleActuator,
+        pedalPositionD: pedalD ?? t.pedalPositionD,
+        pedalPositionE: pedalE ?? t.pedalPositionE,
+        engineLoad: load ?? t.engineLoad,
+        intakeAirTemp: iat ?? t.intakeAirTemp,
+        engineOilTemp: oilTemp ?? t.engineOilTemp,
+        mafGramsPerSec: maf ?? t.mafGramsPerSec,
+        barometricPressureKpa: baro ?? t.barometricPressureKpa,
+        shortTermFuelTrim: stft ?? t.shortTermFuelTrim,
+        longTermFuelTrim: ltft ?? t.longTermFuelTrim,
+        equivalenceRatio: lambda ?? t.equivalenceRatio,
+        lastUpdated: DateTime.now(),
+      ),
+    );
   }
 
   // Tier 4: 里程 (ODO)、催化转化器温与低频专用传感器
@@ -573,21 +678,23 @@ class CarObdService {
     // 切回标准广播报头
     await sendRawCommand('ATSH7DF');
 
-    _updateTelemetry((t) => t.copyWith(
-          totalOdometerKm: odo ?? t.totalOdometerKm,
-          catalystTemp: catTemp ?? t.catalystTemp,
-          catalystTemp2: catTemp2 ?? t.catalystTemp2,
-          runTimeSeconds: runTime ?? t.runTimeSeconds,
-          ambientAirTemp: ambTemp ?? t.ambientAirTemp,
-          lastUpdated: DateTime.now(),
-        ));
+    _updateTelemetry(
+      (t) => t.copyWith(
+        totalOdometerKm: odo ?? t.totalOdometerKm,
+        catalystTemp: catTemp ?? t.catalystTemp,
+        catalystTemp2: catTemp2 ?? t.catalystTemp2,
+        runTimeSeconds: runTime ?? t.runTimeSeconds,
+        ambientAirTemp: ambTemp ?? t.ambientAirTemp,
+        lastUpdated: DateTime.now(),
+      ),
+    );
   }
 
   // --- 5. 数据解码器 (Parser 实现) ---
 
   // 010D: 41 0D XX -> XX (km/h)
   double? _parseStandardSpeed(String resp) {
-    final clean = _cleanHex(resp);
+    final clean = _matchedPayload(resp, const ['010D']);
     final idx = clean.indexOf('410D');
     if (idx != -1 && clean.length >= idx + 6) {
       final hexA = clean.substring(idx + 4, idx + 6);
@@ -598,7 +705,7 @@ class CarObdService {
 
   // 010C: 41 0C AA BB -> ((AA*256)+BB)/4
   double? _parseStandardRpm(String resp) {
-    final clean = _cleanHex(resp);
+    final clean = _matchedPayload(resp, const ['010C']);
     final idx = clean.indexOf('410C');
     if (idx != -1 && clean.length >= idx + 8) {
       final hexA = clean.substring(idx + 4, idx + 6);
@@ -614,7 +721,7 @@ class CarObdService {
 
   // 0105 / 010F / 0146 / 015C: 41 XX YY -> YY - 40
   double? _parseStandardTemp(String resp) {
-    final clean = _cleanHex(resp);
+    final clean = _matchedPayload(resp, const ['0105', '010F', '0146', '015C']);
     final match = RegExp(r'41(05|0F|46|5C)([0-9A-F]{2})').firstMatch(clean);
     if (match != null) {
       final val = int.tryParse(match.group(2)!, radix: 16);
@@ -630,8 +737,18 @@ class CarObdService {
 
   // 0111 / 0104 / 012F / 0145 / 0149 / 014A / 014C: (XX * 100) / 255
   double? _parsePercent(String resp) {
-    final clean = _cleanHex(resp);
-    final match = RegExp(r'41(11|04|2F|45|49|4A|4C)([0-9A-F]{2})').firstMatch(clean);
+    final clean = _matchedPayload(resp, const [
+      '0111',
+      '0104',
+      '012F',
+      '0145',
+      '0149',
+      '014A',
+      '014C',
+    ]);
+    final match = RegExp(
+      r'41(11|04|2F|45|49|4A|4C)([0-9A-F]{2})',
+    ).firstMatch(clean);
     if (match != null) {
       final val = int.tryParse(match.group(2)!, radix: 16);
       if (val != null) return (val * 100.0) / 255.0;
@@ -646,7 +763,7 @@ class CarObdService {
 
   // 0106 / 0107: 41 06 XX -> (XX - 128) * 100 / 128 (%)
   double? _parseFuelTrim(String resp) {
-    final clean = _cleanHex(resp);
+    final clean = _matchedPayload(resp, const ['0106', '0107']);
     final match = RegExp(r'41(06|07)([0-9A-F]{2})').firstMatch(clean);
     if (match != null) {
       final val = int.tryParse(match.group(2)!, radix: 16);
@@ -657,7 +774,7 @@ class CarObdService {
 
   // 010E: 41 0E XX -> (XX - 128) / 2 (°)
   double? _parseTimingAdvance(String resp) {
-    final clean = _cleanHex(resp);
+    final clean = _matchedPayload(resp, const ['010E']);
     final idx = clean.indexOf('410E');
     if (idx != -1 && clean.length >= idx + 6) {
       final hexA = clean.substring(idx + 4, idx + 6);
@@ -669,7 +786,7 @@ class CarObdService {
 
   // 011F: 41 1F AA BB -> (AA * 256) + BB (s)
   int? _parseRunTime(String resp) {
-    final clean = _cleanHex(resp);
+    final clean = _matchedPayload(resp, const ['011F']);
     final idx = clean.indexOf('411F');
     if (idx != -1 && clean.length >= idx + 8) {
       final hexVal = clean.substring(idx + 4, idx + 8);
@@ -680,7 +797,7 @@ class CarObdService {
 
   // 0134: 41 34 AA BB -> ((AA * 256) + BB) / 32768 (Lambda)
   double? _parseLambda(String resp) {
-    final clean = _cleanHex(resp);
+    final clean = _matchedPayload(resp, const ['0134']);
     final idx = clean.indexOf('4134');
     if (idx != -1 && clean.length >= idx + 8) {
       final hexVal = clean.substring(idx + 4, idx + 8);
@@ -692,7 +809,7 @@ class CarObdService {
 
   // 0142: 41 42 AA BB -> ((AA * 256) + BB) / 1000 (V)
   double? _parseStandardModuleVoltage(String resp) {
-    final clean = _cleanHex(resp);
+    final clean = _matchedPayload(resp, const ['0142']);
     final idx = clean.indexOf('4142');
     if (idx != -1 && clean.length >= idx + 8) {
       final hexA = clean.substring(idx + 4, idx + 6);
@@ -708,7 +825,7 @@ class CarObdService {
 
   // 01A6: 41 A6 AA BB CC DD -> ((AA * 16^6) + (BB * 16^4) + (CC * 16^2) + DD) / 10 (km)
   double? _parseStandardOdometer(String resp) {
-    final clean = _cleanHex(resp);
+    final clean = _matchedPayload(resp, const ['01A6']);
     final idx = clean.indexOf('41A6');
     if (idx != -1 && clean.length >= idx + 12) {
       final hexOdo = clean.substring(idx + 4, idx + 12);
@@ -722,7 +839,7 @@ class CarObdService {
 
   // 0110: 41 10 AA BB -> ((AA * 256) + BB) / 100 (g/s)
   double? _parseStandardMaf(String resp) {
-    final clean = _cleanHex(resp);
+    final clean = _matchedPayload(resp, const ['0110']);
     final idx = clean.indexOf('4110');
     if (idx != -1 && clean.length >= idx + 8) {
       final hexA = clean.substring(idx + 4, idx + 6);
@@ -738,7 +855,7 @@ class CarObdService {
 
   // 0133: 41 33 AA -> AA (kPa)
   double? _parseStandardBaro(String resp) {
-    final clean = _cleanHex(resp);
+    final clean = _matchedPayload(resp, const ['0133']);
     final idx = clean.indexOf('4133');
     if (idx != -1 && clean.length >= idx + 6) {
       final hexA = clean.substring(idx + 4, idx + 6);
@@ -750,7 +867,7 @@ class CarObdService {
 
   // 013C / 013D: 41 3C/3D AA BB -> (((AA * 256) + BB) / 10) - 40 (°C)
   double? _parseStandardCatTemp(String resp) {
-    final clean = _cleanHex(resp);
+    final clean = _matchedPayload(resp, const ['013C', '013D']);
     final match = RegExp(r'41(3C|3D)([0-9A-F]{4})').firstMatch(clean);
     if (match != null) {
       final hexVal = match.group(2)!;
@@ -774,6 +891,7 @@ class CarObdService {
 
   // AT RV: 例如 "14.1V"
   double? _parseAtRv(String resp) {
+    if (resp.startsWith('ERROR:') || resp.contains('TIMEOUT') || resp.contains('STOPPED')) return null;
     final match = RegExp(r'([0-9]+\.?[0-9]*)\s*V').firstMatch(resp);
     if (match != null) {
       return double.tryParse(match.group(1) ?? '');
@@ -815,13 +933,15 @@ class CarObdService {
         powerKw = (vb * ib) / 1000.0;
       }
 
-      _updateTelemetry((t) => t.copyWith(
-            batterySoc: soc ?? t.batterySoc,
-            batteryVoltage: vb ?? t.batteryVoltage,
-            batteryCurrent: ib ?? t.batteryCurrent,
-            batteryPowerKw: powerKw ?? t.batteryPowerKw,
-            lastUpdated: DateTime.now(),
-          ));
+      _updateTelemetry(
+        (t) => t.copyWith(
+          batterySoc: soc ?? t.batterySoc,
+          batteryVoltage: vb ?? t.batteryVoltage,
+          batteryCurrent: ib ?? t.batteryCurrent,
+          batteryPowerKw: powerKw ?? t.batteryPowerKw,
+          lastUpdated: DateTime.now(),
+        ),
+      );
     } catch (e) {
       log('解析 TNGA 221024 失败: $e');
     }
@@ -842,14 +962,16 @@ class CarObdService {
         transOil = (bytes[6] - 40).toDouble();
       }
 
-      _updateTelemetry((t) => t.copyWith(
-            voltageBeforeBoost: vl,
-            voltageAfterBoost: vh,
-            mg1InverterTemp: mg1T,
-            mg2InverterTemp: mg2T,
-            transaxleOilTemp: transOil ?? t.transaxleOilTemp,
-            lastUpdated: DateTime.now(),
-          ));
+      _updateTelemetry(
+        (t) => t.copyWith(
+          voltageBeforeBoost: vl,
+          voltageAfterBoost: vh,
+          mg1InverterTemp: mg1T,
+          mg2InverterTemp: mg2T,
+          transaxleOilTemp: transOil ?? t.transaxleOilTemp,
+          lastUpdated: DateTime.now(),
+        ),
+      );
     } catch (e) {
       log('解析 TNGA 221100 失败: $e');
     }
@@ -881,13 +1003,15 @@ class CarObdService {
         regenT = rawR / 8.0;
       }
 
-      _updateTelemetry((t) => t.copyWith(
-            mg1Rpm: rawMg1.toDouble(),
-            mg2Rpm: rawMg2.toDouble(),
-            mg2Torque: mg2T ?? t.mg2Torque,
-            regenBrakingTorque: regenT ?? t.regenBrakingTorque,
-            lastUpdated: DateTime.now(),
-          ));
+      _updateTelemetry(
+        (t) => t.copyWith(
+          mg1Rpm: rawMg1.toDouble(),
+          mg2Rpm: rawMg2.toDouble(),
+          mg2Torque: mg2T ?? t.mg2Torque,
+          regenBrakingTorque: regenT ?? t.regenBrakingTorque,
+          lastUpdated: DateTime.now(),
+        ),
+      );
     } catch (e) {
       log('解析 TNGA 221102 失败: $e');
     }
@@ -911,13 +1035,15 @@ class CarObdService {
       }
       avgCell ??= (maxCell + minCell) / 2.0;
 
-      _updateTelemetry((t) => t.copyWith(
-            maxCellVoltage: maxCell,
-            minCellVoltage: minCell,
-            avgCellVoltage: avgCell,
-            cellDeltaVoltage: delta,
-            lastUpdated: DateTime.now(),
-          ));
+      _updateTelemetry(
+        (t) => t.copyWith(
+          maxCellVoltage: maxCell,
+          minCellVoltage: minCell,
+          avgCellVoltage: avgCell,
+          cellDeltaVoltage: delta,
+          lastUpdated: DateTime.now(),
+        ),
+      );
     } catch (e) {
       log('解析 TNGA 222884 失败: $e');
     }
@@ -933,10 +1059,10 @@ class CarObdService {
       for (int i = 0; i < bytes.length && i < 6; i++) {
         temps.add((bytes[i] - 40).toDouble());
       }
-      _updateTelemetry((t) => t.copyWith(
-            batteryTemperatures: temps,
-            lastUpdated: DateTime.now(),
-          ));
+      _updateTelemetry(
+        (t) =>
+            t.copyWith(batteryTemperatures: temps, lastUpdated: DateTime.now()),
+      );
     } catch (e) {
       log('解析 TNGA 222885 失败: $e');
     }
@@ -958,12 +1084,14 @@ class CarObdService {
         oilT = (bytes[4] - 40).toDouble();
       }
 
-      _updateTelemetry((t) => t.copyWith(
-            electricWaterPumpRpm: actualRpm,
-            electricWaterPumpTargetRpm: targetRpm ?? t.electricWaterPumpTargetRpm,
-            engineOilTemp: oilT ?? t.engineOilTemp,
-            lastUpdated: DateTime.now(),
-          ));
+      _updateTelemetry(
+        (t) => t.copyWith(
+          electricWaterPumpRpm: actualRpm,
+          electricWaterPumpTargetRpm: targetRpm ?? t.electricWaterPumpTargetRpm,
+          engineOilTemp: oilT ?? t.engineOilTemp,
+          lastUpdated: DateTime.now(),
+        ),
+      );
     } catch (e) {
       log('解析 TNGA 221234 失败: $e');
     }
@@ -980,10 +1108,12 @@ class CarObdService {
         raw = (raw << 8) | b;
       }
       final odo = raw / 10.0;
-      _updateTelemetry((t) => t.copyWith(
-            totalOdometerKm: t.totalOdometerKm ?? odo,
-            lastUpdated: DateTime.now(),
-          ));
+      _updateTelemetry(
+        (t) => t.copyWith(
+          totalOdometerKm: t.totalOdometerKm ?? odo,
+          lastUpdated: DateTime.now(),
+        ),
+      );
     } catch (e) {
       log('解析 TNGA 222006 失败: $e');
     }
@@ -1025,15 +1155,17 @@ class CarObdService {
         powerKw = (vb * ib) / 1000.0;
       }
 
-      _updateTelemetry((t) => t.copyWith(
-            batterySoc: soc ?? t.batterySoc,
-            batteryVoltage: vb ?? t.batteryVoltage,
-            batteryCurrent: ib ?? t.batteryCurrent,
-            batteryPowerKw: powerKw ?? t.batteryPowerKw,
-            mg1InverterTemp: mg1T ?? t.mg1InverterTemp,
-            mg2InverterTemp: mg2T ?? t.mg2InverterTemp,
-            lastUpdated: DateTime.now(),
-          ));
+      _updateTelemetry(
+        (t) => t.copyWith(
+          batterySoc: soc ?? t.batterySoc,
+          batteryVoltage: vb ?? t.batteryVoltage,
+          batteryCurrent: ib ?? t.batteryCurrent,
+          batteryPowerKw: powerKw ?? t.batteryPowerKw,
+          mg1InverterTemp: mg1T ?? t.mg1InverterTemp,
+          mg2InverterTemp: mg2T ?? t.mg2InverterTemp,
+          lastUpdated: DateTime.now(),
+        ),
+      );
     } catch (e) {
       log('解析 21C3 失败: $e');
     }
@@ -1048,11 +1180,13 @@ class CarObdService {
       final vl = (bytes[3] * 2).toDouble();
       final vh = (bytes[4] * 2).toDouble();
 
-      _updateTelemetry((t) => t.copyWith(
-            voltageBeforeBoost: vl,
-            voltageAfterBoost: vh,
-            lastUpdated: DateTime.now(),
-          ));
+      _updateTelemetry(
+        (t) => t.copyWith(
+          voltageBeforeBoost: vl,
+          voltageAfterBoost: vh,
+          lastUpdated: DateTime.now(),
+        ),
+      );
     } catch (e) {
       log('解析 21C4 失败: $e');
     }
@@ -1065,17 +1199,22 @@ class CarObdService {
 
     try {
       final oilTemp = (bytes[0] - 40).toDouble();
-      _updateTelemetry((t) => t.copyWith(
-            engineOilTemp: oilTemp,
-            lastUpdated: DateTime.now(),
-          ));
+      _updateTelemetry(
+        (t) => t.copyWith(engineOilTemp: oilTemp, lastUpdated: DateTime.now()),
+      );
     } catch (e) {
       log('解析 21CE 失败: $e');
     }
   }
 
   List<int>? _extractPayloadBytes(String rawResp, String prefixHex) {
-    final clean = _cleanHex(rawResp);
+    final command =
+        (int.parse(prefixHex.substring(0, 2), radix: 16) - 0x40)
+            .toRadixString(16)
+            .padLeft(2, '0')
+            .toUpperCase() +
+        prefixHex.substring(2);
+    final clean = _matchedPayload(rawResp, [command]);
     final idx = clean.indexOf(prefixHex);
     if (idx == -1) return null;
 
@@ -1088,14 +1227,19 @@ class CarObdService {
     return result;
   }
 
-  String _cleanHex(String raw) {
-    // 过滤掉 ELM327 多帧行标号 (如 "0: ", "1: ", "014\n0: ...")
-    final withoutFrameIndex = raw.replaceAll(
-        RegExp(r'(?:^|[\r\n])\s*[0-9A-F]{1,3}\s*:\s*', caseSensitive: false),
-        ' ');
-    return withoutFrameIndex
-        .replaceAll(RegExp(r'[\r\n\s>:]'), '')
-        .toUpperCase();
+  String _matchedPayload(String raw, List<String> commands) {
+    if (raw.startsWith('ERROR:') ||
+        raw.contains('TIMEOUT') ||
+        raw.contains('STOPPED')) {
+      return '';
+    }
+    for (final cmd in commands) {
+      final evidence = ElmObdParser.classify(ElmReply(raw, 'prompt'), cmd);
+      for (final frame in evidence.frames) {
+        if (frame.positive) return frame.payload;
+      }
+    }
+    return '';
   }
 
   // --- 6. 指令发送与串口底层收发 ---
@@ -1103,99 +1247,226 @@ class CarObdService {
     String command, {
     Duration timeout = const Duration(milliseconds: 1200),
   }) async {
-    while (_cmdQueue != null) {
-      try {
-        await _cmdQueue!.future;
-      } catch (_) {}
-    }
-    final queueCompleter = Completer<void>();
-    _cmdQueue = queueCompleter;
+    final reply = await _exchange(command, timeout: timeout);
+    return reply.complete
+        ? reply.raw.replaceAll('>', '').trim()
+        : 'ERROR: ${reply.completion.toUpperCase()}\n${reply.raw}';
+  }
 
+  Future<ElmReply> _exchange(
+    String command, {
+    Duration timeout = const Duration(milliseconds: 1200),
+    bool restoring = false,
+  }) async {
+    if (timeout > const Duration(seconds: 5)) {
+      timeout = const Duration(seconds: 5);
+    }
+    final ownsSequence =
+        _sequenceOwner != null && Zone.current[_sequenceKey] == _sequenceOwner;
+    if ((_isDeepScanning || _sequenceOwner != null) && !ownsSequence) {
+      return ElmReply('', 'busy_transaction');
+    }
+    while (_cmdQueue != null) {
+      await _cmdQueue!.future;
+    }
+    // Recheck after the await: a scan may have reserved the serial transaction.
+    if ((_isDeepScanning || _sequenceOwner != null) && !ownsSequence) {
+      return ElmReply('', 'busy_transaction');
+    }
+    final done = Completer<void>();
+    _cmdQueue = done;
+    final sw = Stopwatch()..start();
+    final started = DateTime.now();
     try {
-      return await _sendRawCommandInternal(command, timeout: timeout);
+      if (_cancelDeepScanRequested &&
+          ownsSequence &&
+          !restoring &&
+          !_isPollingBusy) {
+        return ElmReply('', 'cancelled');
+      }
+      if (!isConnected &&
+          currentTelemetry.status != ObdConnectionStatus.initializing) {
+        return ElmReply('', 'disconnected');
+      }
+      if (!_serialSynchronized) {
+        try {
+          await _drained?.future.timeout(const Duration(milliseconds: 500));
+        } on TimeoutException {
+          return ElmReply(_rxBuffer.toString(), 'unsynchronized_not_sent');
+        }
+        if (!_serialSynchronized) {
+          return ElmReply('', 'unsynchronized_not_sent');
+        }
+      }
+      _rxBuffer.clear();
+      _activeInterrupted = false;
+      final complete = Completer<String>();
+      _cmdCompleter = complete;
+      final data = ascii.encode('${command.trim()}\r');
+      _invalidateAdapterState(command);
+      try {
+        if (_testWriter != null) {
+          await _testWriter!(data).timeout(timeout);
+        } else {
+          final w = _writeCharacteristic;
+          if (w == null) return ElmReply('', 'disconnected');
+          // Do not resend an ambiguous write: it may already have reached the bus.
+          await w
+              .write(data, withoutResponse: w.properties.writeWithoutResponse)
+              .timeout(timeout);
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 25));
+        final remaining = timeout - sw.elapsed;
+        if (remaining <= Duration.zero) throw TimeoutException('write timeout');
+        final raw = await complete.future.timeout(remaining);
+        final completion = raw.trimRight().endsWith('>')
+            ? 'prompt'
+            : (!isConnected ? 'disconnected' : 'cancelled');
+        if (completion != 'prompt' && !_activeInterrupted) {
+          _markUnsynchronized();
+        }
+        final reply = ElmReply(
+          raw,
+          completion,
+          time: started,
+          elapsedMs: sw.elapsedMilliseconds,
+        );
+        if (reply.complete &&
+            (_atOk(command, reply) ||
+                RegExp(
+                  r'^AT(Z|WS|D)$',
+                ).hasMatch(command.trim().toUpperCase()))) {
+          _recordAdapterState(command);
+        }
+        return reply;
+      } on TimeoutException {
+        _markUnsynchronized();
+        return ElmReply(
+          _rxBuffer.toString(),
+          'timeout',
+          time: started,
+          elapsedMs: sw.elapsedMilliseconds,
+        );
+      } catch (e) {
+        _markUnsynchronized();
+        return ElmReply(
+          _rxBuffer.toString(),
+          'write_error: $e',
+          time: started,
+          elapsedMs: sw.elapsedMilliseconds,
+        );
+      } finally {
+        _cmdCompleter = null;
+      }
     } finally {
-      if (_cmdQueue == queueCompleter) {
-        _cmdQueue = null;
-      }
-      if (!queueCompleter.isCompleted) {
-        queueCompleter.complete();
-      }
+      _cmdQueue = null;
+      done.complete();
     }
   }
 
-  Future<String> _sendRawCommandInternal(
-    String command, {
-    Duration timeout = const Duration(milliseconds: 1200),
-  }) async {
-    final writeChar = _writeCharacteristic;
-    if (writeChar == null || _connectedDevice == null) {
-      return 'ERROR: DISCONNECTED';
+  void _markUnsynchronized() {
+    _serialSynchronized = false;
+    _drained ??= Completer<void>();
+  }
+
+  String _atContent(String command, ElmReply reply) => reply.raw
+      .replaceAll('>', '')
+      .split(RegExp(r'[\r\n]+'))
+      .where(
+        (l) =>
+            l.trim().isNotEmpty &&
+            l.replaceAll(' ', '').toUpperCase() !=
+                command.replaceAll(' ', '').toUpperCase(),
+      )
+      .map((l) => l.trim())
+      .join('\n');
+
+  bool _atOk(String command, ElmReply reply) =>
+      reply.complete &&
+      reply.raw
+              .replaceAll('>', '')
+              .split(RegExp(r'[\r\n]+'))
+              .where(
+                (l) =>
+                    l.trim().isNotEmpty &&
+                    l.replaceAll(' ', '').toUpperCase() !=
+                        command.replaceAll(' ', '').toUpperCase(),
+              )
+              .map((l) => l.trim().toUpperCase())
+              .join() ==
+          'OK';
+
+  void _invalidateAdapterState(String command) {
+    // An unacknowledged write may have changed adapter state. Never retain a stale ACK.
+    final cmd=command.replaceAll(' ', '').toUpperCase();
+    if(cmd.startsWith('ATSH')) _knownHeader=null;
+    if(RegExp(r'^ATH[01]$').hasMatch(cmd)) _knownDisplay=null;
+    if(RegExp(r'^ATCAF[01]$').hasMatch(cmd)) _knownFormatting=null;
+    if(cmd.startsWith('ATSP') || cmd.startsWith('ATTP')) {
+      _knownProtocol=null; _knownHeader=null;
     }
+    if(cmd=='ATD' || cmd=='ATZ' || cmd=='ATWS') {
+      _knownHeader=null; _knownDisplay=null; _knownFormatting=null; _knownProtocol=null;
+    }
+  }
 
-    _rxBuffer.clear();
-    _cmdCompleter = Completer<String>();
-
-    final formatted = '${command.trim()}\r';
-    final bytes = ascii.encode(formatted);
-
-    final hasWriteNoResp = writeChar.properties.writeWithoutResponse;
-    final hasWrite = writeChar.properties.write;
-    final useWithoutResponse = hasWriteNoResp;
-
-    try {
-      try {
-        await writeChar.write(bytes, withoutResponse: useWithoutResponse);
-      } catch (e) {
-        if (hasWrite && hasWriteNoResp) {
-          log('⚠️ 切换写入模式重试: withoutResponse=${!useWithoutResponse}');
-          await writeChar.write(bytes, withoutResponse: !useWithoutResponse);
-        } else {
-          rethrow;
-        }
-      }
-
-      // 指令间隔安全延时，保护低功耗蓝牙芯片 FIFO
-      await Future.delayed(const Duration(milliseconds: 25));
-
-      final response = await _cmdCompleter!.future.timeout(
-        timeout,
-        onTimeout: () {
-          final partial = _rxBuffer.toString();
-          log('⏱️ 指令 "$command" 响应超时, 缓冲区内容: "$partial"');
-          return partial.isNotEmpty ? partial : 'TIMEOUT';
-        },
-      );
-      return response.trim();
-    } catch (e) {
-      log('指令 "$command" 发送失败: $e');
-      return 'ERROR: $e';
-    } finally {
-      _cmdCompleter = null;
+  void _recordAdapterState(String command) {
+    final cmd = command.replaceAll(' ', '').toUpperCase();
+    if (cmd.startsWith('ATSH')) _knownHeader = cmd.substring(4);
+    if (RegExp(r'^ATH[01]$').hasMatch(cmd)) _knownDisplay = cmd;
+    if (cmd.startsWith('ATSP')) _knownProtocol = cmd;
+    if (RegExp(r'^ATCAF[01]$').hasMatch(cmd)) _knownFormatting = cmd;
+    if (cmd == 'ATD' || cmd == 'ATZ' || cmd == 'ATWS') {
+      _knownHeader = null;
+      _knownDisplay = null;
+      _knownProtocol = null;
+      _knownFormatting = null;
     }
   }
 
   void _onDataReceived(List<int> data) {
     if (data.isEmpty) return;
-    final text = ascii.decode(data, allowInvalid: true);
-    _rxBuffer.write(text);
-
-    // ELM327 完成一次应答后以 '>' 结束
+    _rxBuffer.write(ascii.decode(data, allowInvalid: true));
     if (_rxBuffer.toString().contains('>')) {
-      final completeResponse = _rxBuffer.toString().replaceAll('>', '').trim();
-      if (_cmdCompleter != null && !_cmdCompleter!.isCompleted) {
-        _cmdCompleter!.complete(completeResponse);
+      if (!_serialSynchronized) {
+        if (_isDeepScanning) {
+          _scanLateReplies.add({
+            'phase': 'late_reply_drain',
+            'raw': _rxBuffer.toString(),
+            'time': DateTime.now().toIso8601String(),
+            'reason':
+                'previous interrupted exchange; not assigned to another PID',
+          });
+        }
+        _serialSynchronized = true;
+        _drained?.complete();
+        _drained = null;
+        return; // Late reply belongs to the previous exchange, never the next PID.
       }
+      final c = _cmdCompleter;
+      if (c != null && !c.isCompleted) c.complete(_rxBuffer.toString());
     }
   }
 
   // --- 7. 连接断开与清理 ---
   void _handleDisconnection() {
     _pollingTimer?.cancel();
+    _cancelDeepScanRequested = _isDeepScanning;
+    if (_cmdCompleter != null && !_cmdCompleter!.isCompleted) {
+      _activeInterrupted = true;
+      _markUnsynchronized();
+      _cmdCompleter!.complete(_rxBuffer.toString());
+    }
+    _knownHeader = null;
+    _knownDisplay = null;
+    _knownProtocol = null;
+    _knownFormatting = null;
     _updateStatus(ObdConnectionStatus.disconnected, message: '蓝牙连接已断开');
     log('🔌 OBD 蓝牙链路已终止');
   }
 
   Future<void> disconnect() async {
+    _handleDisconnection();
     _pollingTimer?.cancel();
     _notifySubscription?.cancel();
     _connectionStateSubscription?.cancel();
@@ -1239,173 +1510,297 @@ class CarObdService {
   void cancelDeepScan() {
     if (_isDeepScanning) {
       _cancelDeepScanRequested = true;
+      if (_cmdCompleter != null &&
+          !_cmdCompleter!.isCompleted &&
+          _scanOwnsSerial && !_restoringScanState) {
+        _activeInterrupted = true;
+        _markUnsynchronized();
+        _cmdCompleter!.complete(_rxBuffer.toString());
+      }
       log('⚠️ 用户请求终止全车深度扫描');
     }
   }
 
   Future<ObdDeepScanReport?> runDeepScan({
     void Function(double progress, String status, ObdDiscoveredItem? newItem)?
-        onProgress,
+    onProgress,
   }) async {
     if (!isConnected || _isDeepScanning) return null;
-    _isDeepScanning = true;
+    _isDeepScanning =
+        true; // Reserve before waiting for any in-flight sequence.
     _cancelDeepScanRequested = false;
     isDeepScanningNotifier.value = true;
-
-    // 暂停周期性轮询，避免总线串口请求冲突
     _pollingTimer?.cancel();
-
-    final startTime = DateTime.now();
-    log('🔬 启动全车深度扫描与数据探索 (Deep Scan)...');
-
-    final discoveredItems = <ObdDiscoveredItem>[];
-    final activeEcus = <String>[];
-    String protocolName = 'ISO 15765-4 CAN 11-bit 500k';
-
     try {
-      // 1. 读取通信协议
-      final dpResp = await sendRawCommand('ATDP');
-      if (dpResp.isNotEmpty && !dpResp.contains('ERROR')) {
-        protocolName = dpResp;
-      }
-
-      // 2. 发现活跃 ECU 节点
-      onProgress?.call(0.04, '正在探测全车在线 ECU 电脑节点...', null);
-      await sendRawCommand('ATH1'); // 临时开启报头
-      final ecuProbeResp =
-          await sendRawCommand('0100', timeout: const Duration(seconds: 3));
-      await sendRawCommand('ATH0'); // 关闭报头
-
-      final ecuMap = {
-        '7E8': 'ECM 发动机控制电脑',
-        '7EA': 'HV 混动系统控制电脑',
-        '7EB': 'EVB 混动动力电池电脑',
-        '7B8': 'Combination Meter 组合仪表',
-        '7D8': 'A/C 空调与车身电脑',
-        '738': 'EPS 电子助力转向',
-        '768': 'TSS 毫米波雷达/主动安全',
-      };
-
-      for (final entry in ecuMap.entries) {
-        if (ecuProbeResp.contains(entry.key)) {
-          activeEcus.add('${entry.key} (${entry.value})');
-        }
-      }
-      if (activeEcus.isEmpty) {
-        activeEcus.add('7E8 (ECM 发动机节点)');
-        activeEcus.add('7EA (HV 混动系统节点)');
-      }
-      log('发现活跃 ECU 节点: $activeEcus');
-
-      // 3. 构建全车探测探针列表
-      final probeList = _buildProbeList();
-      final totalCount = probeList.length;
-      int testedCount = 0;
-      int supportedCount = 0;
-
-      for (final probe in probeList) {
-        if (_cancelDeepScanRequested) {
-          log('⚠️ 深度扫描已被用户提前终止');
-          break;
-        }
-
-        testedCount++;
-        final progress = 0.08 + (testedCount / totalCount) * 0.90;
-        onProgress?.call(
-            progress, '探测 ${probe.category}: ${probe.cmd} (${probe.name})...', null);
-
-        // 切换报头 (若指定特定 ECU)
-        if (probe.header != null) {
-          await sendRawCommand('ATSH${probe.header}');
-        }
-
-        final sw = Stopwatch()..start();
-        final rawResp = await sendRawCommand(probe.cmd,
-            timeout: const Duration(milliseconds: 1400));
-        sw.stop();
-
-        final isSupported = _isResponseValid(rawResp, probe.cmd);
-        String? hint;
-        if (isSupported) {
-          supportedCount++;
-          hint = _formatSampleValue(probe.cmd, rawResp);
-          log('✅ 发现有效数据 [${probe.header ?? "7DF"}] ${probe.cmd} (${probe.name}): $rawResp ${hint != null ? "-> $hint" : ""}');
-        }
-
-        final item = ObdDiscoveredItem(
-          category: probe.category,
-          header: probe.header ?? '7DF',
-          command: probe.cmd,
-          name: probe.name,
-          rawHexResponse: rawResp,
-          decodedHint: hint,
-          responseTimeMs: sw.elapsedMilliseconds,
-          isSupported: isSupported,
-        );
-        discoveredItems.add(item);
-        onProgress?.call(
-            progress, '已测 $testedCount/$totalCount (开放 $supportedCount 项)', item);
-
-        // 微小停顿，避免过密占用 CAN 总线
-        await Future.delayed(const Duration(milliseconds: 30));
-      }
-
-      // 还原广播报头
-      await sendRawCommand('ATSH7DF');
-      await sendRawCommand('ATH0');
-
-      final report = ObdDeepScanReport(
-        startTime: startTime,
-        endTime: DateTime.now(),
-        deviceName: connectedDeviceName ?? 'Veepeak OBDCheck BLE+',
-        protocolName: protocolName,
-        activeEcus: activeEcus,
-        items: discoveredItems,
-        totalTested: testedCount,
-        totalSupported: supportedCount,
-      );
-
-      lastDeepScanReportNotifier.value = report;
-      log('🎉 深度扫描完成！共测试 $testedCount 项，车辆开放响应 $supportedCount 项');
-      return report;
-    } catch (e) {
-      log('❌ 深度扫描异常: $e');
-      return null;
+      return await _sequence(() => _runDeepScanOwned(onProgress));
     } finally {
       _isDeepScanning = false;
       _cancelDeepScanRequested = false;
       isDeepScanningNotifier.value = false;
-      // 恢复常规轮询
       _startPolling();
     }
   }
 
-  bool _isResponseValid(String raw, String cmd) {
-    if (raw.isEmpty ||
-        raw.contains('NO DATA') ||
-        raw.contains('UNABLE') ||
-        raw.contains('ERROR') ||
-        raw.contains('TIMEOUT') ||
-        raw.contains('7F')) {
-      return false;
+  Future<ObdDeepScanReport> _runDeepScanOwned(
+    void Function(double, String, ObdDiscoveredItem?)? onProgress,
+  ) async {
+    // The sequence lock drains polling; drain a manual command that preceded it too.
+    while (_cmdQueue != null) {
+      await _cmdQueue!.future;
     }
-    final clean = _cleanHex(raw);
-    if (clean.length < 4) return false;
+    _scanOwnsSerial = true;
+    _scanLateReplies.clear();
+    final start = DateTime.now();
+    final items = <ObdDiscoveredItem>[];
+    final ecus = <String>{};
+    final trace = <Map<String, dynamic>>[];
+    final savedHeader = _knownHeader;
+    final savedDisplay = _knownDisplay;
+    final savedProtocol = _knownProtocol;
+    final savedFormatting = _knownFormatting;
+    var protocol = 'unknown';
+    var outcome = 'completed';
+    var touched = false;
+    var restored = true;
+    void progress(double p, String status, ObdDiscoveredItem? item) {
+      // A disposed/debug UI must not abort restoration or discard evidence.
+      try {
+        onProgress?.call(p, status, item);
+      } catch (e) {
+        log('扫描进度显示异常: $e');
+      }
+    }
 
-    // 针对 Mode 01: 正响应以 41 开头
-    if (cmd.startsWith('01') && clean.contains('41')) return true;
-    // 针对 Mode 09: 正响应以 49 开头
-    if (cmd.startsWith('09') && clean.contains('49')) return true;
-    // 针对 Mode 21: 正响应以 61 开头
-    if (cmd.startsWith('21') && clean.contains('61')) return true;
-    // 针对 Mode 22: 正响应以 62 开头
-    if (cmd.startsWith('22') && clean.contains('62')) return true;
+    Future<ElmReply> exchange(String cmd, {bool restoring = false}) async {
+      final r = await _exchange(
+        cmd,
+        timeout: const Duration(milliseconds: 1400),
+        restoring: restoring,
+      );
+      trace.add({
+        'command': cmd,
+        'phase': restoring ? 'restore' : 'scan',
+        'request_header': _knownHeader ?? 'unknown',
+        ...r.toJson(),
+      });
+      return r;
+    }
 
-    return true;
+    Future<void> setting(String cmd) async {
+      final r = await exchange(cmd);
+      if (!_atOk(cmd, r)) {
+        throw StateError('adapter_setting_failed: $cmd (${r.completion})');
+      }
+    }
+
+    try {
+      trace.add({
+        'phase': 'snapshot',
+        'header': savedHeader ?? 'unknown',
+        'display': savedDisplay ?? 'unknown',
+        'protocol_setting': savedProtocol ?? 'unknown',
+        'CAN_formatting': savedFormatting ?? 'unknown',
+        'scope':
+            '57 fixed probes + explicit 0100 discovery; no extra bitmap walk',
+      });
+      if (_cancelDeepScanRequested) {
+        outcome = isConnected ? 'cancelled' : 'disconnected';
+      } else {
+        final dp = await exchange('ATDP');
+        if (dp.complete) protocol = _atContent('ATDP', dp);
+        if (!dp.complete) throw StateError('protocol_query_incomplete');
+        // Scan profile uses 11-bit CAN addressing. Do not silently change a manual protocol.
+        final dpn = await exchange('ATDPN');
+        final number = _atContent('ATDPN', dpn).toUpperCase();
+        if (!dpn.complete || (number != '6' && number != 'A6')) {
+          throw StateError('scan_requires_CAN_11bit_500k; observed $number');
+        }
+        touched = true;
+        await setting('ATSH7DF');
+        await setting('ATH1');
+        await setting('ATCAF1');
+        progress(0.02, '显式 0100 响应节点发现（不是全部 ECU 遍历）', null);
+        final discovery = await exchange('0100');
+        final classified = ElmObdParser.classify(discovery, '0100');
+        trace.add({
+          'phase': 'ECU_discovery',
+          'reason': classified.reason,
+          'frames': classified.frames.map((f) => f.toJson()).toList(),
+        });
+        ecus.addAll(
+          classified.frames
+              .where((f) => f.positive && f.ecu != 'unknown')
+              .map((f) => f.ecu),
+        );
+        if (!discovery.complete) {
+          throw StateError('discovery_${discovery.completion}');
+        }
+        final probes = _buildProbeList();
+        for (final probe in probes) {
+          if (_cancelDeepScanRequested || !isConnected) {
+            outcome = isConnected ? 'cancelled' : 'disconnected';
+            break;
+          }
+          final header = probe.header ?? '7DF';
+          // Always explicit, including broadcast probes after a physical target.
+          final h = await exchange('ATSH$header');
+          ElmReply r;
+          ObdResponseEvidence evidence;
+          if (!_atOk('ATSH$header', h)) {
+            r = ElmReply(
+              '',
+              'not_sent_header_failed',
+              time: h.time,
+              elapsedMs: h.elapsedMs,
+            );
+            evidence = ObdResponseEvidence(
+              const [],
+              'header_setting_failed (see trace)',
+            );
+          } else {
+            r = await exchange(probe.cmd);
+            evidence = ElmObdParser.classify(r, probe.cmd);
+          }
+          final candidate =
+              probe.cmd.startsWith('21') || probe.cmd.startsWith('22');
+          String? hint;
+          if (!candidate && evidence.positive) {
+            // Decode only a complete matched payload from one ECU, never joined frames/ECUs.
+            final payload = evidence.frames
+                .firstWhere((f) => f.positive)
+                .payload;
+            hint = _formatSampleValue(probe.cmd, payload);
+          }
+          final item = ObdDiscoveredItem(
+            category: probe.category,
+            header: header,
+            command: probe.cmd,
+            name: probe.name,
+            rawHexResponse: r.raw,
+            decodedHint: hint,
+            responseTimeMs: r.elapsedMs,
+            isSupported: evidence.positive,
+            reason: evidence.reason,
+            completion: r.completion,
+            time: r.time,
+            frames: evidence.frames,
+            candidate: candidate,
+          );
+          items.add(item);
+          ecus.addAll(
+            evidence.frames
+                .where((f) => f.positive && f.ecu != 'unknown')
+                .map((f) => f.ecu),
+          );
+          progress(
+            items.length / probes.length,
+            '已测 ${items.length}/${probes.length}；匹配响应 ${items.where((i) => i.isSupported).length}',
+            item,
+          );
+          if (!r.complete) {
+            outcome = !isConnected
+                ? 'disconnected'
+                : _cancelDeepScanRequested
+                ? 'cancelled'
+                : 'incomplete_transport';
+            break; // No blind retry or further PID after an ambiguous exchange.
+          }
+        }
+      }
+    } catch (e) {
+      outcome = _cancelDeepScanRequested
+          ? (!isConnected ? 'disconnected' : 'cancelled')
+          : 'error';
+      trace.add({'phase': 'error', 'reason': e.toString()});
+    } finally {
+      _restoringScanState=true;
+      if (touched) {
+        // Protocol was queried only, never changed. Restore only settings we changed.
+        trace.add({
+          'phase': 'restore_plan',
+          'protocol': 'unchanged_by_scan',
+          'CAN_formatting_origin': savedFormatting == null
+              ? 'unknown; explicit CAF1 fallback'
+              : 'observed ACK',
+          'header_origin': savedHeader == null
+              ? 'unknown; explicit safe broadcast fallback'
+              : 'observed ACK',
+          'display_origin': savedDisplay == null
+              ? 'unknown; explicit ATH0 fallback'
+              : 'observed ACK',
+        });
+        for (final cmd in [
+          savedFormatting ?? 'ATCAF1',
+          'ATSH${savedHeader ?? "7DF"}',
+          savedDisplay ?? 'ATH0',
+        ]) {
+          if (!isConnected) {
+            restored = false;
+            trace.add({
+              'phase': 'restore',
+              'command': cmd,
+              'completion': 'not_sent_disconnected',
+            });
+            continue;
+          }
+          try {
+            final r = await exchange(cmd, restoring: true);
+            final ok = _atOk(cmd, r);
+            trace.add({
+              'phase': 'restore_result',
+              'command': cmd,
+              'acknowledged': ok,
+            });
+            if (!ok) restored = false;
+          } catch (e) {
+            restored = false;
+            trace.add({
+              'phase': 'restore',
+              'command': cmd,
+              'error': e.toString(),
+            });
+          }
+        }
+      }
+      _pollingSuspended = !restored || !_serialSynchronized;
+      trace.addAll(_scanLateReplies);
+      _scanLateReplies.clear();
+      _scanOwnsSerial = false;
+      _restoringScanState=false;
+      trace.add({
+        'phase': 'final',
+        'restoration_acknowledged': touched ? restored : null,
+        'polling_suspended': _pollingSuspended,
+        'connected': isConnected,
+      });
+    }
+    final report = ObdDeepScanReport(
+      startTime: start,
+      endTime: DateTime.now(),
+      deviceName: connectedDeviceName ?? 'unknown',
+      protocolName: protocol,
+      activeEcus: ecus.toList()..sort(),
+      items: items,
+      totalTested: items.length,
+      totalSupported: items.where((i) => i.isSupported).length,
+      outcome: outcome,
+      trace: trace,
+    );
+    lastDeepScanReportNotifier.value = report;
+    log(
+      '扫描结束: $outcome；已测 ${items.length}；匹配响应 ${report.totalSupported}；恢复确认 ${touched ? restored : '未执行（未改状态）'}',
+    );
+    return report;
   }
 
   String? _formatSampleValue(String cmd, String raw) {
-    if (cmd == '010D') {
+    if (cmd == '0104' || cmd == '012F') {
+      final p = _parsePercent(raw);
+      if (p != null) return '${p.toStringAsFixed(1)}%';
+    } else if (cmd == '010F') {
+      final t = _parseStandardTemp(raw);
+      if (t != null) return '${t.toStringAsFixed(1)} °C';
+    } else if (cmd == '010D') {
       final s = _parseStandardSpeed(raw);
       if (s != null) return '${s.toInt()} km/h (车速)';
     } else if (cmd == '010C') {
@@ -1468,67 +1863,6 @@ class CarObdService {
     } else if (cmd == '014C') {
       final p = _parsePercent(raw);
       if (p != null) return '${p.toStringAsFixed(1)}% (节气门作动器指令)';
-    } else if (cmd == '221024') {
-      final bytes = _extractPayloadBytes(raw, '621024');
-      if (bytes != null && bytes.length >= 3) {
-        final soc = (bytes[0] * 100.0 / 255.0).toStringAsFixed(1);
-        final v = (((bytes[1] << 8) | bytes[2]) * 0.1).toStringAsFixed(1);
-        return 'TNGA核心: SOC $soc%, 电池总压 $v V';
-      }
-      return 'TNGA混动核心遥测 (包含电池SoC/总电压/充放电流)';
-    } else if (cmd == '221100') {
-      final bytes = _extractPayloadBytes(raw, '621100');
-      if (bytes != null && bytes.length >= 4) {
-        final vl = (((bytes[0] << 8) | bytes[1]) * 0.1).toStringAsFixed(1);
-        final vh = (((bytes[2] << 8) | bytes[3]) * 0.1).toStringAsFixed(1);
-        return 'TNGA升压: VL $vl V -> VH $vh V';
-      }
-      return 'TNGA升压变压器与逆变器热管理';
-    } else if (cmd == '221102') {
-      final bytes = _extractPayloadBytes(raw, '621102');
-      if (bytes != null && bytes.length >= 4) {
-        int rawMg1 = (bytes[0] << 8) | bytes[1];
-        if (rawMg1 > 32767) rawMg1 -= 65536;
-        int rawMg2 = (bytes[2] << 8) | bytes[3];
-        if (rawMg2 > 32767) rawMg2 -= 65536;
-        return 'TNGA双电机: MG1 $rawMg1 rpm, MG2 $rawMg2 rpm';
-      }
-      return 'TNGA双电机工况与再生制动力矩';
-    } else if (cmd == '222884') {
-      final bytes = _extractPayloadBytes(raw, '622884');
-      if (bytes != null && bytes.length >= 4) {
-        final maxV = (((bytes[0] << 8) | bytes[1]) / 1000.0).toStringAsFixed(2);
-        final minV = (((bytes[2] << 8) | bytes[3]) / 1000.0).toStringAsFixed(2);
-        return 'TNGA电芯: 最高 $maxV V, 最低 $minV V';
-      }
-      return 'TNGA动力电芯极值与单体压差';
-    } else if (cmd == '222885') {
-      return 'TNGA动力电池包 6 点温感监控';
-    } else if (cmd == '221234') {
-      final bytes = _extractPayloadBytes(raw, '621234');
-      if (bytes != null && bytes.length >= 2) {
-        final rpm = (bytes[0] << 8) | bytes[1];
-        return '电子水泵实际转速 $rpm rpm';
-      }
-      return 'TNGA电子水泵与高阶热管理';
-    } else if (cmd == '222006') {
-      final bytes = _extractPayloadBytes(raw, '622006');
-      if (bytes != null && bytes.length >= 3) {
-        int rawOdo = 0;
-        for (final b in bytes.take(4)) {
-          rawOdo = (rawOdo << 8) | b;
-        }
-        return '总里程: ${(rawOdo / 10.0).toStringAsFixed(1)} km';
-      }
-      return '系统记录总里程';
-    } else if (cmd == '21C3') {
-      return '旧版混动遥测 (Prius 3代兼容)';
-    } else if (cmd == '21C4') {
-      return '旧版升压遥测 (Prius 3代兼容)';
-    } else if (cmd == '21CE') {
-      return '油温与动力总成高阶参数';
-    } else if (cmd == '0902') {
-      return '车辆 VIN 码';
     }
     return null;
   }
@@ -1585,19 +1919,49 @@ class CarObdService {
 
       // 3. 丰田 TNGA 第四代 THS-II 混动核心 (Header 0x7E2 / 0x7EB)
       _ProbeEntry('TNGA混动', '7E2', '221024', 'TNGA 电池遥测 (SOC, VB, IB, 充放功率)'),
-      _ProbeEntry('TNGA混动', '7E2', '221100', 'TNGA 升压与逆变器温 (VL, VH, MG1/MG2, 油温)'),
-      _ProbeEntry('TNGA混动', '7E2', '221102', 'TNGA 双电机与再生力矩 (MG1/MG2 RPM, MG2/再生扭矩)'),
+      _ProbeEntry(
+        'TNGA混动',
+        '7E2',
+        '221100',
+        'TNGA 升压与逆变器温 (VL, VH, MG1/MG2, 油温)',
+      ),
+      _ProbeEntry(
+        'TNGA混动',
+        '7E2',
+        '221102',
+        'TNGA 双电机与再生力矩 (MG1/MG2 RPM, MG2/再生扭矩)',
+      ),
       _ProbeEntry('TNGA电池', '7EB', '222884', 'TNGA 电芯极值 (最高单体, 最低单体, 压差)'),
-      _ProbeEntry('TNGA电池', '7EB', '222885', 'TNGA 电池包 6 点温感监控 (Pack Temperatures)'),
-      _ProbeEntry('TNGA混动', '7E2', '222006', 'UDS 混动系统记录里程 (HV Total Odometer)'),
-      _ProbeEntry('TNGA混动', '7E2', '220101', 'UDS 混动电池包扩充遥测 (Battery Pack Ext)'),
+      _ProbeEntry(
+        'TNGA电池',
+        '7EB',
+        '222885',
+        'TNGA 电池包 6 点温感监控 (Pack Temperatures)',
+      ),
+      _ProbeEntry(
+        'TNGA混动',
+        '7E2',
+        '222006',
+        'UDS 混动系统记录里程 (HV Total Odometer)',
+      ),
+      _ProbeEntry(
+        'TNGA混动',
+        '7E2',
+        '220101',
+        'UDS 混动电池包扩充遥测 (Battery Pack Ext)',
+      ),
       _ProbeEntry('TNGA混动', '7E2', '21C3', '兼容旧版混动矩阵 (Legacy Prius 21C3)'),
       _ProbeEntry('TNGA混动', '7E2', '21C4', '兼容旧版升压变压器 (Legacy Prius 21C4)'),
 
       // 4. 丰田 TNGA 发动机 ECM (Header 0x7E0)
       _ProbeEntry('TNGA发动机', '7E0', '221234', '电子冷却水泵实际/目标转速与机油温'),
       _ProbeEntry('TNGA发动机', '7E0', '222006', 'ECM 记录总里程 (ECM Total Odometer)'),
-      _ProbeEntry('TNGA发动机', '7E0', '222008', '累计燃油消耗总量 (Total Fuel Consumed L)'),
+      _ProbeEntry(
+        'TNGA发动机',
+        '7E0',
+        '222008',
+        '累计燃油消耗总量 (Total Fuel Consumed L)',
+      ),
       _ProbeEntry('TNGA发动机', '7E0', '21CE', '兼容旧版机油温度与压力 (Legacy ECM 21CE)'),
     ];
   }
@@ -1628,7 +1992,8 @@ class CarObdService {
         for (final c in service.characteristics) {
           final cUuid = c.uuid.str128.toLowerCase();
           final props = c.properties;
-          if (cUuid.contains('fff2') || (props.write || props.writeWithoutResponse)) {
+          if (cUuid.contains('fff2') ||
+              (props.write || props.writeWithoutResponse)) {
             if (props.write || props.writeWithoutResponse) w ??= c;
           }
           if (cUuid.contains('fff1') || (props.notify || props.indicate)) {
@@ -1655,9 +2020,11 @@ class CarObdService {
         for (final c in service.characteristics) {
           final cUuid = c.uuid.str128.toLowerCase();
           final props = c.properties;
-          if (cUuid.contains('6e400002') && (props.write || props.writeWithoutResponse)) {
+          if (cUuid.contains('6e400002') &&
+              (props.write || props.writeWithoutResponse)) {
             w = c;
-          } else if (cUuid.contains('6e400003') && (props.notify || props.indicate)) {
+          } else if (cUuid.contains('6e400003') &&
+              (props.notify || props.indicate)) {
             n = c;
           }
         }
@@ -1681,10 +2048,14 @@ class CarObdService {
         for (final c in service.characteristics) {
           final cUuid = c.uuid.str128.toLowerCase();
           final props = c.properties;
-          if ((cUuid.contains('1e4d') || props.write || props.writeWithoutResponse) && w == null) {
+          if ((cUuid.contains('1e4d') ||
+                  props.write ||
+                  props.writeWithoutResponse) &&
+              w == null) {
             if (props.write || props.writeWithoutResponse) w = c;
           }
-          if ((cUuid.contains('8841') || props.notify || props.indicate) && n == null) {
+          if ((cUuid.contains('8841') || props.notify || props.indicate) &&
+              n == null) {
             if (props.notify || props.indicate) n = c;
           }
         }
@@ -1734,7 +2105,8 @@ class CarObdService {
         for (final c in service.characteristics) {
           final cUuid = c.uuid.str128.toLowerCase();
           final props = c.properties;
-          if (cUuid.contains('ffe1') || (props.write || props.writeWithoutResponse)) {
+          if (cUuid.contains('ffe1') ||
+              (props.write || props.writeWithoutResponse)) {
             if (props.write || props.writeWithoutResponse) w ??= c;
             if (props.notify || props.indicate) n ??= c;
           }
@@ -1795,8 +2167,9 @@ class CarObdService {
   }
 
   @visibleForTesting
-  ObdGattChannel? resolveObdGattChannelForTesting(List<BluetoothService> services) =>
-      _resolveObdGattChannel(services);
+  ObdGattChannel? resolveObdGattChannelForTesting(
+    List<BluetoothService> services,
+  ) => _resolveObdGattChannel(services);
 
   @visibleForTesting
   double? parseStandardSpeed(String resp) => _parseStandardSpeed(resp);

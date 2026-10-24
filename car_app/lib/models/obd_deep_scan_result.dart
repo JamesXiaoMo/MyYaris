@@ -1,13 +1,22 @@
-class ObdDiscoveredItem {
-  final String category; // e.g. '标准OBD (Mode 01)', '丰田混动 (0x7E2)', '发动机ECM (0x7E0)', '车辆信息 (Mode 09)'
-  final String header; // e.g. '7DF', '7E2', '7E0'
-  final String command; // e.g. '010D', '21C3', '221024'
-  final String name; // e.g. '车速 (Vehicle Speed)', '混动核心遥测 (HV Matrix)'
-  final String rawHexResponse; // 原始 HEX 应答
-  final String? decodedHint; // 解码预览值 (若已知)
-  final int responseTimeMs; // 应答耗时
-  final bool isSupported; // 是否有效响应 (非 NO DATA / UNABLE / ERROR)
+import 'dart:convert';
+import 'elm_obd_response.dart';
 
+class ObdDiscoveredItem {
+  final String category;
+  final String header;
+  final String command;
+  final String name;
+  final String rawHexResponse;
+  final String? decodedHint;
+  final int responseTimeMs;
+
+  /// Compatibility name: a matched response, not proof of vehicle-wide support.
+  final bool isSupported;
+  final String reason;
+  final String completion;
+  final DateTime? time;
+  final List<ObdFrameEvidence> frames;
+  final bool candidate;
   const ObdDiscoveredItem({
     required this.category,
     required this.header,
@@ -17,23 +26,35 @@ class ObdDiscoveredItem {
     this.decodedHint,
     required this.responseTimeMs,
     required this.isSupported,
+    this.reason = 'unknown',
+    this.completion = 'unknown',
+    this.time,
+    this.frames = const [],
+    this.candidate = false,
   });
-
-  Map<String, dynamic> toJson() {
-    return {
-      'category': category,
-      'header': header,
-      'command': command,
-      'name': name,
-      'raw_hex': rawHexResponse,
-      'decoded_hint': decodedHint,
-      'response_time_ms': responseTimeMs,
-      'is_supported': isSupported,
-    };
-  }
+  Map<String, dynamic> toJson() => {
+    'category': category,
+    'request_header': header,
+    'command': command,
+    'name': name,
+    'raw_hex': rawHexResponse,
+    'decoded_hint': decodedHint,
+    'response_time_ms': responseTimeMs,
+    'matched_response': isSupported,
+    'reason': reason,
+    'completion': completion,
+    'time': time?.toIso8601String(),
+    'candidate_unverified': candidate,
+    'received_ecu_headers': frames.isEmpty
+        ? ['unknown']
+        : frames.map((f) => f.ecu).toSet().toList(),
+    'frames': frames.map((e) => e.toJson()).toList(),
+  };
 }
 
 class ObdDeepScanReport {
+  static const sensitiveNotice =
+      '报告可能包含 VIN、车辆标识及原始诊断数据。仅保存在 App 私有目录；复制或分享前请确认接收方，不要提交到公开仓库。';
   final DateTime startTime;
   final DateTime? endTime;
   final String deviceName;
@@ -42,7 +63,8 @@ class ObdDeepScanReport {
   final List<ObdDiscoveredItem> items;
   final int totalTested;
   final int totalSupported;
-
+  final String outcome;
+  final List<Map<String, dynamic>> trace;
   const ObdDeepScanReport({
     required this.startTime,
     this.endTime,
@@ -52,55 +74,72 @@ class ObdDeepScanReport {
     this.items = const [],
     required this.totalTested,
     required this.totalSupported,
+    this.outcome = 'completed',
+    this.trace = const [],
   });
-
-  Map<String, dynamic> toJson() {
-    return {
-      'start_time': startTime.toIso8601String(),
-      'end_time': endTime?.toIso8601String(),
-      'device_name': deviceName,
-      'protocol_name': protocolName,
-      'active_ecus': activeEcus,
-      'total_tested': totalTested,
-      'total_supported': totalSupported,
-      'support_rate': totalTested > 0 ? '${(totalSupported / totalTested * 100).toStringAsFixed(1)}%' : '0%',
-      'items': items.map((e) => e.toJson()).toList(),
-    };
-  }
-
+  int get parsedCount =>
+      items.where((i) => i.decodedHint != null && !i.candidate).length;
+  Map<String, dynamic> toJson() => {
+    'schema_version': 2,
+    'sensitive_notice': sensitiveNotice,
+    'scope':
+        'Fixed 57 candidate probes plus explicit ECU discovery 0100; not all ECUs or vehicle capability coverage.',
+    'start_time': startTime.toIso8601String(),
+    'end_time': endTime?.toIso8601String(),
+    'device_name': deviceName,
+    'protocol_name': protocolName,
+    'active_ecus': activeEcus,
+    'outcome': outcome,
+    'total_tested': totalTested,
+    'matched_response_count': totalSupported,
+    'parsed_count': parsedCount,
+    'items': items.map((e) => e.toJson()).toList(),
+    'trace': trace,
+  };
+  String toJsonText() => const JsonEncoder.withIndent('  ').convert(toJson());
   String toMarkdown() {
-    final sb = StringBuffer();
-    sb.writeln('# 丰田 Yaris Z 混动 (2022) OBD 全车深度扫描报告');
-    sb.writeln();
-    sb.writeln('> **扫描时间**：${startTime.toLocal().toString().substring(0, 19)}');
-    sb.writeln('> **诊断适配器**：$deviceName');
-    sb.writeln('> **通信协议**：$protocolName');
-    sb.writeln('> **探测结果**：共测试 **$totalTested** 项，车辆成功开放响应 **$totalSupported** 项（支持率 ${(totalTested > 0 ? totalSupported * 100.0 / totalTested : 0).toStringAsFixed(1)}%）');
-    sb.writeln();
-    sb.writeln('### 一、 车辆活跃 ECU 节点发现');
-    if (activeEcus.isEmpty) {
-      sb.writeln('- 未识别到独立 ECU 节点');
-    } else {
-      for (final ecu in activeEcus) {
-        sb.writeln('- `$ecu`');
+    final b = StringBuffer('# OBD 扫描证据报告\n\n');
+    b.writeln('> $sensitiveNotice\n');
+    b.writeln(
+      '- 时间：${startTime.toIso8601String()} — ${endTime?.toIso8601String() ?? "unknown"}',
+    );
+    b.writeln('- 适配器：$deviceName；协议：$protocolName；结果：$outcome');
+    b.writeln(
+      '- 已测 $totalTested 项；匹配响应 $totalSupported 项；标准值解析 $parsedCount 项。',
+    );
+    b.writeln(
+      '- 范围：固定 57 项候选（40 Mode 01、4 Mode 09、13 私有）及显式 0100 节点发现；不是全车支持率或全部 ECU 遍历。',
+    );
+    b.writeln(
+      '- 已识别响应 ECU：${activeEcus.isEmpty ? "未发现（不虚构节点）" : activeEcus.join(", ")}\n',
+    );
+    for (final i in items) {
+      b.writeln(
+        '## ${i.command} ${i.name}${i.candidate ? "（候选/地址与解码未验证）" : ""}\n',
+      );
+      b.writeln(
+        '- 请求 header：${i.header}；时间：${i.time?.toIso8601String() ?? "unknown"}；耗时：${i.responseTimeMs} ms',
+      );
+      b.writeln('- 判定：${i.reason}；完成状态：${i.completion}；匹配响应：${i.isSupported}');
+      b.writeln(
+        '- 接收 ECU：${i.frames.isEmpty ? "unknown" : i.frames.map((f) => f.ecu).toSet().join(", ")}',
+      );
+      if (i.decodedHint != null) b.writeln('- 解析：${i.decodedHint}');
+      // Indent raw data rather than fencing: arbitrary replies cannot terminate a fence.
+      b.writeln('\n原始完整回复：\n');
+      for (final line in i.rawHexResponse.split('\n')) {
+        b.writeln('    $line');
       }
+      b.writeln('\n逐帧判定：\n');
+      for (final f in i.frames) {
+        b.writeln('    ${jsonEncode(f.toJson())}');
+      }
+      b.writeln();
     }
-    sb.writeln();
-    sb.writeln('### 二、 车辆成功开放的数据清单 (已验证有效响应)');
-    sb.writeln('| 分类 | ECU 寻址 | 指令/PID | 传感器名称 | 原始 HEX 响应 | 采样解析/说明 |');
-    sb.writeln('| :--- | :--- | :--- | :--- | :--- | :--- |');
-
-    final supportedItems = items.where((i) => i.isSupported).toList();
-    for (final item in supportedItems) {
-      final safeHex = item.rawHexResponse.length > 32
-          ? '${item.rawHexResponse.substring(0, 32)}...'
-          : item.rawHexResponse;
-      sb.writeln('| ${item.category} | `0x${item.header}` | `${item.command}` | ${item.name} | `$safeHex` | ${item.decodedHint ?? "原始多字节报文"} |');
+    b.writeln('## 事务与恢复证据\n');
+    for (final t in trace) {
+      b.writeln('    ${jsonEncode(t)}');
     }
-
-    sb.writeln();
-    sb.writeln('---');
-    sb.writeln('*报告由 MyYaris 车机助手 (Ottocast P3 Pro) 自动化深度探测引擎生成*');
-    return sb.toString();
+    return b.toString();
   }
 }

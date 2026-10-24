@@ -47,3 +47,6 @@ android/app/release
 key.properties
 local.properties
 just_audio_cache/
+
+# Kotlin compiler session cache
+android/.kotlin/

@@ -2,9 +2,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../models/obd_deep_scan_result.dart';
 import '../services/car_obd_service.dart';
+import '../services/obd_report_export_service.dart';
 
 class ObdDeepScanDialog extends StatefulWidget {
-  const ObdDeepScanDialog({super.key});
+  const ObdDeepScanDialog({super.key, this.service});
+  final CarObdService? service;
 
   static Future<void> show(BuildContext context) {
     return showDialog(
@@ -19,11 +21,11 @@ class ObdDeepScanDialog extends StatefulWidget {
 }
 
 class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
-  final CarObdService _obd = CarObdService();
+  late final CarObdService _obd = widget.service ?? CarObdService();
   final ScrollController _listScrollController = ScrollController();
 
   double _progress = 0.0;
-  String _statusMessage = '就绪：点击下方【开始深度扫描】探测全车开放数据';
+  String _statusMessage = '就绪：点击下方【开始深度扫描】扫描固定 57 项候选；不代表全车能力';
   final List<ObdDiscoveredItem> _discoveredItems = [];
   List<String> _activeEcus = [];
   ObdDeepScanReport? _report;
@@ -39,12 +41,13 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
       _activeEcus = existingReport.activeEcus;
       _progress = 1.0;
       _statusMessage =
-          '上次扫描结果：共测试 ${existingReport.totalTested} 项，车辆开放 ${existingReport.totalSupported} 项';
+          '上次扫描结果：共测试 ${existingReport.totalTested} 项，匹配响应 ${existingReport.totalSupported} 项';
     }
   }
 
   @override
   void dispose() {
+    if (_isScanning) _obd.cancelDeepScan();
     _listScrollController.dispose();
     super.dispose();
   }
@@ -52,15 +55,35 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
   Future<void> _startScan() async {
     if (!_obd.isConnected) {
       setState(() {
-        _statusMessage = '⚠️ 请先在主界面点击【扫描 OBD】连接 Veepeak 适配器，再执行全车扫描';
+        _statusMessage = '⚠️ 请先在主界面点击【扫描 OBD】连接 Veepeak 适配器，再执行候选扫描';
       });
       return;
     }
 
+    final proceed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('确认扫描工况与范围'),
+        content: const Text(
+          '仅在车辆停稳、允许诊断时开始。将执行显式 0100 节点发现及固定 57 项候选（含 13 项地址/解码未验证的私有请求，7EB 请求地址存疑）。不会遍历所有 ECU，也不代表全部能力。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('车辆已停稳，开始'),
+          ),
+        ],
+      ),
+    );
+    if (proceed != true || !mounted) return;
     setState(() {
       _isScanning = true;
       _progress = 0.02;
-      _statusMessage = '正在准备全车诊断探针...';
+      _statusMessage = '正在准备固定候选诊断探针...';
       _discoveredItems.clear();
       _activeEcus.clear();
       _report = null;
@@ -87,7 +110,7 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
           _activeEcus = report.activeEcus;
           _progress = 1.0;
           _statusMessage =
-              '扫描完毕！共测试 ${report.totalTested} 项，车辆成功开放 ${report.totalSupported} 项';
+              '${report.outcome}：已测 ${report.totalTested}，响应 ${report.totalSupported}，解析 ${report.parsedCount}；恢复状态见报告';
         } else {
           _statusMessage = '扫描已中止或未完成';
         }
@@ -102,8 +125,46 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
     });
   }
 
-  void _copyMarkdownReport() {
-    if (_report == null) return;
+  Future<bool> _confirmSensitive() async =>
+      await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('报告含敏感车辆数据'),
+          content: const Text(ObdDeepScanReport.sensitiveNotice),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('取消'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('确认'),
+            ),
+          ],
+        ),
+      ) ??
+      false;
+
+  Future<void> _exportReport({bool share = false}) async {
+    final report = _report;
+    if (report == null || !await _confirmSensitive() || !mounted) return;
+    try {
+      final path = await ObdReportExportService.export(report, share: share);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('JSON + Markdown 已保存到 App 私有目录：$path')),
+      );
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('导出失败：$e')));
+      }
+    }
+  }
+
+  Future<void> _copyMarkdownReport() async {
+    if (_report == null || !await _confirmSensitive() || !mounted) return;
     final md = _report!.toMarkdown();
     Clipboard.setData(ClipboardData(text: md));
     ScaffoldMessenger.of(context).showSnackBar(
@@ -131,18 +192,21 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
               children: [
                 Icon(Icons.description, color: Colors.tealAccent, size: 20),
                 SizedBox(width: 8),
-                Text('全车开放数据报告 (Markdown)',
-                    style: TextStyle(color: Colors.white, fontSize: 15)),
+                Text(
+                  '完整扫描证据 (Markdown)',
+                  style: TextStyle(color: Colors.white, fontSize: 15),
+                ),
               ],
             ),
             IconButton(
               icon: const Icon(Icons.copy, color: Colors.tealAccent, size: 18),
               tooltip: '一键复制',
-              onPressed: () {
+              onPressed: () async {
+                if (!await _confirmSensitive() || !mounted) return;
                 Clipboard.setData(ClipboardData(text: md));
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('已复制到剪贴板')),
-                );
+                ScaffoldMessenger.of(
+                  context,
+                ).showSnackBar(const SnackBar(content: Text('已复制到剪贴板')));
               },
             ),
           ],
@@ -193,23 +257,30 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
                   color: Colors.tealAccent.withValues(alpha: 0.15),
                   borderRadius: BorderRadius.circular(6),
                 ),
-                child: const Icon(Icons.manage_search,
-                    color: Colors.tealAccent, size: 20),
+                child: const Icon(
+                  Icons.manage_search,
+                  color: Colors.tealAccent,
+                  size: 20,
+                ),
               ),
               const SizedBox(width: 8),
               Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const Text(
-                    '全车数据一键深度扫描与导出 (Deep Scan)',
+                    'OBD 候选扫描与完整证据导出',
                     style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 14,
-                        fontWeight: FontWeight.bold),
+                      color: Colors.white,
+                      fontSize: 14,
+                      fontWeight: FontWeight.bold,
+                    ),
                   ),
                   Text(
                     '自动遍历标准 OBD、车辆标识、丰田混动 0x7E2 与发动机 0x7E0 专有数据块',
-                    style: TextStyle(color: Colors.white.withValues(alpha: 0.5), fontSize: 9.5),
+                    style: TextStyle(
+                      color: Colors.white.withValues(alpha: 0.5),
+                      fontSize: 9.5,
+                    ),
                   ),
                 ],
               ),
@@ -247,16 +318,19 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
                         child: Text(
                           _statusMessage,
                           style: const TextStyle(
-                              color: Colors.tealAccent, fontSize: 11),
+                            color: Colors.tealAccent,
+                            fontSize: 11,
+                          ),
                           overflow: TextOverflow.ellipsis,
                         ),
                       ),
                       Text(
-                        '开放 $supportedCount / 已测 $testedCount 项',
+                        '响应 $supportedCount / 已测 $testedCount 项',
                         style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 11,
-                            fontWeight: FontWeight.bold),
+                          color: Colors.white,
+                          fontSize: 11,
+                          fontWeight: FontWeight.bold,
+                        ),
                       ),
                     ],
                   ),
@@ -264,8 +338,9 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
                   LinearProgressIndicator(
                     value: _progress.clamp(0.0, 1.0),
                     backgroundColor: Colors.white12,
-                    valueColor:
-                        const AlwaysStoppedAnimation<Color>(Colors.tealAccent),
+                    valueColor: const AlwaysStoppedAnimation<Color>(
+                      Colors.tealAccent,
+                    ),
                     minHeight: 5,
                   ),
                 ],
@@ -280,18 +355,23 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
                 runSpacing: 4,
                 children: _activeEcus.map((ecu) {
                   return Container(
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 6,
+                      vertical: 2,
+                    ),
                     decoration: BoxDecoration(
                       color: Colors.blueAccent.withValues(alpha: 0.15),
                       borderRadius: BorderRadius.circular(4),
                       border: Border.all(
-                          color: Colors.blueAccent.withValues(alpha: 0.4)),
+                        color: Colors.blueAccent.withValues(alpha: 0.4),
+                      ),
                     ),
                     child: Text(
                       ecu,
                       style: const TextStyle(
-                          color: Colors.lightBlueAccent, fontSize: 9.5),
+                        color: Colors.lightBlueAccent,
+                        fontSize: 9.5,
+                      ),
                     ),
                   );
                 }).toList(),
@@ -312,14 +392,19 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
                         child: Column(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            Icon(Icons.radar,
-                                size: 36, color: Colors.white.withValues(alpha: 0.2)),
+                            Icon(
+                              Icons.radar,
+                              size: 36,
+                              color: Colors.white.withValues(alpha: 0.2),
+                            ),
                             const SizedBox(height: 8),
                             const Text(
-                              '点击下方【开始深度扫描】，适配器将依次向全车 ECU 发起只读探测\n测算您的 Yaris Z 混动开放的所有数据项与采样报文',
+                              '固定 57 项候选与显式 0100 节点发现，保留全部失败和原始回复。\n不是全部 ECU 遍历；私有地址和解码未验证。',
                               textAlign: TextAlign.center,
                               style: TextStyle(
-                                  color: Colors.white38, fontSize: 11.5),
+                                color: Colors.white38,
+                                fontSize: 11.5,
+                              ),
                             ),
                           ],
                         ),
@@ -344,28 +429,38 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
 
                           return Container(
                             padding: const EdgeInsets.symmetric(
-                                horizontal: 10, vertical: 5),
+                              horizontal: 10,
+                              vertical: 5,
+                            ),
                             decoration: const BoxDecoration(
                               border: Border(
-                                  bottom: BorderSide(
-                                      color: Colors.white10, width: 0.5)),
+                                bottom: BorderSide(
+                                  color: Colors.white10,
+                                  width: 0.5,
+                                ),
+                              ),
                             ),
                             child: Row(
                               children: [
                                 // 分类标签
                                 Container(
                                   padding: const EdgeInsets.symmetric(
-                                      horizontal: 5, vertical: 1.5),
+                                    horizontal: 5,
+                                    vertical: 1.5,
+                                  ),
                                   decoration: BoxDecoration(
                                     color: catColor.withValues(alpha: 0.15),
                                     borderRadius: BorderRadius.circular(3),
                                     border: Border.all(
-                                        color: catColor.withValues(alpha: 0.4)),
+                                      color: catColor.withValues(alpha: 0.4),
+                                    ),
                                   ),
                                   child: Text(
                                     item.category,
                                     style: TextStyle(
-                                        color: catColor, fontSize: 9.5),
+                                      color: catColor,
+                                      fontSize: 9.5,
+                                    ),
                                   ),
                                 ),
                                 const SizedBox(width: 8),
@@ -385,9 +480,11 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
                                 // 传感器名称
                                 Expanded(
                                   child: Text(
-                                    item.name,
+                                    '${item.name}${item.candidate ? '（候选/未验证）' : ''}',
                                     style: const TextStyle(
-                                        color: Colors.white70, fontSize: 11),
+                                      color: Colors.white70,
+                                      fontSize: 11,
+                                    ),
                                     overflow: TextOverflow.ellipsis,
                                   ),
                                 ),
@@ -397,33 +494,40 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
                                   Container(
                                     margin: const EdgeInsets.only(right: 8),
                                     padding: const EdgeInsets.symmetric(
-                                        horizontal: 5, vertical: 1.5),
+                                      horizontal: 5,
+                                      vertical: 1.5,
+                                    ),
                                     decoration: BoxDecoration(
-                                      color: Colors.greenAccent
-                                          .withValues(alpha: 0.1),
+                                      color: Colors.greenAccent.withValues(
+                                        alpha: 0.1,
+                                      ),
                                       borderRadius: BorderRadius.circular(3),
                                     ),
                                     child: Text(
                                       item.decodedHint!,
                                       style: const TextStyle(
-                                          color: Colors.greenAccent,
-                                          fontSize: 10),
+                                        color: Colors.greenAccent,
+                                        fontSize: 10,
+                                      ),
                                     ),
                                   ),
 
-                                // 状态指示 (开放/未开放)
+                                // 状态指示（匹配响应/未匹配）
                                 Container(
                                   padding: const EdgeInsets.symmetric(
-                                      horizontal: 6, vertical: 2),
+                                    horizontal: 6,
+                                    vertical: 2,
+                                  ),
                                   decoration: BoxDecoration(
                                     color: isSupp
                                         ? Colors.green.withValues(alpha: 0.2)
                                         : Colors.grey.withValues(alpha: 0.1),
                                     borderRadius: BorderRadius.circular(4),
                                     border: Border.all(
-                                        color: isSupp
-                                            ? Colors.greenAccent
-                                            : Colors.white24),
+                                      color: isSupp
+                                          ? Colors.greenAccent
+                                          : Colors.white24,
+                                    ),
                                   ),
                                   child: Row(
                                     mainAxisSize: MainAxisSize.min,
@@ -439,7 +543,7 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
                                       ),
                                       const SizedBox(width: 3),
                                       Text(
-                                        isSupp ? '开放' : '无数据',
+                                        isSupp ? '响应' : '未匹配',
                                         style: TextStyle(
                                           color: isSupp
                                               ? Colors.greenAccent
@@ -463,6 +567,16 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
       ),
       actions: [
         if (_report != null) ...[
+          TextButton.icon(
+            onPressed: () => _exportReport(),
+            icon: const Icon(Icons.save_alt),
+            label: const Text('保存 JSON + Markdown'),
+          ),
+          TextButton.icon(
+            onPressed: () => _exportReport(share: true),
+            icon: const Icon(Icons.share),
+            label: const Text('分享完整证据'),
+          ),
           ElevatedButton.icon(
             style: ElevatedButton.styleFrom(
               backgroundColor: const Color(0xFF1E3A2F),
@@ -474,8 +588,10 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
               ),
             ),
             icon: const Icon(Icons.copy, size: 15),
-            label: const Text('复制 Markdown 报告',
-                style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold)),
+            label: const Text(
+              '复制 Markdown 报告',
+              style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold),
+            ),
             onPressed: _copyMarkdownReport,
           ),
           ElevatedButton.icon(
@@ -489,8 +605,10 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
               ),
             ),
             icon: const Icon(Icons.visibility, size: 15),
-            label: const Text('查看报告全文',
-                style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold)),
+            label: const Text(
+              '查看报告全文',
+              style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold),
+            ),
             onPressed: _showReportFullscreen,
           ),
         ],
@@ -514,9 +632,10 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
               padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
             ),
             icon: const Icon(Icons.play_arrow, size: 16),
-            label: Text(_report == null ? '开始深度扫描' : '重新扫描',
-                style: const TextStyle(
-                    fontSize: 12, fontWeight: FontWeight.bold)),
+            label: Text(
+              _report == null ? '开始深度扫描' : '重新扫描',
+              style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+            ),
             onPressed: _startScan,
           ),
         TextButton(

@@ -20,14 +20,14 @@ class ToyotaPidDefinition {
   });
 }
 
-/// 丰田第四代 THS-II / TNGA 全球架构混动专用数据集
-/// 对应 Car Scanner Profile:
+/// 丰田第四代 THS-II / TNGA 候选数据集（本车未验证）
+/// 历史参考名称（不等于已复现该软件的参数覆盖）:
 /// `Toyota Corolla Hybrid 2020-, RAV4 Hybrid 2019-, Camry Hybrid 2018-, Avalon Hybrid 2019-`
 class ToyotaTngaHybridProfile {
   static const String profileName =
-      'Toyota Corolla Hybrid 2020-, RAV4 Hybrid 2019-, Camry Hybrid 2018-, Avalon Hybrid 2019- (TNGA THS-II)';
+      'Toyota Corolla Hybrid 2020-, RAV4 Hybrid 2019-, Camry Hybrid 2018-, Avalon Hybrid 2019- (TNGA THS-II，候选/本车未验证)';
 
-  /// 标准 SAE J1979 Mode 01 参数 (实车已验证开放)
+  /// 标准 SAE J1979 Mode 01 参数候选；当前车辆响应须以扫描证据为准。
   static const List<ToyotaPidDefinition> standardPidList = [
     ToyotaPidDefinition(
       category: '标准OBD (Mode 01)',
@@ -215,7 +215,7 @@ class ToyotaTngaHybridProfile {
     ),
   ];
 
-  /// 丰田 TNGA 专有 UDS Mode 22 DID 参数集
+  /// 丰田 TNGA 私有候选：本车地址、布局和公式未验证；7EB 请求地址存疑。
   static const List<ToyotaPidDefinition> proprietaryDidList = [
     ToyotaPidDefinition(
       category: 'TNGA混动核心 (0x7E2)',
