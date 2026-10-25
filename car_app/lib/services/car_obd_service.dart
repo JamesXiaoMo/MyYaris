@@ -7,6 +7,7 @@ import '../models/obd_telemetry.dart';
 import '../models/elm_obd_response.dart';
 import '../models/obd_deep_scan_result.dart';
 import '../models/toyota_tnga_profile.dart';
+import 'obd_transport_journal.dart';
 
 class CarObdService {
   static final CarObdService _instance = CarObdService._internal();
@@ -15,11 +16,35 @@ class CarObdService {
 
   /// Isolated instance exercising the real serial queue with a fake BLE writer.
   @visibleForTesting
-  CarObdService.forTesting(Future<void> Function(List<int>) writer)
-    : _testWriter = writer {
+  CarObdService.forTesting(
+    Future<void> Function(List<int>) writer, {
+    Future<void> Function(Map<String, dynamic>)? journalSink,
+  }) : _testWriter = writer,
+       _testJournalSink = journalSink {
     _updateStatus(ObdConnectionStatus.ready);
   }
   Future<void> Function(List<int>)? _testWriter;
+  Future<void> Function(Map<String, dynamic>)? _testJournalSink;
+  late final ObdTransportJournal _journal = ObdTransportJournal(
+    test: _testWriter != null,
+    sink: _testJournalSink,
+  );
+  int _transactionSequence = 0;
+  int _notificationSequence = 0;
+  int? _transactionId;
+  int? _observedMtu;
+  StreamSubscription<int>? _mtuSubscription;
+  Map<String, dynamic>? _exchangeStats;
+  Future<void>? _pendingWrite;
+  bool _replyPromptSeen = true;
+  final StringBuffer _trailingRx = StringBuffer();
+  final ValueNotifier<String> diagnosticStateNotifier = ValueNotifier('尚未开始诊断');
+
+  bool get isPollingSuspended => _pollingSuspended;
+  void _transportEvent(String phase, [Map<String, dynamic> fields = const {}]) {
+    _journal.record(phase, {'transaction_id': _transactionId, ...fields});
+  }
+
   final Object _sequenceKey = Object();
   Object? _sequenceOwner;
   Completer<void>? _sequenceDone;
@@ -54,6 +79,15 @@ class CarObdService {
 
   @visibleForTesting
   void receiveForTesting(String value) => _onDataReceived(ascii.encode(value));
+  @visibleForTesting
+  void receiveBytesForTesting(List<int> bytes) => _onDataReceived(bytes);
+  @visibleForTesting
+  Future<ElmReply> exchangeForTesting(
+    String cmd, {
+    required Duration timeout,
+  }) => _exchange(cmd, timeout: timeout);
+  @visibleForTesting
+  Future<void> flushJournalForTesting() => _journal.flush();
   @visibleForTesting
   void disconnectForTesting() => _handleDisconnection();
 
@@ -213,14 +247,20 @@ class CarObdService {
       });
 
       // 调整 MTU 加速多帧报文传输
+      _observedMtu = null;
       try {
         if (!kIsWeb) {
-          await device.requestMtu(247);
+          _observedMtu = await device.requestMtu(247);
         }
       } catch (e) {
         log('MTU 协商忽略: $e');
       }
 
+      _mtuSubscription?.cancel();
+      _mtuSubscription = device.mtu.listen((mtu) {
+        _observedMtu = mtu;
+        _transportEvent('mtu', {'mtu': mtu});
+      });
       log('🔎 正在发现 GATT 服务与串口特征值...');
       final services = await device.discoverServices();
       final channel = _resolveObdGattChannel(services);
@@ -235,6 +275,13 @@ class CarObdService {
       _pollingSuspended = false;
       _serialSynchronized = true;
       _drained = null;
+      _replyPromptSeen = true;
+      _rxBuffer.clear();
+      _trailingRx.clear();
+      _transactionId = null;
+      _exchangeStats = null;
+      _transportEvent('connection', {'mtu': _observedMtu});
+      diagnosticStateNotifier.value = '串口已连接，尚未进行诊断';
       _knownHeader = null;
       _knownDisplay = null;
       _knownProtocol = null;
@@ -891,7 +938,11 @@ class CarObdService {
 
   // AT RV: 例如 "14.1V"
   double? _parseAtRv(String resp) {
-    if (resp.startsWith('ERROR:') || resp.contains('TIMEOUT') || resp.contains('STOPPED')) return null;
+    if (resp.startsWith('ERROR:') ||
+        resp.contains('TIMEOUT') ||
+        resp.contains('STOPPED')) {
+      return null;
+    }
     final match = RegExp(r'([0-9]+\.?[0-9]*)\s*V').firstMatch(resp);
     if (match != null) {
       return double.tryParse(match.group(1) ?? '');
@@ -1253,10 +1304,31 @@ class CarObdService {
         : 'ERROR: ${reply.completion.toUpperCase()}\n${reply.raw}';
   }
 
+  Future<bool> _waitForSynchronization() async {
+    if (!isConnected) return false;
+    if (_serialSynchronized) return _pendingWrite == null;
+    final sw = Stopwatch()..start();
+    _transportEvent('drain_wait_start', {'limit_ms': 500});
+    try {
+      await _drained?.future.timeout(const Duration(milliseconds: 500));
+    } on TimeoutException {
+      // One bounded passive drain, never an interrupt/reset/repeated PID.
+    }
+    final ok = _serialSynchronized && _pendingWrite == null && isConnected;
+    _transportEvent('drain_wait_end', {
+      'elapsed_ms': sw.elapsedMilliseconds,
+      'synchronized': ok,
+      'write_pending': _pendingWrite != null,
+      'completion': ok ? 'prompt' : 'unsynchronized_not_sent',
+    });
+    return ok;
+  }
+
   Future<ElmReply> _exchange(
     String command, {
     Duration timeout = const Duration(milliseconds: 1200),
     bool restoring = false,
+    bool waitForSync = true,
   }) async {
     if (timeout > const Duration(seconds: 5)) {
       timeout = const Duration(seconds: 5);
@@ -1269,7 +1341,6 @@ class CarObdService {
     while (_cmdQueue != null) {
       await _cmdQueue!.future;
     }
-    // Recheck after the await: a scan may have reserved the serial transaction.
     if ((_isDeepScanning || _sequenceOwner != null) && !ownsSequence) {
       return ElmReply('', 'busy_transaction');
     }
@@ -1277,60 +1348,125 @@ class CarObdService {
     _cmdQueue = done;
     final sw = Stopwatch()..start();
     final started = DateTime.now();
+    final id = ++_transactionSequence;
+    final stats = <String, dynamic>{
+      'transaction_id': id,
+      'start_us': _journal.nowUs,
+      'deadline_us': _journal.nowUs + timeout.inMicroseconds,
+      'timeout_ms': timeout.inMilliseconds,
+      'mtu': _observedMtu,
+      'write_attempted': false,
+      'write_completed': false,
+      'first_rx_us': null,
+      'last_rx_us': null,
+      'rx_byte_count': 0,
+      'rx_notification_count': 0,
+      'prompt_us': null,
+    };
+    ElmReply finish(String raw, String completion) {
+      final details = Map<String, dynamic>.from(stats);
+      _transportEvent('exchange_end', {
+        ...details,
+        'command': command,
+        'completion': completion,
+        'elapsed_ms': sw.elapsedMilliseconds,
+        'response_byte_length': raw.length,
+      });
+      return ElmReply(
+        raw,
+        completion,
+        time: started,
+        elapsedMs: sw.elapsedMilliseconds,
+        transport: details,
+      );
+    }
+
+    _transportEvent('exchange_attempt', {...stats, 'command': command});
     try {
       if (_cancelDeepScanRequested &&
           ownsSequence &&
           !restoring &&
           !_isPollingBusy) {
-        return ElmReply('', 'cancelled');
+        return finish('', 'cancelled');
       }
       if (!isConnected &&
           currentTelemetry.status != ObdConnectionStatus.initializing) {
-        return ElmReply('', 'disconnected');
+        return finish('', 'disconnected');
       }
       if (!_serialSynchronized) {
-        try {
-          await _drained?.future.timeout(const Duration(milliseconds: 500));
-        } on TimeoutException {
-          return ElmReply(_rxBuffer.toString(), 'unsynchronized_not_sent');
-        }
-        if (!_serialSynchronized) {
-          return ElmReply('', 'unsynchronized_not_sent');
+        final synchronized = waitForSync && await _waitForSynchronization();
+        if (!synchronized) {
+          return finish(_rxBuffer.toString(), 'unsynchronized_not_sent');
         }
       }
+      // Future.timeout does not cancel the native write. Fence it until it actually settles.
+      if (_pendingWrite != null) return finish('', 'write_pending_not_sent');
+      final writeBudget = timeout - sw.elapsed;
+      if (writeBudget <= Duration.zero) return finish('', 'deadline_not_sent');
       _rxBuffer.clear();
+      _trailingRx.clear();
+      _replyPromptSeen = false;
       _activeInterrupted = false;
+      _transactionId = id;
+      _exchangeStats = stats;
       final complete = Completer<String>();
       _cmdCompleter = complete;
       final data = ascii.encode('${command.trim()}\r');
       _invalidateAdapterState(command);
+      stats['write_attempted'] = true;
+      stats['write_start_us'] = _journal.nowUs;
+      _transportEvent('write_start', {
+        'raw_hex': ElmObdParser.hex(data),
+        'length': data.length,
+        'deadline_us': stats['deadline_us'],
+        'mtu': _observedMtu,
+      });
       try {
-        if (_testWriter != null) {
-          await _testWriter!(data).timeout(timeout);
-        } else {
-          final w = _writeCharacteristic;
-          if (w == null) return ElmReply('', 'disconnected');
-          // Do not resend an ambiguous write: it may already have reached the bus.
-          await w
-              .write(data, withoutResponse: w.properties.writeWithoutResponse)
-              .timeout(timeout);
+        final w = _writeCharacteristic;
+        if (_testWriter == null && w == null) return finish('', 'disconnected');
+        final operation = _testWriter != null
+            ? _testWriter!(data)
+            : w!.write(
+                data,
+                withoutResponse: w.properties.writeWithoutResponse,
+              );
+        _pendingWrite = operation;
+        unawaited(
+          operation.then(
+            (_) {
+              if (identical(_pendingWrite, operation)) _pendingWrite = null;
+              stats['write_completed'] = true;
+              stats['write_end_us'] = _journal.nowUs;
+              _transportEvent('write_complete', {'transaction_id': id});
+            },
+            onError: (Object error, StackTrace stack) {
+              if (identical(_pendingWrite, operation)) _pendingWrite = null;
+              _transportEvent('write_failed', {
+                'transaction_id': id,
+                'error_type': error.runtimeType.toString(),
+              });
+            },
+          ),
+        );
+        await operation.timeout(writeBudget);
+        final protectionBudget = timeout - sw.elapsed;
+        if (protectionBudget > Duration.zero) {
+          await Future<void>.delayed(
+            protectionBudget < const Duration(milliseconds: 25)
+                ? protectionBudget
+                : const Duration(milliseconds: 25),
+          );
         }
-        await Future<void>.delayed(const Duration(milliseconds: 25));
         final remaining = timeout - sw.elapsed;
         if (remaining <= Duration.zero) throw TimeoutException('write timeout');
         final raw = await complete.future.timeout(remaining);
-        final completion = raw.trimRight().endsWith('>')
+        final completion = raw.endsWith('>')
             ? 'prompt'
             : (!isConnected ? 'disconnected' : 'cancelled');
         if (completion != 'prompt' && !_activeInterrupted) {
           _markUnsynchronized();
         }
-        final reply = ElmReply(
-          raw,
-          completion,
-          time: started,
-          elapsedMs: sw.elapsedMilliseconds,
-        );
+        final reply = finish(raw, completion);
         if (reply.complete &&
             (_atOk(command, reply) ||
                 RegExp(
@@ -1341,20 +1477,10 @@ class CarObdService {
         return reply;
       } on TimeoutException {
         _markUnsynchronized();
-        return ElmReply(
-          _rxBuffer.toString(),
-          'timeout',
-          time: started,
-          elapsedMs: sw.elapsedMilliseconds,
-        );
+        return finish(_rxBuffer.toString(), 'timeout');
       } catch (e) {
         _markUnsynchronized();
-        return ElmReply(
-          _rxBuffer.toString(),
-          'write_error: $e',
-          time: started,
-          elapsedMs: sw.elapsedMilliseconds,
-        );
+        return finish(_rxBuffer.toString(), 'write_error: ${e.runtimeType}');
       } finally {
         _cmdCompleter = null;
       }
@@ -1367,6 +1493,14 @@ class CarObdService {
   void _markUnsynchronized() {
     _serialSynchronized = false;
     _drained ??= Completer<void>();
+    diagnosticStateNotifier.value = '串口未同步，等待旧响应结束';
+  }
+
+  void _markSynchronized() {
+    _serialSynchronized = true;
+    final drained = _drained;
+    _drained = null;
+    if (drained != null && !drained.isCompleted) drained.complete();
   }
 
   String _atContent(String command, ElmReply reply) => reply.raw
@@ -1398,15 +1532,19 @@ class CarObdService {
 
   void _invalidateAdapterState(String command) {
     // An unacknowledged write may have changed adapter state. Never retain a stale ACK.
-    final cmd=command.replaceAll(' ', '').toUpperCase();
-    if(cmd.startsWith('ATSH')) _knownHeader=null;
-    if(RegExp(r'^ATH[01]$').hasMatch(cmd)) _knownDisplay=null;
-    if(RegExp(r'^ATCAF[01]$').hasMatch(cmd)) _knownFormatting=null;
-    if(cmd.startsWith('ATSP') || cmd.startsWith('ATTP')) {
-      _knownProtocol=null; _knownHeader=null;
+    final cmd = command.replaceAll(' ', '').toUpperCase();
+    if (cmd.startsWith('ATSH')) _knownHeader = null;
+    if (RegExp(r'^ATH[01]$').hasMatch(cmd)) _knownDisplay = null;
+    if (RegExp(r'^ATCAF[01]$').hasMatch(cmd)) _knownFormatting = null;
+    if (cmd.startsWith('ATSP') || cmd.startsWith('ATTP')) {
+      _knownProtocol = null;
+      _knownHeader = null;
     }
-    if(cmd=='ATD' || cmd=='ATZ' || cmd=='ATWS') {
-      _knownHeader=null; _knownDisplay=null; _knownFormatting=null; _knownProtocol=null;
+    if (cmd == 'ATD' || cmd == 'ATZ' || cmd == 'ATWS') {
+      _knownHeader = null;
+      _knownDisplay = null;
+      _knownFormatting = null;
+      _knownProtocol = null;
     }
   }
 
@@ -1425,32 +1563,98 @@ class CarObdService {
   }
 
   void _onDataReceived(List<int> data) {
+    final now = _journal.nowUs;
+    final late =
+        !_serialSynchronized || _replyPromptSeen || _cmdCompleter == null;
+    final stats = _exchangeStats;
+    if (stats != null) {
+      stats['first_rx_us'] ??= now;
+      stats['last_rx_us'] = now;
+      stats['rx_byte_count'] = (stats['rx_byte_count'] as int) + data.length;
+      stats['rx_notification_count'] =
+          (stats['rx_notification_count'] as int) + 1;
+    }
+    _transportEvent('rx_notification', {
+      'notification_seq': ++_notificationSequence,
+      'received_us': now,
+      'raw_hex': ElmObdParser.hex(data),
+      'length': data.length,
+      'late': late,
+      'mtu': _observedMtu,
+    });
     if (data.isEmpty) return;
-    _rxBuffer.write(ascii.decode(data, allowInvalid: true));
-    if (_rxBuffer.toString().contains('>')) {
-      if (!_serialSynchronized) {
-        if (_isDeepScanning) {
-          _scanLateReplies.add({
-            'phase': 'late_reply_drain',
-            'raw': _rxBuffer.toString(),
-            'time': DateTime.now().toIso8601String(),
-            'reason':
-                'previous interrupted exchange; not assigned to another PID',
-          });
-        }
-        _serialSynchronized = true;
-        _drained?.complete();
-        _drained = null;
-        return; // Late reply belongs to the previous exchange, never the next PID.
+    // Latin-1 is byte-preserving. Non-ASCII input fails parser validation, never replaced.
+    final text = latin1.decode(data);
+    if (_replyPromptSeen) {
+      _receiveTrailing(text);
+      return;
+    }
+    if (late && _scanOwnsSerial) {
+      _scanLateReplies.add({
+        'phase': 'late_fragment',
+        'transaction_id': _transactionId,
+        'mono_us': now,
+        'raw_hex': ElmObdParser.hex(data),
+        'length': data.length,
+      });
+    }
+    final prompt = text.indexOf('>');
+    _rxBuffer.write(prompt < 0 ? text : text.substring(0, prompt + 1));
+    if (prompt < 0) return;
+    _replyPromptSeen = true;
+    stats?['prompt_us'] = now;
+    _transportEvent(late ? 'late_prompt' : 'prompt', {
+      'offset_in_notification': prompt,
+    });
+    if (!_serialSynchronized) {
+      if (_scanOwnsSerial) {
+        _scanLateReplies.add({
+          'phase': 'late_reply_drain',
+          'transaction_id': _transactionId,
+          'raw': _rxBuffer.toString(),
+          'mono_us': now,
+          'reason':
+              'previous interrupted exchange; not assigned to another PID',
+        });
       }
-      final c = _cmdCompleter;
-      if (c != null && !c.isCompleted) c.complete(_rxBuffer.toString());
+      _markSynchronized();
+    }
+    final c = _cmdCompleter;
+    if (c != null && !c.isCompleted) c.complete(_rxBuffer.toString());
+    if (prompt + 1 < text.length) _receiveTrailing(text.substring(prompt + 1));
+  }
+
+  void _receiveTrailing(String text) {
+    if (RegExp(r'^[ \r\n\t]*$').hasMatch(text) && _trailingRx.isEmpty) return;
+    _trailingRx.write(text);
+    _markUnsynchronized();
+    _transportEvent('unassigned_fragment', {
+      'raw_hex': ElmObdParser.hex(latin1.encode(text)),
+      'length': text.length,
+    });
+    final all = _trailingRx.toString();
+    final prompt = all.lastIndexOf('>');
+    if (prompt >= 0) {
+      final remainder = all.substring(prompt + 1);
+      _transportEvent('unassigned_prompt', {'drained_byte_length': prompt + 1});
+      _trailingRx.clear();
+      if (RegExp(r'^[ \r\n\t]*$').hasMatch(remainder)) {
+        _markSynchronized();
+      } else {
+        _trailingRx.write(remainder);
+      }
     }
   }
 
   // --- 7. 连接断开与清理 ---
   void _handleDisconnection() {
     _pollingTimer?.cancel();
+    _transportEvent('disconnect');
+    _serialSynchronized = false;
+    final drained = _drained;
+    _drained = null;
+    if (drained != null && !drained.isCompleted) drained.complete();
+    diagnosticStateNotifier.value = '连接已断开';
     _cancelDeepScanRequested = _isDeepScanning;
     if (_cmdCompleter != null && !_cmdCompleter!.isCompleted) {
       _activeInterrupted = true;
@@ -1469,6 +1673,7 @@ class CarObdService {
     _handleDisconnection();
     _pollingTimer?.cancel();
     _notifySubscription?.cancel();
+    _mtuSubscription?.cancel();
     _connectionStateSubscription?.cancel();
     _writeCharacteristic = null;
     if (_connectedDevice != null) {
@@ -1512,7 +1717,8 @@ class CarObdService {
       _cancelDeepScanRequested = true;
       if (_cmdCompleter != null &&
           !_cmdCompleter!.isCompleted &&
-          _scanOwnsSerial && !_restoringScanState) {
+          _scanOwnsSerial &&
+          !_restoringScanState) {
         _activeInterrupted = true;
         _markUnsynchronized();
         _cmdCompleter!.complete(_rxBuffer.toString());
@@ -1550,6 +1756,8 @@ class CarObdService {
     }
     _scanOwnsSerial = true;
     _scanLateReplies.clear();
+    _journal.beginCapture();
+    _transportEvent('capture_start', {'mtu': _observedMtu});
     final start = DateTime.now();
     final items = <ObdDiscoveredItem>[];
     final ecus = <String>{};
@@ -1576,6 +1784,7 @@ class CarObdService {
         cmd,
         timeout: const Duration(milliseconds: 1400),
         restoring: restoring,
+        waitForSync: !restoring,
       );
       trace.add({
         'command': cmd,
@@ -1685,6 +1894,7 @@ class CarObdService {
             time: r.time,
             frames: evidence.frames,
             candidate: candidate,
+            transport: r.transport,
           );
           items.add(item);
           ecus.addAll(
@@ -1713,33 +1923,56 @@ class CarObdService {
           : 'error';
       trace.add({'phase': 'error', 'reason': e.toString()});
     } finally {
-      _restoringScanState=true;
+      _restoringScanState = true;
+      // Decide synchronization once for the whole restoration transaction.
+      final drainStarted = DateTime.now();
+      final drainWatch = Stopwatch()..start();
+      final synchronized = await _waitForSynchronization();
+      trace.add({
+        'phase': 'restore_sync',
+        'time': drainStarted.toIso8601String(),
+        'elapsed_ms': drainWatch.elapsedMilliseconds,
+        'completion': synchronized ? 'prompt' : 'unsynchronized_not_sent',
+        'write_attempted': false,
+      });
       if (touched) {
-        // Protocol was queried only, never changed. Restore only settings we changed.
         trace.add({
           'phase': 'restore_plan',
           'protocol': 'unchanged_by_scan',
           'CAN_formatting_origin': savedFormatting == null
-              ? 'unknown; explicit CAF1 fallback'
+              ? 'unknown; no fallback'
               : 'observed ACK',
           'header_origin': savedHeader == null
-              ? 'unknown; explicit safe broadcast fallback'
+              ? 'unknown; no fallback'
               : 'observed ACK',
           'display_origin': savedDisplay == null
-              ? 'unknown; explicit ATH0 fallback'
+              ? 'unknown; no fallback'
               : 'observed ACK',
         });
-        for (final cmd in [
-          savedFormatting ?? 'ATCAF1',
-          'ATSH${savedHeader ?? "7DF"}',
-          savedDisplay ?? 'ATH0',
-        ]) {
-          if (!isConnected) {
+        final settings = <String, String?>{
+          'CAN_formatting': savedFormatting,
+          'header': savedHeader == null ? null : 'ATSH$savedHeader',
+          'display': savedDisplay,
+        };
+        for (final entry in settings.entries) {
+          final cmd = entry.value;
+          if (cmd == null ||
+              !isConnected ||
+              !synchronized ||
+              !_serialSynchronized ||
+              _pendingWrite != null) {
             restored = false;
             trace.add({
               'phase': 'restore',
+              'setting': entry.key,
               'command': cmd,
-              'completion': 'not_sent_disconnected',
+              'completion': cmd == null
+                  ? 'unknown_original_not_restored'
+                  : !isConnected
+                  ? 'not_sent_disconnected'
+                  : 'unsynchronized_not_sent',
+              'write_attempted': false,
+              'elapsed_ms': 0,
             });
             continue;
           }
@@ -1757,16 +1990,28 @@ class CarObdService {
             trace.add({
               'phase': 'restore',
               'command': cmd,
-              'error': e.toString(),
+              'completion': 'restore_error',
             });
           }
         }
       }
-      _pollingSuspended = !restored || !_serialSynchronized;
+      _pollingSuspended =
+          !restored || !_serialSynchronized || _pendingWrite != null;
+      if (outcome == 'completed' && _pollingSuspended) {
+        outcome = 'completed_restore_unconfirmed';
+      }
+      diagnosticStateNotifier.value = _pollingSuspended
+          ? '诊断已暂停：串口未同步或原状态恢复未确认'
+          : '串口已同步，原状态恢复已确认';
+      _transportEvent('capture_end', {
+        'polling_suspended': _pollingSuspended,
+        'synchronized': _serialSynchronized,
+        'restoration_acknowledged': touched ? restored : null,
+      });
       trace.addAll(_scanLateReplies);
       _scanLateReplies.clear();
       _scanOwnsSerial = false;
-      _restoringScanState=false;
+      _restoringScanState = false;
       trace.add({
         'phase': 'final',
         'restoration_acknowledged': touched ? restored : null,
@@ -1774,8 +2019,20 @@ class CarObdService {
         'connected': isConnected,
       });
     }
+    final transportEvents = _journal.endCapture();
+    await _journal.flush();
+    if (_journal.storageFailures > 0) {
+      diagnosticStateNotifier.value += '；私有日志未完整保存，请查看报告';
+    }
     final report = ObdDeepScanReport(
       startTime: start,
+      transportEvents: transportEvents,
+      transportStorage: {
+        ..._journal.storageStatus,
+        'capture_end_event': transportEvents.isEmpty
+            ? null
+            : transportEvents.last['event_seq'],
+      },
       endTime: DateTime.now(),
       deviceName: connectedDeviceName ?? 'unknown',
       protocolName: protocol,

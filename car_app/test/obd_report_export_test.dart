@@ -5,6 +5,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:my_yaris/models/obd_deep_scan_result.dart';
 import 'package:my_yaris/models/elm_obd_response.dart';
 import 'package:my_yaris/services/obd_report_export_service.dart';
+import 'package:my_yaris/services/obd_transport_journal.dart';
 import 'package:my_yaris/services/car_obd_service.dart';
 import 'package:my_yaris/ui/obd_deep_scan_dialog.dart';
 
@@ -53,7 +54,9 @@ void main() {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(ObdReportExportService.channel, (call) async {
           calls.add(call);
-          return 'private/obd_reports/test';
+          return call.method == 'appendTransport'
+              ? null
+              : 'private/obd_reports/test';
         });
   });
   tearDown(
@@ -129,4 +132,27 @@ void main() {
       throwsA(isA<PlatformException>()),
     );
   });
+  test(
+    'byte journal uses only the private native sink, without export or share',
+    () async {
+      final journal = ObdTransportJournal();
+      journal.beginCapture();
+      final event = journal.record('rx_notification', {
+        'transaction_id': 9,
+        'notification_seq': 1,
+        'raw_hex': '00FF0D3E',
+        'length': 4,
+      });
+      await journal.flush();
+      expect(calls.single.method, 'appendTransport');
+      expect(calls.single.arguments['session'], journal.session);
+      expect(jsonDecode(calls.single.arguments['event']), event);
+      expect(calls.single.arguments.containsKey('share'), isFalse);
+      expect(
+        journal.storageStatus['persisted_through_event'],
+        event['event_seq'],
+      );
+      expect(journal.storageStatus['storage_failures'], 0);
+    },
+  );
 }

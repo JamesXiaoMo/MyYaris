@@ -8,12 +8,38 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.util.UUID
+import java.io.FileOutputStream
+import java.util.concurrent.Executors
 
 /** Explicit local export. noBackupFilesDir is private and excluded from Android backup. */
 object ObdReportExporter {
+    private val journalWriter = Executors.newSingleThreadExecutor()
     fun register(activity: Activity, engine: FlutterEngine) {
         MethodChannel(engine.dartExecutor.binaryMessenger, "com.myyaris.my_yaris/obd_reports")
             .setMethodCallHandler { call, result ->
+                if (call.method == "appendTransport") {
+                    val session = call.argument<String>("session")
+                    val event = call.argument<String>("event")
+                    if (session == null || !session.matches(Regex("[0-9]+")) ||
+                        event == null || event.contains('\n')) {
+                        result.error("JOURNAL_INVALID", "无效日志记录", null)
+                        return@setMethodCallHandler
+                    }
+                    // Keep disk/fsync work off the UI/BLE delivery thread, in order.
+                    journalWriter.execute {
+                        try {
+                            val directory = File(activity.noBackupFilesDir, "obd_reports").apply { mkdirs() }
+                            FileOutputStream(File(directory, "transport_$session.jsonl"), true).use {
+                                it.write((event + "\n").toByteArray(Charsets.UTF_8))
+                                it.fd.sync()
+                            }
+                            activity.runOnUiThread { result.success(null) }
+                        } catch (e: Exception) {
+                            activity.runOnUiThread { result.error("JOURNAL_FAILED", "私有日志保存失败", null) }
+                        }
+                    }
+                    return@setMethodCallHandler
+                }
                 if (call.method != "export") {
                     result.notImplemented()
                     return@setMethodCallHandler

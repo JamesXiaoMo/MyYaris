@@ -1,5 +1,7 @@
 # Yaris 混动油量证据与 OBD 扫描中断分析
 
+> 下文保留修复前研究基线；后续收包日志与恢复实现见[传输修复说明](obd-transport-recovery.md)，安装与实车验收分别记录。
+
 - 状态：2026-10-25 只读源码/用户提供报告分析及公开资料纠偏；未实现、构建、安装或进行实车操作。
 - 源码基线：`d2cb8d0`；本次复核工作树 HEAD 为 `be85583`，相对该基线仅增加原研究文档。
 - 目标：日本版 2022 Yaris Z 1.5 Hybrid。用户确认 Car Scanner 在连接配置 `Toyota Corolla Hybrid 2020-, RAV4 Hybrid 2019-, Camry Hybrid 2018-, Avalon Hybrid 2019-` 下能显示剩余燃油 L。具体传感器名称、内置 PID、公式及成功通信记录尚未取得。

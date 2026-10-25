@@ -17,6 +17,7 @@ class ObdDiscoveredItem {
   final DateTime? time;
   final List<ObdFrameEvidence> frames;
   final bool candidate;
+  final Map<String, dynamic> transport;
   const ObdDiscoveredItem({
     required this.category,
     required this.header,
@@ -31,6 +32,7 @@ class ObdDiscoveredItem {
     this.time,
     this.frames = const [],
     this.candidate = false,
+    this.transport = const {},
   });
   Map<String, dynamic> toJson() => {
     'category': category,
@@ -45,6 +47,7 @@ class ObdDiscoveredItem {
     'completion': completion,
     'time': time?.toIso8601String(),
     'candidate_unverified': candidate,
+    'transport': transport,
     'received_ecu_headers': frames.isEmpty
         ? ['unknown']
         : frames.map((f) => f.ecu).toSet().toList(),
@@ -65,6 +68,8 @@ class ObdDeepScanReport {
   final int totalSupported;
   final String outcome;
   final List<Map<String, dynamic>> trace;
+  final List<Map<String, dynamic>> transportEvents;
+  final Map<String, dynamic> transportStorage;
   const ObdDeepScanReport({
     required this.startTime,
     this.endTime,
@@ -76,11 +81,13 @@ class ObdDeepScanReport {
     required this.totalSupported,
     this.outcome = 'completed',
     this.trace = const [],
+    this.transportEvents = const [],
+    this.transportStorage = const {},
   });
   int get parsedCount =>
       items.where((i) => i.decodedHint != null && !i.candidate).length;
   Map<String, dynamic> toJson() => {
-    'schema_version': 2,
+    'schema_version': 3,
     'sensitive_notice': sensitiveNotice,
     'scope':
         'Fixed 57 candidate probes plus explicit ECU discovery 0100; not all ECUs or vehicle capability coverage.',
@@ -95,6 +102,8 @@ class ObdDeepScanReport {
     'parsed_count': parsedCount,
     'items': items.map((e) => e.toJson()).toList(),
     'trace': trace,
+    'transport_events': transportEvents,
+    'transport_storage': transportStorage,
   };
   String toJsonText() => const JsonEncoder.withIndent('  ').convert(toJson());
   String toMarkdown() {
@@ -130,6 +139,10 @@ class ObdDeepScanReport {
       for (final line in i.rawHexResponse.split('\n')) {
         b.writeln('    $line');
       }
+      b.writeln('\n无损原文（JSON 字符串，保留 CR/LF）：\n');
+      b.writeln('    ${jsonEncode(i.rawHexResponse)}');
+      b.writeln('\n收发元数据：\n');
+      b.writeln('    ${jsonEncode(i.transport)}');
       b.writeln('\n逐帧判定：\n');
       for (final f in i.frames) {
         b.writeln('    ${jsonEncode(f.toJson())}');
@@ -139,6 +152,12 @@ class ObdDeepScanReport {
     b.writeln('## 事务与恢复证据\n');
     for (final t in trace) {
       b.writeln('    ${jsonEncode(t)}');
+    }
+    b.writeln('\n## 私有传输日志存储状态\n');
+    b.writeln('    ${jsonEncode(transportStorage)}');
+    b.writeln('\n## 逐通知与事务传输证据（与 JSON transport_events 一致）\n');
+    for (final event in transportEvents) {
+      b.writeln('    ${jsonEncode(event)}');
     }
     return b.toString();
   }

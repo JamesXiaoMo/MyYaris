@@ -4,14 +4,21 @@ class ElmReply {
   final String completion;
   final DateTime time;
   final int elapsedMs;
-  ElmReply(this.raw, this.completion, {DateTime? time, this.elapsedMs = 0})
-    : time = time ?? DateTime.now();
+  final Map<String, dynamic> transport;
+  ElmReply(
+    this.raw,
+    this.completion, {
+    DateTime? time,
+    this.elapsedMs = 0,
+    this.transport = const {},
+  }) : time = time ?? DateTime.now();
   bool get complete => completion == 'prompt';
   Map<String, dynamic> toJson() => {
     'raw': raw,
     'completion': completion,
     'time': time.toIso8601String(),
     'elapsed_ms': elapsedMs,
+    ...transport,
   };
 }
 
@@ -21,12 +28,16 @@ class ObdFrameEvidence {
   final String verdict;
   final int? service;
   final int? nrc;
+  final String? structureVerdict;
+  final String? transportCompletion;
   const ObdFrameEvidence(
     this.ecu,
     this.payload,
     this.verdict, {
     this.service,
     this.nrc,
+    this.structureVerdict,
+    this.transportCompletion,
   });
   bool get positive => verdict == 'positive';
   Map<String, dynamic> toJson() => {
@@ -35,6 +46,9 @@ class ObdFrameEvidence {
     'verdict': verdict,
     if (service != null) 'negative_service': service,
     if (nrc != null) 'nrc': nrc,
+    if (structureVerdict != null) 'structure_verdict': structureVerdict,
+    if (transportCompletion != null)
+      'transport_completion': transportCompletion,
   };
 }
 
@@ -169,9 +183,18 @@ class ElmObdParser {
           }
         }
       }
+      final structure = verdict;
       if (!reply.complete) verdict = reply.completion;
       frames.add(
-        ObdFrameEvidence(ecu, payload, verdict, service: service, nrc: nrc),
+        ObdFrameEvidence(
+          ecu,
+          payload,
+          verdict,
+          service: service,
+          nrc: nrc,
+          structureVerdict: structure,
+          transportCompletion: reply.completion,
+        ),
       );
     }
 
@@ -256,17 +279,48 @@ class ElmObdParser {
       if (header != null) {
         ecu = header[1]!;
         h = header[2]!.replaceAll(' ', '');
-      } else if (h.length.isOdd && h.length > 3) {
-        ecu = h.substring(0, 3);
-        h = h.substring(3);
       } else if (h.startsWith('18DA') && h.length > 10) {
         ecu = h.substring(0, 8);
         h = h.substring(8);
+      } else if (h.startsWith('7') && h.length >= 7) {
+        ecu = h.substring(0, 3);
+        h = h.substring(3);
       }
-      // Optional single-nibble CAN DLC in header display.
-      if (ecu != 'unknown' && h.length.isOdd) h = h.substring(1);
-      if (h.length.isOdd || h.isEmpty) {
-        frames.add(ObdFrameEvidence(ecu, line, 'invalid_hex'));
+      void rejectEnvelope(String reason) {
+        // A guessed header on an invalid line is not an observed ECU identity.
+        frames.add(
+          ObdFrameEvidence(
+            'unknown',
+            line,
+            reason,
+            structureVerdict: reason,
+            transportCompletion: reply.completion,
+          ),
+        );
+      }
+
+      if (ecu != 'unknown') {
+        final id = int.tryParse(ecu, radix: 16);
+        if (ecu.length == 3 && (id == null || id < 0x700 || id > 0x7FF)) {
+          rejectEnvelope('unsupported_obd_header');
+          continue;
+        }
+        // Accept a DLC nibble only when it agrees exactly with the byte count.
+        if (h.length.isOdd) {
+          final dlc = int.tryParse(h[0], radix: 16);
+          if (dlc == null || dlc < 1 || dlc > 8 || (h.length - 1) ~/ 2 != dlc) {
+            rejectEnvelope('invalid_dlc_or_truncated_frame');
+            continue;
+          }
+          h = h.substring(1);
+        }
+        if (h.isEmpty || h.length > 16) {
+          rejectEnvelope('invalid_can_frame_length');
+          continue;
+        }
+      }
+      if (h.length.isOdd || h.isEmpty || !RegExp(r'^[0-9A-F]+$').hasMatch(h)) {
+        rejectEnvelope('invalid_hex');
         continue;
       }
       final b = [
@@ -274,16 +328,29 @@ class ElmObdParser {
           int.parse(h.substring(i, i + 2), radix: 16),
       ];
       final type = b[0] >> 4;
+      if (ecu != 'unknown' && type > 2) {
+        rejectEnvelope('unexpected_pci');
+        continue;
+      }
       if (type == 0) {
         final old = pending.remove(ecu);
         if (old != null) emit(ecu, old.bytes, 'incomplete_multiframe');
         final len = b[0];
+        if (ecu != 'unknown' && (len == 0 || len > 7 || b.length < len + 1)) {
+          rejectEnvelope('short_frame');
+          continue;
+        }
         emit(
           ecu,
           b.skip(1).take(len).toList(),
-          len == 0 || b.length < len + 1 ? 'short_frame' : null,
+          len == 0 || len > 7 || b.length < len + 1 ? 'short_frame' : null,
         );
       } else if (type == 1 && b.length >= 2) {
+        final declared = ((b[0] & 15) << 8) | b[1];
+        if (b.length != 8 || declared <= 7) {
+          rejectEnvelope('invalid_first_frame');
+          continue;
+        }
         final old = pending.remove(ecu);
         if (old != null) {
           emit(ecu, old.bytes, 'ambiguous_or_incomplete_multiframe');
@@ -301,6 +368,11 @@ class ElmObdParser {
           emit(ecu, b, 'orphan_or_out_of_order_frame');
           final old = pending.remove(ecu);
           if (old != null) emit(ecu, old.bytes, 'incomplete_multiframe');
+        } else if (b.length < 2 ||
+            b.length > 8 ||
+            b.length - 1 < (a.length - a.bytes.length).clamp(0, 7)) {
+          pending.remove(ecu);
+          rejectEnvelope('short_consecutive_frame');
         } else {
           a.bytes.addAll(b.skip(1));
           a.next = (a.next + 1) & 15;
@@ -344,6 +416,30 @@ class ElmObdParser {
             f.ecu,
             f.payload,
             'adapter_failure_with_payload',
+          );
+        }
+      }
+    }
+    final damaged = frames.any(
+      (f) => !const {
+        'positive',
+        'negative_response',
+        'wrong_negative_service',
+        'wrong_service_or_pid',
+        'adapter_searching',
+        'no_data',
+      }.contains(f.structureVerdict ?? f.verdict),
+    );
+    if (damaged) {
+      for (var i = 0; i < frames.length; i++) {
+        final f = frames[i];
+        if (f.positive) {
+          frames[i] = ObdFrameEvidence(
+            f.ecu,
+            f.payload,
+            'malformed_exchange',
+            structureVerdict: f.structureVerdict,
+            transportCompletion: reply.completion,
           );
         }
       }

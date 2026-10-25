@@ -15,6 +15,13 @@ class FakeElm {
     answer(cmd);
   }
 
+  Future<void> prime() async {
+    await service.sendRawCommand('ATSH7DF');
+    await service.sendRawCommand('ATH0');
+    await service.sendRawCommand('ATCAF1');
+    commands.clear();
+  }
+
   void answer(String cmd) => service.receiveForTesting(
     cmd == 'ATDP'
         ? 'ISO 15765-4 CAN\r>'
@@ -39,6 +46,7 @@ void main() {
     'real scan retains 57 probes, failures, full raw, headers and standard decode',
     () async {
       final elm = FakeElm();
+      await elm.prime();
       final r = (await elm.service.runDeepScan())!;
       expect(r.totalTested, 57);
       expect(r.items.where((i) => i.candidate).length, 13);
@@ -77,6 +85,7 @@ void main() {
     'scan drains whole in-flight poll and rejects manual commands',
     () async {
       final elm = FakeElm();
+      await elm.prime();
       final blocked = Completer<void>();
       final entered = Completer<void>();
       elm.service.canBusReady = true;
@@ -109,6 +118,7 @@ void main() {
     'manual exchange before scan drains; later manual writes rejected',
     () async {
       final elm = FakeElm();
+      await elm.prime();
       final entered = Completer<void>();
       final release = Completer<void>();
       elm.intercept = (cmd) async {
@@ -135,6 +145,7 @@ void main() {
     'failed header never sends PID to inherited target; trace keeps raw error',
     () async {
       final elm = FakeElm();
+      await elm.prime();
       var count = 0;
       elm.intercept = (cmd) async {
         if (cmd == 'ATSH7DF' && ++count == 2) {
@@ -152,6 +163,7 @@ void main() {
   );
   test('ECU discovery never infers header from payload', () async {
     final elm = FakeElm();
+    await elm.prime();
     elm.intercept = (cmd) async {
       if (cmd == '0100') {
         elm.service.receiveForTesting('41007E87EA00\r>');
@@ -165,6 +177,7 @@ void main() {
   });
   test('cancel after completed probe restores actual prior settings', () async {
     final elm = FakeElm();
+    await elm.prime();
     await elm.service.sendRawCommand('ATSH7E0');
     await elm.service.sendRawCommand('ATH1');
     final r = (await elm.service.runDeepScan(
@@ -181,6 +194,7 @@ void main() {
     'pending cancellation is bounded; late prompt drains before restore',
     () async {
       final elm = FakeElm();
+      await elm.prime();
       elm.intercept = (cmd) async {
         if (cmd == '0104') {
           elm.service.receiveForTesting('7E8 03 41 04');
@@ -204,6 +218,7 @@ void main() {
     'timeout fragment retained; no next PID; failed restore suspends polling',
     () async {
       final elm = FakeElm();
+      await elm.prime();
       elm.intercept = (cmd) async {
         if (cmd == '0104') {
           elm.service.receiveForTesting('7E8 03 41 04 7F');
@@ -228,6 +243,7 @@ void main() {
     'disconnect preserves fragment; never claims restoration sent',
     () async {
       final elm = FakeElm();
+      await elm.prime();
       elm.intercept = (cmd) async {
         if (cmd == '0104') {
           elm.service.receiveForTesting('7E8 03');
@@ -251,6 +267,7 @@ void main() {
     'protocol mismatch preserves error report and releases scan flag',
     () async {
       final elm = FakeElm()..protocol = '7';
+      await elm.prime();
       final r = (await elm.service.runDeepScan())!;
       expect(r.outcome, 'error');
       expect(r.totalTested, 0);
@@ -261,6 +278,7 @@ void main() {
   );
   test('manual CAF0 and echoed ATDPN restore original formatting', () async {
     final elm = FakeElm();
+    await elm.prime();
     await elm.service.sendRawCommand('ATCAF0');
     elm.intercept = (cmd) async {
       if (cmd == 'ATDPN') {
@@ -285,6 +303,7 @@ void main() {
   });
   test('failed restore ACK is explicit and suspends polling', () async {
     final elm = FakeElm();
+    await elm.prime();
     elm.intercept = (cmd) async {
       if (cmd == 'ATH0') {
         elm.service.receiveForTesting('?\r>');
@@ -305,6 +324,7 @@ void main() {
     'cancel while waiting never interrupts a prior manual exchange',
     () async {
       final elm = FakeElm();
+      await elm.prime();
       final entered = Completer<void>();
       final release = Completer<void>();
       elm.intercept = (cmd) async {
@@ -330,6 +350,7 @@ void main() {
     'ambiguous write failure never retries or sends diagnostic followup',
     () async {
       final elm = FakeElm();
+      await elm.prime();
       elm.intercept = (cmd) async {
         if (cmd == '0104') throw StateError('fake BLE write failed');
         elm.answer(cmd);
@@ -345,6 +366,7 @@ void main() {
     'unacknowledged manual setting invalidates the old adapter snapshot',
     () async {
       final elm = FakeElm();
+      await elm.prime();
       await elm.service.sendRawCommand('ATSH7E0');
       elm.intercept = (cmd) async {
         if (cmd == 'ATSH7E2') {
@@ -360,16 +382,22 @@ void main() {
         },
       ))!;
       expect(r.trace.first['header'], 'unknown');
-      expect(elm.commands.sublist(elm.commands.length - 2), [
-        'ATSH7DF',
-        'ATH0',
-      ]);
+      expect(
+        r.trace
+            .where((t) => t['completion'] == 'unknown_original_not_restored')
+            .length,
+        1,
+      );
+      expect(r.trace.last['restoration_acknowledged'], isFalse);
+      expect(r.trace.last['polling_suspended'], isTrue);
+      expect(elm.commands.last, 'ATH0');
     },
   );
   test(
     'repeated cancellation cannot interrupt finally restoration ACK',
     () async {
       final elm = FakeElm();
+      await elm.prime();
       var formattingCount = 0;
       elm.intercept = (cmd) async {
         if (cmd == 'ATCAF1' && ++formattingCount == 2) {

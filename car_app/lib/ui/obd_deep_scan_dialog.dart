@@ -121,7 +121,7 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
   void _cancelScan() {
     _obd.cancelDeepScan();
     setState(() {
-      _statusMessage = '正在中止扫描并复位总线报头...';
+      _statusMessage = '正在中止，等待旧响应结束并核对恢复状态...';
     });
   }
 
@@ -276,7 +276,7 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
                     ),
                   ),
                   Text(
-                    '自动遍历标准 OBD、车辆标识、丰田混动 0x7E2 与发动机 0x7E0 专有数据块',
+                    '固定候选诊断；保留失败、逐通知证据及恢复状态',
                     style: TextStyle(
                       color: Colors.white.withValues(alpha: 0.5),
                       fontSize: 9.5,
@@ -335,6 +335,13 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
                     ],
                   ),
                   const SizedBox(height: 6),
+                  ValueListenableBuilder<String>(
+                    valueListenable: _obd.diagnosticStateNotifier,
+                    builder: (context, state, child) => Text(
+                      state,
+                      style: const TextStyle(color: Colors.amber, fontSize: 10),
+                    ),
+                  ),
                   LinearProgressIndicator(
                     value: _progress.clamp(0.0, 1.0),
                     backgroundColor: Colors.white12,
