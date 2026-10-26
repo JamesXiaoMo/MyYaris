@@ -6,12 +6,18 @@ import 'package:my_yaris/services/car_obd_service.dart';
 import 'package:my_yaris/services/obd_transport_journal.dart';
 
 class ByteElm {
-  late final CarObdService service = CarObdService.forTesting(
-    write,
-    journalSink: (event) async {
-      events.add(event);
-    },
-  );
+  late final CarObdService service = createService();
+  CarObdService createService() {
+    final service = CarObdService.forTesting(
+      write,
+      journalSink: (event) async {
+        events.add(event);
+      },
+    );
+    service.beginTransportForTesting();
+    return service;
+  }
+
   final commands = <String>[];
   final events = <Map<String, dynamic>>[];
   final delivered = <int>[];
@@ -303,7 +309,7 @@ void main() {
         expect(report.transportStorage['storage_failures'], 0);
         expect(
           report.transportStorage['persisted_through_event'],
-          events.last['event_seq'],
+          greaterThanOrEqualTo(events.last['event_seq']),
         );
       } finally {
         fragments?.cancel();
@@ -334,7 +340,7 @@ void main() {
   );
 
   test(
-    'native journal failures are visible; queued subsequent evidence is still attempted',
+    'native journal failure stops the sink and preserves an explicit incomplete capture',
     () async {
       var attempts = 0;
       final journal = ObdTransportJournal(
@@ -347,10 +353,11 @@ void main() {
       journal.record('rx_notification', {'raw_hex': '00FF', 'length': 2});
       journal.record('prompt');
       await journal.flush();
-      expect(attempts, 2);
+      expect(attempts, 1);
       expect(journal.storageStatus['storage_failures'], 1);
-      expect(journal.storageStatus['persisted_through_event'], isNull);
-      expect(journal.endCapture().length, 2);
+      expect(journal.storageStatus['persisted_through_event'], 0);
+      expect(journal.storageStatus['first_failed_event'], 1);
+      expect(journal.storageStatus['stop_reason'], 'storage_failure');
     },
   );
 

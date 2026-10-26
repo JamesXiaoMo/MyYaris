@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -54,9 +55,13 @@ void main() {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(ObdReportExportService.channel, (call) async {
           calls.add(call);
-          return call.method == 'appendTransport'
-              ? null
-              : 'private/obd_reports/test';
+          return call.method == 'export'
+              ? {
+                  'path': 'private/obd_bundles/test.zip',
+                  'complete': true,
+                  'integrity': 'complete_within_window',
+                }
+              : null;
         });
   });
   tearDown(
@@ -86,7 +91,7 @@ void main() {
   testWidgets(
     'debug dialog export waits for sensitive confirmation and exports both formats',
     (tester) async {
-      await tester.binding.setSurfaceSize(const Size(1600, 1000));
+      await tester.binding.setSurfaceSize(const Size(800, 480));
       addTearDown(() => tester.binding.setSurfaceSize(null));
       final service = CarObdService.forTesting((_) async {});
       service.lastDeepScanReportNotifier.value = report();
@@ -97,27 +102,69 @@ void main() {
       );
       await tester.pumpAndSettle();
       expect(calls, isEmpty);
-      await tester.tap(find.text('保存 JSON + Markdown'));
+      await tester.tap(find.text('保存完整诊断包'));
       await tester.pumpAndSettle();
       expect(find.text(ObdDeepScanReport.sensitiveNotice), findsOneWidget);
       expect(calls, isEmpty);
       await tester.tap(find.text('取消'));
       await tester.pumpAndSettle();
       expect(calls, isEmpty);
-      await tester.tap(find.text('保存 JSON + Markdown'));
+      await tester.tap(find.text('保存完整诊断包'));
       await tester.pumpAndSettle();
       await tester.tap(find.text('确认'));
       await tester.pumpAndSettle();
       expect(calls.length, 1);
       expect(calls.single.arguments['share'], isFalse);
       expect(calls.single.arguments['json'], report().toJsonText());
-      await tester.tap(find.text('分享完整证据'));
+      await tester.tap(find.text('分享完整诊断包'));
       await tester.pumpAndSettle();
       expect(calls.length, 1);
       await tester.tap(find.text('确认'));
       await tester.pumpAndSettle();
       expect(calls.length, 2);
       expect(calls.last.arguments['share'], isTrue);
+      expect(tester.takeException(), isNull);
+    },
+  );
+  testWidgets(
+    'small-screen export stays busy until completion and warns on incomplete native logs',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(800, 480));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final pending = Completer<Map<String, dynamic>>();
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(ObdReportExportService.channel, (
+            call,
+          ) async {
+            calls.add(call);
+            return pending.future;
+          });
+      final service = CarObdService.forTesting((_) async {});
+      service.lastDeepScanReportNotifier.value = report();
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(body: ObdDeepScanDialog(service: service)),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('保存完整诊断包'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('确认'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+      expect(find.text('正在封存日志...'), findsOneWidget);
+      final share = tester.widget<TextButton>(
+        find.widgetWithText(TextButton, '分享完整诊断包'),
+      );
+      expect(share.onPressed, isNull);
+      pending.complete({
+        'path': 'private/test.zip',
+        'complete': false,
+        'integrity': 'incomplete',
+      });
+      await tester.pumpAndSettle();
+      expect(find.textContaining('日志不完整/受限'), findsOneWidget);
+      expect(calls.length, 1);
       expect(tester.takeException(), isNull);
     },
   );
@@ -144,15 +191,21 @@ void main() {
         'length': 4,
       });
       await journal.flush();
-      expect(calls.single.method, 'appendTransport');
-      expect(calls.single.arguments['session'], journal.session);
-      expect(jsonDecode(calls.single.arguments['event']), event);
-      expect(calls.single.arguments.containsKey('share'), isFalse);
+      final rx = calls.singleWhere(
+        (c) =>
+            c.method == 'appendTransport' &&
+            jsonDecode(c.arguments['event'])['phase'] == 'rx_notification',
+      );
+      expect(rx.arguments['session'], journal.session);
+      expect(jsonDecode(rx.arguments['event']), event);
+      expect(rx.arguments.containsKey('share'), isFalse);
       expect(
         journal.storageStatus['persisted_through_event'],
-        event['event_seq'],
+        event!['event_seq'],
       );
       expect(journal.storageStatus['storage_failures'], 0);
+      journal.stop();
+      await journal.flush();
     },
   );
 }

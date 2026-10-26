@@ -30,6 +30,7 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
   List<String> _activeEcus = [];
   ObdDeepScanReport? _report;
   bool _isScanning = false;
+  bool _isExporting = false;
 
   @override
   void initState() {
@@ -151,11 +152,17 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
   Future<void> _exportReport({bool share = false}) async {
     final report = _report;
     if (report == null || !await _confirmSensitive() || !mounted) return;
+    if (_isExporting) return;
+    setState(() => _isExporting = true);
     try {
-      final path = await ObdReportExportService.export(report, share: share);
+      final result = await ObdReportExportService.export(report, share: share);
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('JSON + Markdown 已保存到 App 私有目录：$path')),
+        SnackBar(
+          content: Text(
+            '${result.complete ? '完整诊断包已保存' : '诊断包已保存，日志不完整/受限，请查看清单'}：${result.path}',
+          ),
+        ),
       );
     } catch (e) {
       if (mounted) {
@@ -163,6 +170,8 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
           context,
         ).showSnackBar(SnackBar(content: Text('导出失败：$e')));
       }
+    } finally {
+      if (mounted) setState(() => _isExporting = false);
     }
   }
 
@@ -607,14 +616,16 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
             children: [
               if (_report != null) ...[
                 TextButton.icon(
-                  onPressed: () => _exportReport(),
+                  onPressed: _isExporting ? null : () => _exportReport(),
                   icon: const Icon(Icons.save_alt),
-                  label: const Text('保存 JSON + Markdown'),
+                  label: Text(_isExporting ? '正在封存日志...' : '保存完整诊断包'),
                 ),
                 TextButton.icon(
-                  onPressed: () => _exportReport(share: true),
+                  onPressed: _isExporting
+                      ? null
+                      : () => _exportReport(share: true),
                   icon: const Icon(Icons.share),
-                  label: const Text('分享完整证据'),
+                  label: const Text('分享完整诊断包'),
                 ),
                 ElevatedButton.icon(
                   style: ElevatedButton.styleFrom(

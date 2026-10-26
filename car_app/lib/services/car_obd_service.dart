@@ -19,19 +19,29 @@ class CarObdService {
   CarObdService.forTesting(
     Future<void> Function(List<int>) writer, {
     Future<void> Function(Map<String, dynamic>)? journalSink,
-  }) : _testWriter = writer,
+    ObdTransportJournal? transportJournal,
+  }) : _testJournal = transportJournal,
+       _testWriter = writer,
        _testJournalSink = journalSink {
     _updateStatus(ObdConnectionStatus.ready);
   }
   Future<void> Function(List<int>)? _testWriter;
   Future<void> Function(Map<String, dynamic>)? _testJournalSink;
-  late final ObdTransportJournal _journal = ObdTransportJournal(
-    test: _testWriter != null,
-    sink: _testJournalSink,
-  );
+  ObdTransportJournal? _testJournal;
+  late final ObdTransportJournal _journal =
+      _testJournal ??
+      ObdTransportJournal(
+        test: _testWriter != null,
+        sink: _testJournalSink,
+        tailWindow: _testWriter != null
+            ? Duration.zero
+            : const Duration(seconds: 2),
+      );
   int _transactionSequence = 0;
   int _notificationSequence = 0;
   int? _transactionId;
+  String? _transactionSession;
+  String? _notifyUuid;
   int? _observedMtu;
   StreamSubscription<int>? _mtuSubscription;
   Map<String, dynamic>? _exchangeStats;
@@ -42,7 +52,11 @@ class CarObdService {
 
   bool get isPollingSuspended => _pollingSuspended;
   void _transportEvent(String phase, [Map<String, dynamic> fields = const {}]) {
-    _journal.record(phase, {'transaction_id': _transactionId, ...fields});
+    _journal.record(phase, {
+      'transaction_id': _transactionId,
+      'transaction_origin_session': _transactionSession,
+      ...fields,
+    });
   }
 
   final Object _sequenceKey = Object();
@@ -88,6 +102,10 @@ class CarObdService {
   }) => _exchange(cmd, timeout: timeout);
   @visibleForTesting
   Future<void> flushJournalForTesting() => _journal.flush();
+  @visibleForTesting
+  void beginTransportForTesting() => _journal.beginCapture();
+  @visibleForTesting
+  void stopTransportForTesting() => _journal.stop();
   @visibleForTesting
   void disconnectForTesting() => _handleDisconnection();
 
@@ -241,6 +259,7 @@ class CarObdService {
 
       _connectionStateSubscription = device.connectionState.listen((state) {
         log('📶 蓝牙链路状态变动: $state');
+        _transportEvent('connection_state', {'state': state.name});
         if (state == BluetoothConnectionState.disconnected) {
           _handleDisconnection();
         }
@@ -288,6 +307,7 @@ class CarObdService {
       _knownFormatting = null;
       _writeCharacteristic = channel.writeCharacteristic;
       final notifyChar = channel.notifyCharacteristic;
+      _notifyUuid = notifyChar.uuid.str128;
 
       log('🎯 锁定 OBD 通信通道 [${channel.profileName}]');
       log('   🔹 服务: ${channel.service.uuid.str128}');
@@ -1351,6 +1371,7 @@ class CarObdService {
     final id = ++_transactionSequence;
     final stats = <String, dynamic>{
       'transaction_id': id,
+      'transaction_origin_session': _journal.session,
       'start_us': _journal.nowUs,
       'deadline_us': _journal.nowUs + timeout.inMicroseconds,
       'timeout_ms': timeout.inMilliseconds,
@@ -1365,6 +1386,10 @@ class CarObdService {
     };
     ElmReply finish(String raw, String completion) {
       final details = Map<String, dynamic>.from(stats);
+      if (stats['write_attempted'] == false && raw.isNotEmpty) {
+        details['buffer_origin_transaction_id'] = _transactionId;
+        details['buffer_origin_session'] = _transactionSession;
+      }
       _transportEvent('exchange_end', {
         ...details,
         'command': command,
@@ -1408,6 +1433,7 @@ class CarObdService {
       _replyPromptSeen = false;
       _activeInterrupted = false;
       _transactionId = id;
+      _transactionSession = _journal.session;
       _exchangeStats = stats;
       final complete = Completer<String>();
       _cmdCompleter = complete;
@@ -1423,7 +1449,9 @@ class CarObdService {
         'mtu': _observedMtu,
         'write_mode': _testWriter != null
             ? 'fake'
-            : w?.properties.writeWithoutResponse == true
+            : w == null
+            ? 'not_acquired'
+            : w.properties.writeWithoutResponse == true
             ? 'without_response'
             : 'with_response',
         'write_supported': w?.properties.write,
@@ -1588,6 +1616,7 @@ class CarObdService {
       'received_us': now,
       'raw_hex': ElmObdParser.hex(data),
       'length': data.length,
+      'transaction_rx_bytes': stats?['rx_byte_count'],
       'late': late,
       'mtu': _observedMtu,
     });
@@ -1732,7 +1761,10 @@ class CarObdService {
         _markUnsynchronized();
         _cmdCompleter!.complete(_rxBuffer.toString());
       }
-      log('⚠️ 用户请求终止全车深度扫描');
+      _transportEvent('cancel_requested', {
+        'synchronized': _serialSynchronized,
+      });
+      log('⚠️ 用户请求中止当前诊断模块');
     }
   }
 
@@ -1767,8 +1799,17 @@ class CarObdService {
     }
     _scanOwnsSerial = true;
     _scanLateReplies.clear();
-    _journal.beginCapture();
-    _transportEvent('capture_start', {'mtu': _observedMtu});
+    final capture = _journal.beginCapture();
+    _transportEvent('capture_start', {
+      'mtu': _observedMtu,
+      'connection_state': currentTelemetry.status.name,
+      'synchronized': _serialSynchronized,
+      'write_characteristic_uuid':
+          _writeCharacteristic?.uuid.str128 ?? 'not_acquired',
+      'notify_characteristic_uuid': _notifyUuid ?? 'not_acquired',
+      'service_uuid':
+          _writeCharacteristic?.serviceUuid.str128 ?? 'not_acquired',
+    });
     final start = DateTime.now();
     final probes = _buildProbeList(module);
     final items = <ObdDiscoveredItem>[];
@@ -1914,6 +1955,13 @@ class CarObdService {
             candidateExplanation: probe.explanation,
             expectedResponseEcu: probe.expectedEcu,
           );
+          _transportEvent('parser_result', {
+            'command': probe.cmd,
+            'completion': r.completion,
+            'reason': evidence.reason,
+            'frame_verdicts': evidence.frames.map((f) => f.verdict).toList(),
+            'response_ecus': evidence.frames.map((f) => f.ecu).toSet().toList(),
+          });
           items.add(item);
           ecus.addAll(
             evidence.frames
@@ -2021,6 +2069,17 @@ class CarObdService {
       diagnosticStateNotifier.value = _pollingSuspended
           ? '诊断已暂停：串口未同步或原状态恢复未确认'
           : '串口已同步，原状态恢复已确认';
+      for (final entry in trace.where(
+        (t) =>
+            t['phase'] == 'restore' ||
+            t['phase'] == 'restore_result' ||
+            t['phase'] == 'restore_sync',
+      )) {
+        _transportEvent('recovery_result', {
+          ...entry,
+          'recovery_phase': entry['phase'],
+        });
+      }
       _transportEvent('capture_end', {
         'polling_suspended': _pollingSuspended,
         'synchronized': _serialSynchronized,
@@ -2037,21 +2096,21 @@ class CarObdService {
         'connected': isConnected,
       });
     }
-    final transportEvents = _journal.endCapture();
-    await _journal.flush();
+    final transportEvents = _journal.endCapture(capture);
+    await _journal.flush(capture);
     if (_journal.storageFailures > 0) {
       diagnosticStateNotifier.value += '；私有日志未完整保存，请查看报告';
     }
-    final report = ObdDeepScanReport(
+    late final ObdDeepScanReport report;
+    report = ObdDeepScanReport(
+      prepareForExport: () async {
+        final allEvents = await _journal.sealForExport(capture);
+        return report.withTransport(allEvents, _journal.statusFor(capture));
+      },
       startTime: start,
       module: module,
       transportEvents: transportEvents,
-      transportStorage: {
-        ..._journal.storageStatus,
-        'capture_end_event': transportEvents.isEmpty
-            ? null
-            : transportEvents.last['event_seq'],
-      },
+      transportStorage: _journal.statusFor(capture),
       endTime: DateTime.now(),
       deviceName: connectedDeviceName ?? 'unknown',
       protocolName: protocol,

@@ -109,6 +109,7 @@ class ObdDeepScanReport {
   final List<Map<String, dynamic>> transportEvents;
   final Map<String, dynamic> transportStorage;
   final ObdScanModule module;
+  final Future<ObdDeepScanReport> Function()? prepareForExport;
   const ObdDeepScanReport({
     required this.startTime,
     this.endTime,
@@ -123,11 +124,31 @@ class ObdDeepScanReport {
     this.transportEvents = const [],
     this.transportStorage = const {},
     this.module = ObdScanModule.basic,
+    this.prepareForExport,
   });
+  ObdDeepScanReport withTransport(
+    List<Map<String, dynamic>> events,
+    Map<String, dynamic> storage,
+  ) => ObdDeepScanReport(
+    startTime: startTime,
+    endTime: endTime,
+    deviceName: deviceName,
+    protocolName: protocolName,
+    activeEcus: activeEcus,
+    items: items,
+    totalTested: totalTested,
+    totalSupported: totalSupported,
+    outcome: outcome,
+    trace: trace,
+    module: module,
+    transportEvents: events,
+    transportStorage: storage,
+  );
+
   int get parsedCount =>
       items.where((i) => i.decodedHint != null && !i.candidate).length;
   Map<String, dynamic> toJson() => {
-    'schema_version': 4,
+    'schema_version': 5,
     'module': module.name,
     'planned_probe_count': module.plannedCount,
     'explicit_discovery_0100': module.discoversEcus,
