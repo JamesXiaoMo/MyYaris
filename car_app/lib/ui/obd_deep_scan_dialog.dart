@@ -25,7 +25,7 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
   final ScrollController _listScrollController = ScrollController();
 
   double _progress = 0.0;
-  String _statusMessage = '就绪：点击下方【开始深度扫描】扫描固定 57 项候选；不代表全车能力';
+  String _statusMessage = '就绪：基础 53 项、油量 3 项、车辆标识 4 项分开手动测试；不代表支持';
   final List<ObdDiscoveredItem> _discoveredItems = [];
   List<String> _activeEcus = [];
   ObdDeepScanReport? _report;
@@ -52,7 +52,7 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
     super.dispose();
   }
 
-  Future<void> _startScan() async {
+  Future<void> _startScan([ObdScanModule module = ObdScanModule.basic]) async {
     if (!_obd.isConnected) {
       setState(() {
         _statusMessage = '⚠️ 请先在主界面点击【扫描 OBD】连接 Veepeak 适配器，再执行候选扫描';
@@ -63,9 +63,11 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
     final proceed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('确认扫描工况与范围'),
-        content: const Text(
-          '仅在车辆停稳、允许诊断时开始。将执行显式 0100 节点发现及固定 57 项候选（含 13 项地址/解码未验证的私有请求，7EB 请求地址存疑）。不会遍历所有 ECU，也不代表全部能力。',
+        title: Text('确认${module.label}'),
+        content: Text(
+          '仅在车辆停稳且允许诊断时开始。${module.scopeDescription}'
+          ' 失步会停止后续写入；原状态未知或恢复未确认会暂停。'
+          '${module == ObdScanModule.basic ? ' 私有地址/解码未验证，7EB请求地址存疑。' : ''}',
         ),
         actions: [
           TextButton(
@@ -83,13 +85,14 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
     setState(() {
       _isScanning = true;
       _progress = 0.02;
-      _statusMessage = '正在准备固定候选诊断探针...';
+      _statusMessage = '正在准备${module.label}...';
       _discoveredItems.clear();
       _activeEcus.clear();
       _report = null;
     });
 
     final report = await _obd.runDeepScan(
+      module: module,
       onProgress: (progress, status, newItem) {
         if (!mounted) return;
         setState(() {
@@ -110,7 +113,7 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
           _activeEcus = report.activeEcus;
           _progress = 1.0;
           _statusMessage =
-              '${report.outcome}：已测 ${report.totalTested}，响应 ${report.totalSupported}，解析 ${report.parsedCount}；恢复状态见报告';
+              '${report.module.label} / ${report.outcome}：已测 ${report.totalTested}，响应 ${report.totalSupported}，解析 ${report.parsedCount}；恢复状态见报告';
         } else {
           _statusMessage = '扫描已中止或未完成';
         }
@@ -276,7 +279,7 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
                     ),
                   ),
                   Text(
-                    '固定候选诊断；保留失败、逐通知证据及恢复状态',
+                    '基础、油量与车辆标识分项手动测试；保留全部失败证据',
                     style: TextStyle(
                       color: Colors.white.withValues(alpha: 0.5),
                       fontSize: 9.5,
@@ -300,6 +303,27 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
+            Wrap(
+              spacing: 8,
+              children: [
+                TextButton.icon(
+                  key: const ValueKey('obd-fuel-test'),
+                  onPressed: _isScanning
+                      ? null
+                      : () => _startScan(ObdScanModule.fuel),
+                  icon: const Icon(Icons.local_gas_station, size: 16),
+                  label: const Text('油量专项测试（候选）'),
+                ),
+                TextButton.icon(
+                  key: const ValueKey('obd-metadata-test'),
+                  onPressed: _isScanning
+                      ? null
+                      : () => _startScan(ObdScanModule.vehicleInfo),
+                  icon: const Icon(Icons.badge_outlined, size: 16),
+                  label: const Text('车辆标识测试（单独）'),
+                ),
+              ],
+            ),
             // 1. 进度条与状态条
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
@@ -406,7 +430,7 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
                             ),
                             const SizedBox(height: 8),
                             const Text(
-                              '固定 57 项候选与显式 0100 节点发现，保留全部失败和原始回复。\n不是全部 ECU 遍历；私有地址和解码未验证。',
+                              '基础扫描 53 项，不读 Mode 09；油量与车辆标识需分别手动启动。\n油量候选未验证，不换算正式升数，不自动轮询。',
                               textAlign: TextAlign.center,
                               style: TextStyle(
                                 color: Colors.white38,
@@ -573,81 +597,113 @@ class _ObdDeepScanDialogState extends State<ObdDeepScanDialog> {
         ),
       ),
       actions: [
-        if (_report != null) ...[
-          TextButton.icon(
-            onPressed: () => _exportReport(),
-            icon: const Icon(Icons.save_alt),
-            label: const Text('保存 JSON + Markdown'),
-          ),
-          TextButton.icon(
-            onPressed: () => _exportReport(share: true),
-            icon: const Icon(Icons.share),
-            label: const Text('分享完整证据'),
-          ),
-          ElevatedButton.icon(
-            style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFF1E3A2F),
-              foregroundColor: Colors.tealAccent,
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(6),
-                side: const BorderSide(color: Colors.tealAccent),
+        SizedBox(
+          width: 760,
+          child: Wrap(
+            alignment: WrapAlignment.end,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            spacing: 6,
+            runSpacing: 2,
+            children: [
+              if (_report != null) ...[
+                TextButton.icon(
+                  onPressed: () => _exportReport(),
+                  icon: const Icon(Icons.save_alt),
+                  label: const Text('保存 JSON + Markdown'),
+                ),
+                TextButton.icon(
+                  onPressed: () => _exportReport(share: true),
+                  icon: const Icon(Icons.share),
+                  label: const Text('分享完整证据'),
+                ),
+                ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF1E3A2F),
+                    foregroundColor: Colors.tealAccent,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 7,
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(6),
+                      side: const BorderSide(color: Colors.tealAccent),
+                    ),
+                  ),
+                  icon: const Icon(Icons.copy, size: 15),
+                  label: const Text(
+                    '复制 Markdown 报告',
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  onPressed: _copyMarkdownReport,
+                ),
+                ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF222C3D),
+                    foregroundColor: Colors.lightBlueAccent,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 7,
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(6),
+                      side: const BorderSide(color: Colors.lightBlueAccent),
+                    ),
+                  ),
+                  icon: const Icon(Icons.visibility, size: 15),
+                  label: const Text(
+                    '查看报告全文',
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  onPressed: _showReportFullscreen,
+                ),
+              ],
+              const SizedBox(width: 6),
+              if (_isScanning)
+                ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.red.shade900,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 7,
+                    ),
+                  ),
+                  icon: const Icon(Icons.stop, size: 15),
+                  label: const Text('中止扫描', style: TextStyle(fontSize: 11.5)),
+                  onPressed: _cancelScan,
+                )
+              else
+                ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.teal,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 7,
+                    ),
+                  ),
+                  icon: const Icon(Icons.play_arrow, size: 16),
+                  label: Text(
+                    _report == null ? '开始基础扫描（53项）' : '重新基础扫描（53项）',
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  onPressed: _startScan,
+                ),
+              TextButton(
+                onPressed: _isScanning ? null : () => Navigator.pop(context),
+                child: const Text('关闭'),
               ),
-            ),
-            icon: const Icon(Icons.copy, size: 15),
-            label: const Text(
-              '复制 Markdown 报告',
-              style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold),
-            ),
-            onPressed: _copyMarkdownReport,
+            ],
           ),
-          ElevatedButton.icon(
-            style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFF222C3D),
-              foregroundColor: Colors.lightBlueAccent,
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(6),
-                side: const BorderSide(color: Colors.lightBlueAccent),
-              ),
-            ),
-            icon: const Icon(Icons.visibility, size: 15),
-            label: const Text(
-              '查看报告全文',
-              style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold),
-            ),
-            onPressed: _showReportFullscreen,
-          ),
-        ],
-        const SizedBox(width: 6),
-        if (_isScanning)
-          ElevatedButton.icon(
-            style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.red.shade900,
-              foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
-            ),
-            icon: const Icon(Icons.stop, size: 15),
-            label: const Text('中止扫描', style: TextStyle(fontSize: 11.5)),
-            onPressed: _cancelScan,
-          )
-        else
-          ElevatedButton.icon(
-            style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.teal,
-              foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
-            ),
-            icon: const Icon(Icons.play_arrow, size: 16),
-            label: Text(
-              _report == null ? '开始深度扫描' : '重新扫描',
-              style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
-            ),
-            onPressed: _startScan,
-          ),
-        TextButton(
-          onPressed: _isScanning ? null : () => Navigator.pop(context),
-          child: const Text('关闭'),
         ),
       ],
     );

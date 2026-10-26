@@ -1,6 +1,6 @@
 # OBD scan evidence and review boundary
 
-The scan uses the existing fixed 57 candidates: 40 Mode 01, 4 Mode 09 and 13 private requests. It also explicitly performs `0100` with headers to identify responding nodes. It does not enumerate every ECU or every supported PID. A historical count such as 35 responses is an observation of a particular request set, not the vehicle's complete capability. No additional support-bitmap walk is performed.
+The original fixed 57 candidates are now split into 53 basic probes (40 Mode 01 and 13 private) and four explicit, separate Mode 09 metadata probes. A separate manual three-candidate fuel test is also available. Only the basic module adds explicit `0100` discovery; neither fuel nor metadata requires it. No module enumerates every ECU or every supported PID. See [manual diagnostic modules](obd-diagnostic-modules.md) for the exact ranges and schema 4 fields. A historical count such as 35 responses is an observation of a particular request set, not the vehicle's complete capability.
 
 The private address/DID mappings and formulas are unverified on this vehicle. In particular, `7EB` is a suspect request address; this change neither substitutes an invented address nor claims private support. Private matched responses remain candidate evidence without decoded engineering values. Fuel percentage is not converted into litres.
 
@@ -34,3 +34,5 @@ Offline Flutter tests exercise the actual service serial queue through a fake BL
 After parent review and authorized in-place installation, the smallest controlled vehicle acceptance should start with a confirmed parked vehicle, explicit standard verification, a small known standard response capture and a cancellation/recovery check. Review JSON/Markdown and actual restore ACKs before considering a full candidate scan. Do not use this change to claim CarScanner parameter parity.
 
 The schema 3 byte journal, prompt-tail quarantine, pending-write fence, stricter envelope validation and offline acceptance are described in [OBD transport recovery](obd-transport-recovery.md). Unknown fuel candidates remain unverified.
+
+Schema 4 modules keep the existing byte-journal/recovery guarantees. Moving metadata out of the default basic path does not permit writes after an incomplete exchange or validate fuel support.

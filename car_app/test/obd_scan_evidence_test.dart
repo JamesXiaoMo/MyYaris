@@ -43,12 +43,12 @@ class FakeElm {
 
 void main() {
   test(
-    'real scan retains 57 probes, failures, full raw, headers and standard decode',
+    'basic scan retains 53 probes, failures, full raw, headers and standard decode',
     () async {
       final elm = FakeElm();
       await elm.prime();
       final r = (await elm.service.runDeepScan())!;
-      expect(r.totalTested, 57);
+      expect(r.totalTested, 53);
       expect(r.items.where((i) => i.candidate).length, 13);
       expect(r.totalSupported, 2);
       expect(r.parsedCount, 2);
@@ -71,7 +71,10 @@ void main() {
         expect(elm.commands[index - 1], 'ATSH${i.header}');
       }
       final json = jsonDecode(r.toJsonText()) as Map;
-      expect(json['items'].length, 57);
+      expect(json['items'].length, 53);
+      expect(json['planned_probe_count'], 53);
+      expect(elm.commands.any((c) => c.startsWith('09')), isFalse);
+      expect(elm.commands, contains('21CE'));
       expect(json.containsKey('support_rate'), isFalse);
       expect(r.toMarkdown(), contains('NO DATA\r>'));
       expect(r.trace.last['restoration_acknowledged'], isTrue);

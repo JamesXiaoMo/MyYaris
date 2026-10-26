@@ -1,6 +1,38 @@
 import 'dart:convert';
 import 'elm_obd_response.dart';
 
+enum ObdScanModule { basic, fuel, vehicleInfo }
+
+extension ObdScanModuleScope on ObdScanModule {
+  String get label => switch (this) {
+    ObdScanModule.basic => '基础候选扫描',
+    ObdScanModule.fuel => '油量专项测试（候选/未验证）',
+    ObdScanModule.vehicleInfo => '车辆标识测试（单独）',
+  };
+  int get plannedCount => switch (this) {
+    ObdScanModule.basic => 53,
+    ObdScanModule.fuel => 3,
+    ObdScanModule.vehicleInfo => 4,
+  };
+  bool get discoversEcus => this == ObdScanModule.basic;
+  String get scope => switch (this) {
+    ObdScanModule.basic =>
+      '53 fixed candidates (40 Mode 01 + 13 private) plus explicit 0100 discovery; Mode 09 excluded; not vehicle-wide coverage.',
+    ObdScanModule.fuel =>
+      '3 manual unverified fuel candidates: 7DF/012F, 7C0/221022, 7C0/2129; no VIN/CALID or discovery; no litre conversion or polling.',
+    ObdScanModule.vehicleInfo =>
+      '4 explicit Mode 09 broadcast metadata requests: 0902, 0904, 0906, 090A; may contain identifiers; independent of basic/fuel tests.',
+  };
+  String get scopeDescription => switch (this) {
+    ObdScanModule.basic =>
+      '53 项基础候选（40 Mode 01、13 私有）及显式 0100 发现；不含 Mode 09，不代表全车能力。',
+    ObdScanModule.fuel =>
+      '3 项手动油量候选：7DF/012F、7C0/221022、7C0/2129；不读取 VIN/CALID，不换算升数或启动轮询。',
+    ObdScanModule.vehicleInfo =>
+      '4 项独立 Mode 09 广播：0902、0904、0906、090A；含车辆标识，多源长回复可能失步。',
+  };
+}
+
 class ObdDiscoveredItem {
   final String category;
   final String header;
@@ -18,6 +50,8 @@ class ObdDiscoveredItem {
   final List<ObdFrameEvidence> frames;
   final bool candidate;
   final Map<String, dynamic> transport;
+  final String? candidateExplanation;
+  final String? expectedResponseEcu;
   const ObdDiscoveredItem({
     required this.category,
     required this.header,
@@ -33,6 +67,8 @@ class ObdDiscoveredItem {
     this.frames = const [],
     this.candidate = false,
     this.transport = const {},
+    this.candidateExplanation,
+    this.expectedResponseEcu,
   });
   Map<String, dynamic> toJson() => {
     'category': category,
@@ -48,6 +84,8 @@ class ObdDiscoveredItem {
     'time': time?.toIso8601String(),
     'candidate_unverified': candidate,
     'transport': transport,
+    'candidate_explanation': candidateExplanation,
+    'expected_response_ecu': expectedResponseEcu,
     'received_ecu_headers': frames.isEmpty
         ? ['unknown']
         : frames.map((f) => f.ecu).toSet().toList(),
@@ -70,6 +108,7 @@ class ObdDeepScanReport {
   final List<Map<String, dynamic>> trace;
   final List<Map<String, dynamic>> transportEvents;
   final Map<String, dynamic> transportStorage;
+  final ObdScanModule module;
   const ObdDeepScanReport({
     required this.startTime,
     this.endTime,
@@ -83,14 +122,17 @@ class ObdDeepScanReport {
     this.trace = const [],
     this.transportEvents = const [],
     this.transportStorage = const {},
+    this.module = ObdScanModule.basic,
   });
   int get parsedCount =>
       items.where((i) => i.decodedHint != null && !i.candidate).length;
   Map<String, dynamic> toJson() => {
-    'schema_version': 3,
+    'schema_version': 4,
+    'module': module.name,
+    'planned_probe_count': module.plannedCount,
+    'explicit_discovery_0100': module.discoversEcus,
     'sensitive_notice': sensitiveNotice,
-    'scope':
-        'Fixed 57 candidate probes plus explicit ECU discovery 0100; not all ECUs or vehicle capability coverage.',
+    'scope': module.scope,
     'start_time': startTime.toIso8601String(),
     'end_time': endTime?.toIso8601String(),
     'device_name': deviceName,
@@ -117,7 +159,7 @@ class ObdDeepScanReport {
       '- 已测 $totalTested 项；匹配响应 $totalSupported 项；标准值解析 $parsedCount 项。',
     );
     b.writeln(
-      '- 范围：固定 57 项候选（40 Mode 01、4 Mode 09、13 私有）及显式 0100 节点发现；不是全车支持率或全部 ECU 遍历。',
+      '- 模块：${module.label}；计划 ${module.plannedCount} 项。\n- 范围：${module.scopeDescription}',
     );
     b.writeln(
       '- 已识别响应 ECU：${activeEcus.isEmpty ? "未发现（不虚构节点）" : activeEcus.join(", ")}\n',
@@ -134,6 +176,12 @@ class ObdDeepScanReport {
         '- 接收 ECU：${i.frames.isEmpty ? "unknown" : i.frames.map((f) => f.ecu).toSet().join(", ")}',
       );
       if (i.decodedHint != null) b.writeln('- 解析：${i.decodedHint}');
+      if (i.candidateExplanation != null) {
+        b.writeln('- 候选解释：${i.candidateExplanation}');
+      }
+      if (i.expectedResponseEcu != null) {
+        b.writeln('- 预期来源：${i.expectedResponseEcu}');
+      }
       // Indent raw data rather than fencing: arbitrary replies cannot terminate a fence.
       b.writeln('\n原始完整回复：\n');
       for (final line in i.rawHexResponse.split('\n')) {

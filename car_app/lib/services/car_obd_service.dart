@@ -1415,14 +1415,23 @@ class CarObdService {
       _invalidateAdapterState(command);
       stats['write_attempted'] = true;
       stats['write_start_us'] = _journal.nowUs;
+      final w = _writeCharacteristic;
       _transportEvent('write_start', {
         'raw_hex': ElmObdParser.hex(data),
         'length': data.length,
         'deadline_us': stats['deadline_us'],
         'mtu': _observedMtu,
+        'write_mode': _testWriter != null
+            ? 'fake'
+            : w?.properties.writeWithoutResponse == true
+            ? 'without_response'
+            : 'with_response',
+        'write_supported': w?.properties.write,
+        'write_without_response_supported': w?.properties.writeWithoutResponse,
+        'service_uuid': w?.serviceUuid.str128,
+        'write_characteristic_uuid': w?.uuid.str128,
       });
       try {
-        final w = _writeCharacteristic;
         if (_testWriter == null && w == null) return finish('', 'disconnected');
         final operation = _testWriter != null
             ? _testWriter!(data)
@@ -1728,6 +1737,7 @@ class CarObdService {
   }
 
   Future<ObdDeepScanReport?> runDeepScan({
+    ObdScanModule module = ObdScanModule.basic,
     void Function(double progress, String status, ObdDiscoveredItem? newItem)?
     onProgress,
   }) async {
@@ -1738,7 +1748,7 @@ class CarObdService {
     isDeepScanningNotifier.value = true;
     _pollingTimer?.cancel();
     try {
-      return await _sequence(() => _runDeepScanOwned(onProgress));
+      return await _sequence(() => _runDeepScanOwned(module, onProgress));
     } finally {
       _isDeepScanning = false;
       _cancelDeepScanRequested = false;
@@ -1748,6 +1758,7 @@ class CarObdService {
   }
 
   Future<ObdDeepScanReport> _runDeepScanOwned(
+    ObdScanModule module,
     void Function(double, String, ObdDiscoveredItem?)? onProgress,
   ) async {
     // The sequence lock drains polling; drain a manual command that preceded it too.
@@ -1759,6 +1770,7 @@ class CarObdService {
     _journal.beginCapture();
     _transportEvent('capture_start', {'mtu': _observedMtu});
     final start = DateTime.now();
+    final probes = _buildProbeList(module);
     final items = <ObdDiscoveredItem>[];
     final ecus = <String>{};
     final trace = <Map<String, dynamic>>[];
@@ -1809,8 +1821,9 @@ class CarObdService {
         'display': savedDisplay ?? 'unknown',
         'protocol_setting': savedProtocol ?? 'unknown',
         'CAN_formatting': savedFormatting ?? 'unknown',
-        'scope':
-            '57 fixed probes + explicit 0100 discovery; no extra bitmap walk',
+        'module': module.name,
+        'planned_probe_count': probes.length,
+        'scope': module.scope,
       });
       if (_cancelDeepScanRequested) {
         outcome = isConnected ? 'cancelled' : 'disconnected';
@@ -1828,23 +1841,24 @@ class CarObdService {
         await setting('ATSH7DF');
         await setting('ATH1');
         await setting('ATCAF1');
-        progress(0.02, '显式 0100 响应节点发现（不是全部 ECU 遍历）', null);
-        final discovery = await exchange('0100');
-        final classified = ElmObdParser.classify(discovery, '0100');
-        trace.add({
-          'phase': 'ECU_discovery',
-          'reason': classified.reason,
-          'frames': classified.frames.map((f) => f.toJson()).toList(),
-        });
-        ecus.addAll(
-          classified.frames
-              .where((f) => f.positive && f.ecu != 'unknown')
-              .map((f) => f.ecu),
-        );
-        if (!discovery.complete) {
-          throw StateError('discovery_${discovery.completion}');
+        if (module.discoversEcus) {
+          progress(0.02, '显式 0100 响应节点发现（不是全部 ECU 遍历）', null);
+          final discovery = await exchange('0100');
+          final classified = ElmObdParser.classify(discovery, '0100');
+          trace.add({
+            'phase': 'ECU_discovery',
+            'reason': classified.reason,
+            'frames': classified.frames.map((f) => f.toJson()).toList(),
+          });
+          ecus.addAll(
+            classified.frames
+                .where((f) => f.positive && f.ecu != 'unknown')
+                .map((f) => f.ecu),
+          );
+          if (!discovery.complete) {
+            throw StateError('discovery_${discovery.completion}');
+          }
         }
-        final probes = _buildProbeList();
         for (final probe in probes) {
           if (_cancelDeepScanRequested || !isConnected) {
             outcome = isConnected ? 'cancelled' : 'disconnected';
@@ -1868,10 +1882,12 @@ class CarObdService {
             );
           } else {
             r = await exchange(probe.cmd);
-            evidence = ElmObdParser.classify(r, probe.cmd);
+            evidence = _classifyProbe(r, probe);
           }
           final candidate =
-              probe.cmd.startsWith('21') || probe.cmd.startsWith('22');
+              module == ObdScanModule.fuel ||
+              probe.cmd.startsWith('21') ||
+              probe.cmd.startsWith('22');
           String? hint;
           if (!candidate && evidence.positive) {
             // Decode only a complete matched payload from one ECU, never joined frames/ECUs.
@@ -1895,6 +1911,8 @@ class CarObdService {
             frames: evidence.frames,
             candidate: candidate,
             transport: r.transport,
+            candidateExplanation: probe.explanation,
+            expectedResponseEcu: probe.expectedEcu,
           );
           items.add(item);
           ecus.addAll(
@@ -2026,6 +2044,7 @@ class CarObdService {
     }
     final report = ObdDeepScanReport(
       startTime: start,
+      module: module,
       transportEvents: transportEvents,
       transportStorage: {
         ..._journal.storageStatus,
@@ -2124,7 +2143,102 @@ class CarObdService {
     return null;
   }
 
-  List<_ProbeEntry> _buildProbeList() {
+  ObdResponseEvidence _classifyProbe(ElmReply reply, _ProbeEntry probe) {
+    final original = ElmObdParser.classify(reply, probe.cmd);
+    final frames = original.frames.map((frame) {
+      String? failure;
+      if ((frame.positive || frame.service != null) &&
+          probe.expectedEcu != null &&
+          frame.ecu != probe.expectedEcu) {
+        failure = 'unexpected_response_ecu';
+      } else if (frame.positive &&
+          probe.payloadBytes != null &&
+          frame.payload.length != probe.payloadBytes! * 2) {
+        failure = 'unexpected_payload_length';
+      }
+      if (failure == null) return frame;
+      return ObdFrameEvidence(
+        frame.ecu,
+        frame.payload,
+        failure,
+        service: frame.service,
+        nrc: frame.nrc,
+        structureVerdict: failure,
+        transportCompletion: reply.completion,
+      );
+    }).toList();
+    final contractMismatch =
+        probe.payloadBytes != null &&
+        frames.any(
+          (f) => const {
+            'unexpected_response_ecu',
+            'unexpected_payload_length',
+            'wrong_service_or_pid',
+          }.contains(f.verdict),
+        );
+    if (contractMismatch) {
+      for (var i = 0; i < frames.length; i++) {
+        final frame = frames[i];
+        if (frame.positive) {
+          frames[i] = ObdFrameEvidence(
+            frame.ecu,
+            frame.payload,
+            'candidate_contract_mismatch',
+            structureVerdict: frame.structureVerdict,
+            transportCompletion: reply.completion,
+          );
+        }
+      }
+    }
+    return ObdResponseEvidence(
+      frames,
+      frames.any((f) => f.positive)
+          ? 'matched_response'
+          : frames.map((f) => f.verdict).toSet().join(', '),
+    );
+  }
+
+  List<_ProbeEntry> _buildProbeList(ObdScanModule module) {
+    if (module == ObdScanModule.fuel) {
+      // Community definitions are request/layout candidates, never vehicle proof or formulas.
+      return const [
+        _ProbeEntry(
+          '油量候选',
+          '7DF',
+          '012F',
+          '标准液位百分比（待验证）',
+          payloadBytes: 3,
+          explanation: '标准液位候选；仅记录本次响应，不将百分比折算成升数。',
+        ),
+        _ProbeEntry(
+          '油量候选',
+          '7C0',
+          '221022',
+          '仪表油量 DID（社区候选）',
+          expectedEcu: '7C8',
+          payloadBytes: 5,
+          explanation: 'OBDb Yaris候选：预期7C8及62 10 22加2字节；本车含义/有效值未验证，不换算或赋正式升数。',
+        ),
+        _ProbeEntry(
+          '油量候选',
+          '7C0',
+          '2129',
+          '仪表油量 PID（社区候选）',
+          expectedEcu: '7C8',
+          payloadBytes: 3,
+          explanation: 'OBDb Yaris候选：预期7C8及61 29加1字节；倍率未在本车验证，不套其他车型公式。',
+        ),
+      ];
+    }
+    return _allProbeCandidates()
+        .where(
+          (p) =>
+              p.cmd.startsWith('09') == (module == ObdScanModule.vehicleInfo),
+        )
+        .toList();
+  }
+
+  List<_ProbeEntry> _allProbeCandidates() {
     return const [
       // 1. 标准 OBD-II / JOBD (Mode 01)
       _ProbeEntry('标准OBD', null, '0104', '发动机计算负荷 (Engine Load)'),
@@ -2518,8 +2632,19 @@ class _ProbeEntry {
   final String? header;
   final String cmd;
   final String name;
+  final String? expectedEcu;
+  final int? payloadBytes;
+  final String? explanation;
 
-  const _ProbeEntry(this.category, this.header, this.cmd, this.name);
+  const _ProbeEntry(
+    this.category,
+    this.header,
+    this.cmd,
+    this.name, {
+    this.expectedEcu,
+    this.payloadBytes,
+    this.explanation,
+  });
 }
 
 class ObdGattChannel {

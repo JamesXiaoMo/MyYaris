@@ -1,6 +1,6 @@
 # OBD notification evidence and bounded recovery
 
-This implementation fixes reproducible receiver/reporting failures; it does not establish the cause of any vehicle-side missing bytes or validate a fuel PID. The existing fixed 57 probes and 1400 ms scan budget remain unchanged. No CFC/CAF policy, retry, reset, empty-CR interrupt, single-source mapping, or adaptive extension is introduced.
+This implementation fixes reproducible receiver/reporting failures; it does not establish the cause of any vehicle-side missing bytes or validate a fuel PID. The 1400 ms scan budget remains unchanged. The original 57 probes are now split into explicit [manual diagnostic modules](obd-diagnostic-modules.md), with Mode 09 excluded from the default basic path. No CFC/CAF policy, retry, reset, empty-CR interrupt, single-source mapping, or adaptive extension is introduced.
 
 ## Receive boundaries and writes
 
@@ -14,7 +14,7 @@ Each BLE callback records its original bytes, length, notification sequence, tra
 
 An ordered native worker writes JSONL to `noBackupFilesDir/obd_reports/transport_<session>.jsonl`, with no network/backend dependency. It does not block the BLE callback on disk I/O. Disk errors and bounded-flush failures are reported; a queued event is not called persisted until the native sink acknowledges it. These files can contain VIN/CALID and remain private, excluded from backups. No automatic upload/share is added.
 
-Schema 3 JSON reports include a frozen `transport_events` capture and `transport_storage` status. Markdown serializes the same event maps, plus JSON-escaped response strings so CR/LF remain unambiguous. Post-timeout fragments are captured even without a later prompt; the independent local journal continues after report cutoff. Late bytes are not attached to a different request. User-triggered copy/save/share retains the sensitive-data confirmation.
+Schema 3 introduced the byte journal; schema 4 additionally identifies the selected module and exact planned range. JSON reports include a frozen `transport_events` capture and `transport_storage` status. Markdown serializes the same event maps, plus JSON-escaped response strings so CR/LF remain unambiguous. Post-timeout fragments are captured even without a later prompt; the independent local journal continues after report cutoff. Late bytes are not attached to a different request. User-triggered copy/save/share retains the sensitive-data confirmation.
 
 ## Restoration and failure classification
 
