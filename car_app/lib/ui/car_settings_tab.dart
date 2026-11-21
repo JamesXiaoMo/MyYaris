@@ -301,10 +301,9 @@ class _CarSettingsTabState extends State<CarSettingsTab> {
                             decoration: YarisCarTheme.cardDecoration(),
                             child: Column(
                               children: [
-                                ValueListenableBuilder<MusicSyncMode>(
-                                  valueListenable: CarMusicSyncService().syncModeNotifier,
-                                  builder: (context, syncMode, _) {
-                                    final connected = syncMode != MusicSyncMode.disconnected;
+                                ValueListenableBuilder<bool>(
+                                  valueListenable: CarMusicSyncService().isHealthyNotifier,
+                                  builder: (context, connected, _) {
                                     return _SettingsActionRow(
                                       icon: Icons.cloud_done_rounded,
                                       title: '后端服务连接',

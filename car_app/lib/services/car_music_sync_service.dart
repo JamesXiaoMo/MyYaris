@@ -57,6 +57,7 @@ class CarMusicSyncService {
   String _token = '';
 
   final ValueNotifier<MusicSyncMode> syncModeNotifier = ValueNotifier(MusicSyncMode.disconnected);
+  final ValueNotifier<bool> isHealthyNotifier = ValueNotifier(false);
   final ValueNotifier<String> lastCommandNotifier = ValueNotifier('就绪 (Ready)');
 
   // Cross-channel command_id deduplication & result cache: commandId -> CommandHistoryEntry
@@ -149,6 +150,7 @@ class CarMusicSyncService {
 
     _syncMode = MusicSyncMode.disconnected;
     syncModeNotifier.value = _syncMode;
+    isHealthyNotifier.value = false;
   }
 
   /// Builds WebSocket URL: wss://.../api/v1/ws/music?token=...&client_type=car&device_id=...
@@ -205,6 +207,7 @@ class CarMusicSyncService {
       _webSocket = connection;
       _syncMode = MusicSyncMode.websocket;
       syncModeNotifier.value = _syncMode;
+      isHealthyNotifier.value = true;
       debugPrint('[CarMusicSync] WebSocket connected successfully.');
 
       // Cancel fallback polling if running
@@ -296,7 +299,13 @@ class CarMusicSyncService {
         if (cmd != null && _isRunning && epoch == _connectionEpoch) {
           await handleCommand(cmd);
         }
+        if (_isRunning && epoch == _connectionEpoch) {
+          isHealthyNotifier.value = true;
+        }
       } catch (e) {
+        if (_isRunning && epoch == _connectionEpoch) {
+          isHealthyNotifier.value = false;
+        }
         debugPrint('[CarMusicSync] HTTP Polling error: $e');
       } finally { _pollingInFlight = false; }
     });

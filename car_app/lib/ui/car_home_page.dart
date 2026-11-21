@@ -142,10 +142,10 @@ class _CarHomePageState extends State<CarHomePage> {
             const SizedBox(height: 8),
           ],
           const Spacer(),
-          ValueListenableBuilder<MusicSyncMode>(
-            valueListenable: CarMusicSyncService().syncModeNotifier,
-            builder: (context, syncMode, _) {
-              final online = syncMode != MusicSyncMode.disconnected || widget.poller.isRunning;
+          ValueListenableBuilder<bool>(
+            valueListenable: CarMusicSyncService().isHealthyNotifier,
+            builder: (context, healthy, _) {
+              final online = healthy;
               return Row(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
