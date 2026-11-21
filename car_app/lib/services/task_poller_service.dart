@@ -82,6 +82,23 @@ class TaskPollerService extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Re-launch CAR NAVITIME for an already received destination task.
+  Future<bool> relaunchNavigation(TaskModel task) async {
+    final geoUri = task.toGeoUri();
+    try {
+      final res = await _navChannel.invokeMethod<Map<dynamic, dynamic>>(
+        'launchCarNavitime',
+        {
+          'geoUri': geoUri,
+          'title': task.title,
+        },
+      );
+      return res?['success'] == true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   Future<void> _sleepCancelable(Duration duration) async {
     final completer = Completer<void>();
     _activeSleepCompleter = completer;

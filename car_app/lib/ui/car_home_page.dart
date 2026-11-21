@@ -1,13 +1,18 @@
 import 'package:flutter/material.dart';
+import 'package:just_audio/just_audio.dart';
+import '../models/music_queue_models.dart';
+import '../models/obd_telemetry.dart';
+import '../models/task_model.dart';
+import '../services/built_in_player_service.dart';
+import '../services/car_music_queue_controller.dart';
 import '../services/car_music_sync_service.dart';
-import '../services/music_service.dart';
+import '../services/car_obd_service.dart';
 import '../services/storage_service.dart';
 import '../services/task_poller_service.dart';
-import 'connection_debug_page.dart';
-import 'built_in_player_page.dart';
-import 'obd_dashboard_page.dart';
-import '../models/obd_telemetry.dart';
-import '../services/car_obd_service.dart';
+import 'car_music_tab.dart';
+import 'car_obd_tab.dart';
+import 'car_settings_tab.dart';
+import 'yaris_car_theme.dart';
 
 class CarHomePage extends StatefulWidget {
   final IStorageService storage;
@@ -24,16 +29,12 @@ class CarHomePage extends StatefulWidget {
 }
 
 class _CarHomePageState extends State<CarHomePage> {
-  final MusicService _musicService = MusicService();
-
-  bool _hasNotificationPermission = false;
-  PlaybackInfo? _playbackInfo;
-  bool _isLoadingInfo = false;
+  final BuiltInPlayerService _playerService = BuiltInPlayerService();
+  int _selectedTab = 0;
 
   @override
   void initState() {
     super.initState();
-    // Maintain poller running state across navigation
     if (widget.storage.isPollingEnabled && !widget.poller.isRunning) {
       widget.poller.start();
     }
@@ -47,636 +48,827 @@ class _CarHomePageState extends State<CarHomePage> {
         fallbackDns: widget.storage.fallbackDns,
       );
     }
-    _checkPermissionAndRefreshInfo();
+    _playerService.init();
   }
 
-  Future<void> _checkPermissionAndRefreshInfo() async {
-    setState(() => _isLoadingInfo = true);
-    final granted = await _musicService.isNotificationAccessGranted();
-    PlaybackInfo? info;
-    if (granted) {
-      info = await _musicService.getPlaybackInfo();
-    }
-    if (mounted) {
-      setState(() {
-        _hasNotificationPermission = granted;
-        _playbackInfo = info;
-        _isLoadingInfo = false;
-      });
-    }
+  String _formatDuration(Duration d) {
+    final sec = d.inSeconds < 0 ? 0 : d.inSeconds;
+    final m = (sec ~/ 60).toString();
+    final s = (sec % 60).toString().padLeft(2, '0');
+    return '$m:$s';
   }
 
-  Future<void> _openNotificationSettings() async {
-    await _musicService.openNotificationAccessSettings();
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('已打开系统设置，请在列表中找到【MyYaris 音乐播控监听】并开启授权'),
-          duration: Duration(seconds: 4),
-        ),
-      );
+  String _modeLabel(PlaybackMode mode) {
+    switch (mode) {
+      case PlaybackMode.listLoop:
+        return '喜欢歌单循环';
+      case PlaybackMode.shuffle:
+        return '喜欢歌单随机';
+      case PlaybackMode.intelligence:
+        return '网易云心动';
+      case PlaybackMode.singleLoop:
+        return '单曲循环';
     }
   }
 
-  Future<void> _togglePlayPause() async {
-    final res = await _musicService.togglePlayPause();
-    _showActionResult(res['message']?.toString() ?? '播控指令已发送');
-    await _refreshInfoQuietly();
-  }
-
-  Future<void> _skipToPrevious() async {
-    final res = await _musicService.skipToPrevious();
-    _showActionResult(res['message']?.toString() ?? '已发送上一曲');
-    await _refreshInfoQuietly();
-  }
-
-  Future<void> _skipToNext() async {
-    final res = await _musicService.skipToNext();
-    _showActionResult(res['message']?.toString() ?? '已发送下一曲');
-    await _refreshInfoQuietly();
-  }
-
-  Future<void> _refreshInfoQuietly() async {
-    if (_hasNotificationPermission) {
-      final info = await _musicService.getPlaybackInfo();
-      if (mounted) {
-        setState(() => _playbackInfo = info);
-      }
-    }
-  }
-
-  void _showActionResult(String msg) {
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(msg),
-          duration: const Duration(seconds: 2),
-          backgroundColor: const Color(0xFF222834),
-        ),
-      );
-    }
-  }
-
-  void _showCustomActionDialog() async {
-    final selected = await showDialog<String>(context: context, builder: (context) => SimpleDialog(
-      title: const Text('播放模式'),
-      children: [
-        for (final mode in const {'list_loop': '喜欢歌单循环', 'shuffle': '喜欢歌单随机', 'intelligence': '网易云心动'}.entries)
-          SimpleDialogOption(onPressed: () => Navigator.pop(context, mode.key), child: Text(mode.value)),
-      ],
-    ));
-    if (selected == null || !mounted) return;
-    final sync = CarMusicSyncService();
-    await sync.requestLocalCommand('set_playback_mode', {'mode': selected});
-    if (mounted) _showActionResult(sync.lastCommandNotifier.value);
+  Future<void> _relaunchLatestNav(TaskModel task) async {
+    final ok = await widget.poller.relaunchNavigation(task);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(ok ? '正在打开 NAVITIME：${task.title}' : '未能唤起 NAVITIME，请确认车机已安装该应用'),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    return ListenableBuilder(
-      listenable: widget.poller,
-      builder: (context, _) {
-        final poller = widget.poller;
-        final isRunning = poller.isRunning;
-        final statusColor = isRunning ? Colors.blueAccent : Colors.grey;
+    return Scaffold(
+      backgroundColor: YarisCarTheme.canvas,
+      body: SafeArea(
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            _buildNavigationRail(),
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.all(14),
+                child: IndexedStack(
+                  index: _selectedTab,
+                  children: [
+                    _buildHomeDashboard(),
+                    const CarMusicTab(),
+                    const CarObdTab(),
+                    CarSettingsTab(
+                      storage: widget.storage,
+                      poller: widget.poller,
+                      onOpenObdTab: () => setState(() => _selectedTab = 2),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 
-        return Scaffold(
-          backgroundColor: const Color(0xFF121418),
-          body: SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 14.0, vertical: 8.0),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
+  Widget _buildNavigationRail() {
+    const items = [
+      (icon: Icons.home_rounded, label: '首页'),
+      (icon: Icons.music_note_rounded, label: '音乐'),
+      (icon: Icons.directions_car_rounded, label: '车况'),
+      (icon: Icons.settings_rounded, label: '设置'),
+    ];
+
+    return Container(
+      width: 96,
+      decoration: const BoxDecoration(
+        color: YarisCarTheme.paper,
+        border: Border(right: BorderSide(color: YarisCarTheme.line, width: 1)),
+      ),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 16),
+      child: Column(
+        children: [
+          const SizedBox(height: 4),
+          for (int i = 0; i < items.length; i++) ...[
+            _RailItem(
+              icon: items[i].icon,
+              label: items[i].label,
+              selected: _selectedTab == i,
+              onTap: () => setState(() => _selectedTab = i),
+            ),
+            const SizedBox(height: 8),
+          ],
+          const Spacer(),
+          ValueListenableBuilder<MusicSyncMode>(
+            valueListenable: CarMusicSyncService().syncModeNotifier,
+            builder: (context, syncMode, _) {
+              final online = syncMode != MusicSyncMode.disconnected || widget.poller.isRunning;
+              return Row(
+                mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  // Top Header Bar
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Row(
-                        children: [
-                          const Icon(Icons.directions_car, color: Colors.blueAccent, size: 22),
-                          const SizedBox(width: 8),
-                          const Text(
-                            'MyYaris 车机助手',
-                            style: TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.bold),
-                          ),
-                          const SizedBox(width: 10),
-                          Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-                            decoration: BoxDecoration(
-                              color: statusColor.withValues(alpha: 0.15),
-                              borderRadius: BorderRadius.circular(8),
-                              border: Border.all(color: statusColor, width: 1),
-                            ),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Container(
-                                  width: 6,
-                                  height: 6,
-                                  decoration: BoxDecoration(
-                                    color: statusColor,
-                                    shape: BoxShape.circle,
-                                  ),
-                                ),
-                                const SizedBox(width: 5),
-                                Text(
-                                  isRunning ? '导航接收中' : '导航未接收',
-                                  style: TextStyle(color: statusColor, fontSize: 10),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ],
-                      ),
-                      // Top Action Buttons (Player & Debug Page)
-                      Expanded(
-                        child: SingleChildScrollView(
-                          scrollDirection: Axis.horizontal,
-                          reverse: true,
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                          ValueListenableBuilder<MusicSyncMode>(
-                            valueListenable: CarMusicSyncService().syncModeNotifier,
-                            builder: (context, mode, _) {
-                              Color badgeColor;
-                              String badgeText;
-                              switch (mode) {
-                                case MusicSyncMode.websocket:
-                                  badgeColor = Colors.greenAccent;
-                                  badgeText = '实时播控';
-                                  break;
-                                case MusicSyncMode.httpPolling:
-                                  badgeColor = Colors.amberAccent;
-                                  badgeText = '定时播控';
-                                  break;
-                                case MusicSyncMode.disconnected:
-                                  badgeColor = Colors.grey;
-                                  badgeText = '播控未连接';
-                                  break;
-                              }
-                              return Container(
-                                margin: const EdgeInsets.only(right: 6),
-                                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 5),
-                                decoration: BoxDecoration(
-                                  color: badgeColor.withValues(alpha: 0.15),
-                                  borderRadius: BorderRadius.circular(6),
-                                  border: Border.all(color: badgeColor.withValues(alpha: 0.4), width: 1),
-                                ),
-                                child: Row(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    Container(
-                                      width: 6,
-                                      height: 6,
-                                      decoration: BoxDecoration(color: badgeColor, shape: BoxShape.circle),
-                                    ),
-                                    const SizedBox(width: 4),
-                                    Text(
-                                      badgeText,
-                                      style: TextStyle(color: badgeColor, fontSize: 10, fontWeight: FontWeight.bold),
-                                    ),
-                                  ],
-                                ),
-                              );
-                            },
-                          ),
-                          ValueListenableBuilder<ObdTelemetry>(
-                            valueListenable: CarObdService().telemetryNotifier,
-                            builder: (context, tel, _) {
-                              final isReady = tel.status == ObdConnectionStatus.ready;
-                              final color = isReady ? Colors.tealAccent : Colors.grey;
-                              final text = isReady
-                                  ? (tel.batterySoc != null
-                                      ? 'OBD: ${tel.batterySoc!.toStringAsFixed(0)}%电'
-                                      : 'OBD在线')
-                                  : 'OBD离线';
-                              return Container(
-                                margin: const EdgeInsets.only(right: 6),
-                                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 5),
-                                decoration: BoxDecoration(
-                                  color: color.withValues(alpha: 0.15),
-                                  borderRadius: BorderRadius.circular(6),
-                                  border: Border.all(color: color.withValues(alpha: 0.4), width: 1),
-                                ),
-                                child: Row(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    Container(
-                                      width: 6,
-                                      height: 6,
-                                      decoration: BoxDecoration(color: color, shape: BoxShape.circle),
-                                    ),
-                                    const SizedBox(width: 4),
-                                    Text(
-                                      text,
-                                      style: TextStyle(color: color, fontSize: 10, fontWeight: FontWeight.bold),
-                                    ),
-                                  ],
-                                ),
-                              );
-                            },
-                          ),
-                          ElevatedButton.icon(
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: const Color(0xFF1B2A22),
-                              foregroundColor: Colors.greenAccent,
-                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(8),
-                                side: const BorderSide(color: Colors.greenAccent, width: 1),
-                              ),
-                            ),
-                            icon: const Icon(Icons.electric_car, size: 15, color: Colors.greenAccent),
-                            label: const Text(
-                              'OBD 混动车况',
-                              style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold),
-                            ),
-                            onPressed: () {
-                              Navigator.push(
-                                context,
-                                MaterialPageRoute(
-                                  builder: (ctx) => const ObdDashboardPage(),
-                                ),
-                              );
-                            },
-                          ),
-                          const SizedBox(width: 8),
-                          ElevatedButton.icon(
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: const Color(0xFF162E2E),
-                              foregroundColor: Colors.tealAccent,
-                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(8),
-                                side: const BorderSide(color: Colors.tealAccent, width: 1),
-                              ),
-                            ),
-                            icon: const Icon(Icons.graphic_eq, size: 15, color: Colors.tealAccent),
-                            label: const Text(
-                              '播放队列',
-                              style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold),
-                            ),
-                            onPressed: () {
-                              Navigator.push(
-                                context,
-                                MaterialPageRoute(
-                                  builder: (ctx) => const BuiltInPlayerPage(),
-                                ),
-                              );
-                            },
-                          ),
-                          const SizedBox(width: 8),
-                          ElevatedButton.icon(
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: const Color(0xFF232A38),
-                              foregroundColor: Colors.white,
-                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(8),
-                                side: const BorderSide(color: Colors.blueAccent, width: 1),
-                              ),
-                            ),
-                            icon: const Icon(Icons.tune, size: 15, color: Colors.blueAccent),
-                            label: const Text(
-                              '连接与调试 (后台与导航)',
-                              style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold),
-                            ),
-                            onPressed: () {
-                              Navigator.push(
-                                context,
-                                MaterialPageRoute(
-                                  builder: (ctx) => ConnectionDebugPage(
-                                    storage: widget.storage,
-                                    poller: widget.poller,
-                                  ),
-                                ),
-                              );
-                            },
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                    ],
-                  ),
-                  const SizedBox(height: 6),
-                  // Notification Permission / Status Banner
                   Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                    width: 7,
+                    height: 7,
                     decoration: BoxDecoration(
-                      color: _hasNotificationPermission
-                          ? Colors.blue.withValues(alpha: 0.1)
-                          : Colors.amber.withValues(alpha: 0.12),
-                      borderRadius: BorderRadius.circular(6),
-                      border: Border.all(
-                        color: _hasNotificationPermission
-                            ? Colors.blueAccent.withValues(alpha: 0.3)
-                            : Colors.amberAccent.withValues(alpha: 0.4),
-                      ),
-                    ),
-                    child: Row(
-                      children: [
-                        Icon(
-                          _hasNotificationPermission ? Icons.music_note : Icons.warning_amber_rounded,
-                          size: 14,
-                          color: _hasNotificationPermission ? Colors.blueAccent : Colors.amberAccent,
-                        ),
-                        const SizedBox(width: 6),
-                        Expanded(
-                          child: Text(
-                            _hasNotificationPermission
-                                ? '网易云播放 · 完整喜欢歌单 · 车机可自主切歌'
-                                : '读取播放信息和控制音乐需要通知使用权，请在系统设置中开启授权',
-                            style: TextStyle(
-                              color: _hasNotificationPermission ? Colors.white70 : Colors.amberAccent,
-                              fontSize: 10.5,
-                            ),
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                        TextButton(
-                          style: TextButton.styleFrom(
-                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                            minimumSize: Size.zero,
-                            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                          ),
-                          onPressed: _hasNotificationPermission
-                              ? _checkPermissionAndRefreshInfo
-                              : _openNotificationSettings,
-                          child: Text(
-                            _hasNotificationPermission ? '刷新状态' : '去开启授权',
-                            style: TextStyle(
-                              color: _hasNotificationPermission ? Colors.blueAccent : Colors.orangeAccent,
-                              fontSize: 10.5,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                        ),
-                      ],
+                      color: online ? YarisCarTheme.green : YarisCarTheme.muted,
+                      shape: BoxShape.circle,
                     ),
                   ),
-                  const SizedBox(height: 8),
-                  // Main Body Panels (800x480 Optimized)
-                  Expanded(
-                    child: Row(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        // Left Panel: Playback Info & Transport Controls
-                        Expanded(
-                          flex: 3,
-                          child: Container(
-                            padding: const EdgeInsets.all(10),
-                            decoration: BoxDecoration(
-                              color: const Color(0xFF1B1F27),
-                              borderRadius: BorderRadius.circular(10),
-                              border: Border.all(color: Colors.white10),
-                            ),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Row(
-                                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                  children: [
-                                    const Text(
-                                      '当前播放信息与播控',
-                                      style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold),
-                                    ),
-                                    IconButton(
-                                      icon: const Icon(Icons.refresh, size: 16, color: Colors.blueAccent),
-                                      onPressed: _checkPermissionAndRefreshInfo,
-                                      tooltip: '刷新播放信息',
-                                      padding: EdgeInsets.zero,
-                                      constraints: const BoxConstraints(),
-                                    ),
-                                  ],
-                                ),
-                                const SizedBox(height: 4),
-                                // Current track display card
-                                Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                                  decoration: BoxDecoration(
-                                    color: Colors.black38,
-                                    borderRadius: BorderRadius.circular(6),
-                                    border: Border.all(color: Colors.white10),
-                                  ),
-                                  child: Row(
-                                    children: [
-                                      const Icon(Icons.album, size: 28, color: Colors.blueAccent),
-                                      const SizedBox(width: 8),
-                                      Expanded(
-                                        child: Column(
-                                          crossAxisAlignment: CrossAxisAlignment.start,
-                                          children: [
-                                            Text(
-                                              _playbackInfo?.title.isNotEmpty == true
-                                                  ? _playbackInfo!.title
-                                                  : (_isLoadingInfo ? '正在读取会话...' : '点播放以使用完整喜欢歌单'),
-                                              style: const TextStyle(
-                                                color: Colors.white,
-                                                fontSize: 13,
-                                                fontWeight: FontWeight.bold,
-                                              ),
-                                              maxLines: 1,
-                                              overflow: TextOverflow.ellipsis,
-                                            ),
-                                            Text(
-                                              _playbackInfo?.artist.isNotEmpty == true
-                                                  ? '${_playbackInfo!.artist} ${_playbackInfo!.album.isNotEmpty ? "• ${_playbackInfo!.album}" : ""}'
-                                                  : '歌手: 未知',
-                                              style: const TextStyle(color: Colors.white60, fontSize: 10.5),
-                                              maxLines: 1,
-                                              overflow: TextOverflow.ellipsis,
-                                            ),
-                                          ],
-                                        ),
-                                      ),
-                                      Container(
-                                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                                        decoration: BoxDecoration(
-                                          color: (_playbackInfo?.isPlaying ?? false)
-                                              ? Colors.green.withValues(alpha: 0.2)
-                                              : Colors.grey.withValues(alpha: 0.2),
-                                          borderRadius: BorderRadius.circular(4),
-                                          border: Border.all(
-                                            color: (_playbackInfo?.isPlaying ?? false)
-                                                ? Colors.greenAccent
-                                                : Colors.grey,
-                                          ),
-                                        ),
-                                        child: Text(
-                                          _playbackInfo?.stateName ?? '未连接',
-                                          style: TextStyle(
-                                            color: (_playbackInfo?.isPlaying ?? false)
-                                                ? Colors.greenAccent
-                                                : Colors.white70,
-                                            fontSize: 9.5,
-                                            fontWeight: FontWeight.bold,
-                                          ),
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                                const SizedBox(height: 8),
-                                // Transport Controls (Big tactile buttons)
-                                Row(
-                                  children: [
-                                    Expanded(
-                                      child: SizedBox(
-                                        height: 44,
-                                        child: OutlinedButton.icon(
-                                          style: OutlinedButton.styleFrom(
-                                            foregroundColor: Colors.white,
-                                            side: const BorderSide(color: Colors.white24),
-                                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                                          ),
-                                          onPressed: _hasNotificationPermission ? _skipToPrevious : null,
-                                          icon: const Icon(Icons.skip_previous, size: 20),
-                                          label: const Text('上一曲', style: TextStyle(fontSize: 12)),
-                                        ),
-                                      ),
-                                    ),
-                                    const SizedBox(width: 8),
-                                    Expanded(
-                                      flex: 2,
-                                      child: SizedBox(
-                                        height: 44,
-                                        child: ElevatedButton.icon(
-                                          style: ElevatedButton.styleFrom(
-                                            backgroundColor: Colors.blueAccent.shade700,
-                                            foregroundColor: Colors.white,
-                                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                                          ),
-                                          onPressed: _hasNotificationPermission ? _togglePlayPause : null,
-                                          icon: Icon(
-                                            (_playbackInfo?.isPlaying ?? false) ? Icons.pause : Icons.play_arrow,
-                                            size: 22,
-                                          ),
-                                          label: Text(
-                                            (_playbackInfo?.isPlaying ?? false) ? '暂停' : '播放/暂停',
-                                            style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold),
-                                          ),
-                                        ),
-                                      ),
-                                    ),
-                                    const SizedBox(width: 8),
-                                    Expanded(
-                                      child: SizedBox(
-                                        height: 44,
-                                        child: OutlinedButton.icon(
-                                          style: OutlinedButton.styleFrom(
-                                            foregroundColor: Colors.white,
-                                            side: const BorderSide(color: Colors.white24),
-                                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                                          ),
-                                          onPressed: _hasNotificationPermission ? _skipToNext : null,
-                                          icon: const Icon(Icons.skip_next, size: 20),
-                                          label: const Text('下一曲', style: TextStyle(fontSize: 12)),
-                                        ),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                                const SizedBox(height: 8),
-                                // Mode Test Button
-                                SizedBox(
-                                  width: double.infinity,
-                                  height: 40,
-                                  child: ElevatedButton.icon(
-                                    style: ElevatedButton.styleFrom(
-                                      backgroundColor: const Color(0xFF262D3D),
-                                      foregroundColor: Colors.white,
-                                      shape: RoundedRectangleBorder(
-                                        borderRadius: BorderRadius.circular(8),
-                                        side: const BorderSide(color: Colors.blueAccent, width: 0.8),
-                                      ),
-                                    ),
-                                    onPressed: _showCustomActionDialog,
-                                    icon: const Icon(Icons.repeat, size: 18, color: Colors.blueAccent),
-                                    label: const Text(
-                                      '播放模式',
-                                      style: TextStyle(fontSize: 12),
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 10),
-                        // Right Panel: Music guidance
-                        Expanded(
-                          flex: 2,
-                          child: Container(
-                            padding: const EdgeInsets.all(10),
-                            decoration: BoxDecoration(
-                              color: const Color(0xFF1A1D24),
-                              borderRadius: BorderRadius.circular(10),
-                              border: Border.all(color: Colors.white10),
-                            ),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                const Text(
-                                  '歌曲与歌单',
-                                  style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold),
-                                ),
-                                const SizedBox(height: 2),
-                                const Text(
-                                  '请通过手机搜索单曲或选择我喜欢的音乐',
-                                  style: TextStyle(color: Colors.white38, fontSize: 9.5),
-                                ),
-                                const SizedBox(height: 8),
-                                // Result feedback container
-                                Expanded(
-                                  child: Container(
-                                    width: double.infinity,
-                                    padding: const EdgeInsets.all(8),
-                                    decoration: BoxDecoration(
-                                      color: Colors.black26,
-                                      borderRadius: BorderRadius.circular(6),
-                                      border: Border.all(color: Colors.white10),
-                                    ),
-                                    child: SingleChildScrollView(
-                                      child: Column(
-                                        crossAxisAlignment: CrossAxisAlignment.start,
-                                        children: [
-                                          const Text(
-                                            '在手机上搜索歌曲，或打开“我喜欢的音乐”选择歌曲，再发送到车机播放。',
-                                            style: TextStyle(color: Colors.white70, fontSize: 10.5),
-                                          ),
-                                          const SizedBox(height: 6),
-                                          const Text(
-                                            '手机搜索的单曲播放结束后会停止；循环和随机播放使用完整喜欢歌单。',
-                                            style: TextStyle(color: Colors.white38, fontSize: 9.5),
-                                          ),
-                                        ],
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                      ],
+                  const SizedBox(width: 5),
+                  Text(
+                    online ? '在线' : '离线',
+                    style: TextStyle(
+                      color: online ? YarisCarTheme.green : YarisCarTheme.muted,
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.w600,
                     ),
-                  ),
-                  const SizedBox(height: 4),
-                  // Footer info (no sensitive token shown)
-                  const Text(
-                    'MyYaris v1.0.0 • 车机触控界面 • 连接与授权在“连接与调试”中设置',
-                    style: TextStyle(color: Colors.white24, fontSize: 9.5),
-                    textAlign: TextAlign.center,
                   ),
                 ],
+              );
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildHomeDashboard() {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        // Left Column (~52%): Vehicle Hero + OBD summary (top) & Phone Navigation Receive (bottom)
+        Expanded(
+          flex: 52,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Expanded(
+                flex: 62,
+                child: _buildVehicleHeroCard(),
               ),
+              const SizedBox(height: 12),
+              Expanded(
+                flex: 38,
+                child: _buildNavReceiveCard(),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(width: 14),
+        // Right Column (~48%): Now Playing Card
+        Expanded(
+          flex: 48,
+          child: _buildHomeMusicCard(),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildVehicleHeroCard() {
+    return ValueListenableBuilder<ObdTelemetry>(
+      valueListenable: CarObdService().telemetryNotifier,
+      builder: (context, tel, _) {
+        final obdReady = tel.status == ObdConnectionStatus.ready;
+        return GestureDetector(
+          onTap: () => setState(() => _selectedTab = 2),
+          child: Container(
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              gradient: const LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [YarisCarTheme.periwinkle, Color(0xFFF3F5FF)],
+              ),
+              borderRadius: BorderRadius.circular(22),
+              border: Border.all(color: YarisCarTheme.line, width: 1),
+            ),
+            child: Column(
+              children: [
+                // Top badges
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                      decoration: BoxDecoration(
+                        color: YarisCarTheme.paper.withValues(alpha: 0.72),
+                        borderRadius: BorderRadius.circular(999),
+                        border: Border.all(color: YarisCarTheme.blue.withValues(alpha: 0.2)),
+                      ),
+                      child: const Text(
+                        'HYBRID',
+                        style: TextStyle(
+                          color: YarisCarTheme.periwinkleDark,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: 0.6,
+                        ),
+                      ),
+                    ),
+                    YarisStatusPill(
+                      text: obdReady ? 'OBD 在线' : 'OBD 未连接',
+                      color: obdReady ? YarisCarTheme.green : YarisCarTheme.muted,
+                      backgroundColor: YarisCarTheme.paper.withValues(alpha: 0.9),
+                      showDot: true,
+                    ),
+                  ],
+                ),
+                // YARIS typography + Red Yaris Poster
+                Expanded(
+                  child: Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      const Positioned(
+                        top: 2,
+                        child: Text(
+                          'YARIS',
+                          style: TextStyle(
+                            color: YarisCarTheme.blue,
+                            fontSize: 54,
+                            fontWeight: FontWeight.w900,
+                            letterSpacing: 2,
+                            height: 1.0,
+                          ),
+                        ),
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.only(top: 10),
+                        child: Image.asset(
+                          'assets/images/yaris-model-poster.png',
+                          fit: BoxFit.contain,
+                          errorBuilder: (_, _, _) => const Icon(
+                            Icons.directions_car_filled_rounded,
+                            size: 64,
+                            color: YarisCarTheme.red,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 6),
+                // 4-Metric OBD Summary Strip (em-dash when unread)
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: YarisCarTheme.paper.withValues(alpha: 0.92),
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  child: Row(
+                    children: [
+                      _MiniMetric(
+                        label: '车速',
+                        value: tel.speedKmh != null ? '${tel.speedKmh!.toInt()} km/h' : '—',
+                      ),
+                      _MiniDivider(),
+                      _MiniMetric(
+                        label: '动力电池',
+                        value: tel.batterySoc != null ? '${tel.batterySoc!.toStringAsFixed(0)}%' : '—',
+                      ),
+                      _MiniDivider(),
+                      _MiniMetric(
+                        label: '冷却水温',
+                        value: tel.coolantTemp != null ? '${tel.coolantTemp!.toInt()}°C' : '—',
+                      ),
+                      _MiniDivider(),
+                      _MiniMetric(
+                        label: '12V 电瓶',
+                        value: tel.aux12vVoltage != null
+                            ? '${tel.aux12vVoltage!.toStringAsFixed(1)}V'
+                            : '—',
+                      ),
+                    ],
+                  ),
+                ),
+              ],
             ),
           ),
         );
       },
+    );
+  }
+
+  Widget _buildNavReceiveCard() {
+    return ListenableBuilder(
+      listenable: widget.poller,
+      builder: (context, _) {
+        final isRunning = widget.poller.isRunning;
+        final recent = widget.poller.recentTasks;
+        final latest = recent.isNotEmpty ? recent.first : null;
+
+        return Container(
+          padding: const EdgeInsets.all(14),
+          decoration: YarisCarTheme.cardDecoration(),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  const Text(
+                    '手机导航接收',
+                    style: TextStyle(
+                      color: YarisCarTheme.ink,
+                      fontSize: 15,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  YarisStatusPill(
+                    text: isRunning ? '接收中' : '已暂停',
+                    color: isRunning ? YarisCarTheme.blue : YarisCarTheme.muted,
+                    backgroundColor:
+                        isRunning ? YarisCarTheme.periwinkle : YarisCarTheme.neutral,
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Expanded(
+                child: Row(
+                  children: [
+                    Container(
+                      width: 38,
+                      height: 38,
+                      decoration: const BoxDecoration(
+                        color: YarisCarTheme.periwinkle,
+                        shape: BoxShape.circle,
+                      ),
+                      child: const Icon(
+                        Icons.location_on_rounded,
+                        color: YarisCarTheme.blue,
+                        size: 20,
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            latest?.title ?? '等待手机发送目的地',
+                            style: const TextStyle(
+                              color: YarisCarTheme.ink,
+                              fontSize: 15,
+                              fontWeight: FontWeight.w700,
+                            ),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            latest != null
+                                ? '来自 iPhone · 已收到目的地'
+                                : (isRunning ? '在 iPhone 选好地点发送即可自动唤起' : '请在设置中开启接收手机导航'),
+                            style: const TextStyle(color: YarisCarTheme.muted, fontSize: 11.5),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 8),
+              SizedBox(
+                height: 38,
+                child: FilledButton(
+                  style: FilledButton.styleFrom(
+                    backgroundColor: YarisCarTheme.blue,
+                    foregroundColor: Colors.white,
+                    disabledBackgroundColor: YarisCarTheme.neutral,
+                    disabledForegroundColor: YarisCarTheme.muted,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                  ),
+                  onPressed: latest != null ? () => _relaunchLatestNav(latest) : null,
+                  child: const Text(
+                    '打开 NAVITIME',
+                    style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildHomeMusicCard() {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: YarisCarTheme.cardDecoration(),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // Header + Active Mode Pill
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text(
+                '正在播放',
+                style: TextStyle(
+                  color: YarisCarTheme.ink,
+                  fontSize: 16,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              ValueListenableBuilder<PlaybackMode>(
+                valueListenable: CarMusicQueueController().appliedModeNotifier,
+                builder: (context, mode, _) {
+                  return YarisStatusPill(
+                    text: _modeLabel(mode),
+                    color: mode == PlaybackMode.intelligence
+                        ? YarisCarTheme.red
+                        : YarisCarTheme.blue,
+                    backgroundColor: mode == PlaybackMode.intelligence
+                        ? YarisCarTheme.rose
+                        : YarisCarTheme.periwinkle,
+                  );
+                },
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+
+          // Artwork + Track info
+          ValueListenableBuilder(
+            valueListenable: CarMusicQueueController().currentTrackNotifier,
+            builder: (context, _, _) {
+              return StreamBuilder<int?>(
+                stream: _playerService.player.currentIndexStream,
+                builder: (context, _) {
+                  final track = _playerService.currentTrack;
+                  final hasTrack = track.id.isNotEmpty && track.title != '无播放曲目';
+                  return Row(
+                    children: [
+                      const YarisMusicArtwork(size: 80, borderRadius: 18),
+                      const SizedBox(width: 14),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              hasTrack ? track.title : '点击播放开始听歌',
+                              style: const TextStyle(
+                                color: YarisCarTheme.ink,
+                                fontSize: 17.5,
+                                fontWeight: FontWeight.w700,
+                              ),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              hasTrack && track.artist.isNotEmpty
+                                  ? '${track.artist} · 网易云音乐'
+                                  : '默认播放完整喜欢歌单',
+                              style: const TextStyle(color: YarisCarTheme.muted, fontSize: 12.5),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  );
+                },
+              );
+            },
+          ),
+
+          const Spacer(),
+
+          // Progress bar
+          StreamBuilder<Duration>(
+            stream: _playerService.player.positionStream,
+            builder: (context, posSnap) {
+              final pos = posSnap.data ?? Duration.zero;
+              final total = _playerService.player.duration ?? Duration.zero;
+              final maxMs = total.inMilliseconds > 0 ? total.inMilliseconds.toDouble() : 1.0;
+              final curMs = pos.inMilliseconds.toDouble().clamp(0.0, maxMs);
+
+              return Column(
+                children: [
+                  SliderTheme(
+                    data: SliderTheme.of(context).copyWith(
+                      trackHeight: 4,
+                      thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+                      activeTrackColor: YarisCarTheme.blue,
+                      inactiveTrackColor: YarisCarTheme.neutral,
+                      thumbColor: YarisCarTheme.blue,
+                    ),
+                    child: Slider(
+                      value: curMs,
+                      min: 0.0,
+                      max: maxMs,
+                      onChanged: total.inMilliseconds > 0
+                          ? (v) => _playerService.seek(Duration(milliseconds: v.toInt()))
+                          : null,
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 6),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text(
+                          _formatDuration(pos),
+                          style: const TextStyle(color: YarisCarTheme.muted, fontSize: 11),
+                        ),
+                        Text(
+                          total.inMilliseconds > 0 ? _formatDuration(total) : '--:--',
+                          style: const TextStyle(color: YarisCarTheme.muted, fontSize: 11),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+
+          const SizedBox(height: 6),
+
+          // Transport Controls
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              IconButton(
+                iconSize: 28,
+                color: YarisCarTheme.ink,
+                tooltip: '上一曲',
+                onPressed: () => CarMusicSyncService().requestLocalCommand('prev'),
+                icon: const Icon(Icons.skip_previous_rounded),
+              ),
+              const SizedBox(width: 16),
+              StreamBuilder<PlayerState>(
+                stream: _playerService.player.playerStateStream,
+                builder: (context, snap) {
+                  final playing = snap.data?.playing ?? false;
+                  return SizedBox(
+                    width: 54,
+                    height: 54,
+                    child: FilledButton(
+                      style: FilledButton.styleFrom(
+                        shape: const CircleBorder(),
+                        padding: EdgeInsets.zero,
+                        backgroundColor: YarisCarTheme.blue,
+                        foregroundColor: Colors.white,
+                      ),
+                      onPressed: () =>
+                          CarMusicSyncService().requestLocalCommand(playing ? 'pause' : 'resume'),
+                      child: Icon(
+                        playing ? Icons.pause_rounded : Icons.play_arrow_rounded,
+                        size: 30,
+                      ),
+                    ),
+                  );
+                },
+              ),
+              const SizedBox(width: 16),
+              IconButton(
+                iconSize: 28,
+                color: YarisCarTheme.ink,
+                tooltip: '下一曲',
+                onPressed: () => CarMusicSyncService().requestLocalCommand('next'),
+                icon: const Icon(Icons.skip_next_rounded),
+              ),
+            ],
+          ),
+
+          const Spacer(),
+
+          // Mode pills
+          ValueListenableBuilder<PlaybackMode>(
+            valueListenable: CarMusicQueueController().appliedModeNotifier,
+            builder: (context, mode, _) {
+              return Row(
+                children: [
+                  Expanded(
+                    child: _HomeModeChip(
+                      label: '喜欢循环',
+                      selected: mode == PlaybackMode.listLoop,
+                      onTap: () => CarMusicSyncService()
+                          .requestLocalCommand('set_playback_mode', {'mode': 'list_loop'}),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: _HomeModeChip(
+                      label: '喜欢随机',
+                      selected: mode == PlaybackMode.shuffle,
+                      onTap: () => CarMusicSyncService()
+                          .requestLocalCommand('set_playback_mode', {'mode': 'shuffle'}),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: _HomeModeChip(
+                      label: '网易云心动',
+                      selected: mode == PlaybackMode.intelligence,
+                      isHeart: true,
+                      onTap: () => CarMusicSyncService()
+                          .requestLocalCommand('set_playback_mode', {'mode': 'intelligence'}),
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+
+          const SizedBox(height: 10),
+          const Divider(height: 1, color: YarisCarTheme.line),
+          const SizedBox(height: 8),
+
+          // Bottom Safe Volume + Queue Entry
+          Row(
+            children: [
+              Text(
+                '音量 ${(_playerService.currentVolume * 100).toInt()}%',
+                style: const TextStyle(
+                  color: YarisCarTheme.muted,
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+              Expanded(
+                child: SliderTheme(
+                  data: SliderTheme.of(context).copyWith(
+                    trackHeight: 3,
+                    thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 5.5),
+                    activeTrackColor: YarisCarTheme.blue,
+                    inactiveTrackColor: YarisCarTheme.neutral,
+                    thumbColor: YarisCarTheme.blue,
+                  ),
+                  child: Slider(
+                    value: _playerService.currentVolume,
+                    min: 0.0,
+                    max: 1.0,
+                    onChanged: (v) {
+                      setState(() => _playerService.setVolume(v));
+                    },
+                  ),
+                ),
+              ),
+              InkWell(
+                borderRadius: BorderRadius.circular(8),
+                onTap: () => setState(() => _selectedTab = 1),
+                child: const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        '播放队列',
+                        style: TextStyle(
+                          color: YarisCarTheme.ink,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      Icon(Icons.chevron_right_rounded, size: 16, color: YarisCarTheme.muted),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _RailItem extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+
+  const _RailItem({
+    required this.icon,
+    required this.label,
+    required this.selected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: selected ? YarisCarTheme.periwinkle : Colors.transparent,
+      borderRadius: BorderRadius.circular(16),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(16),
+        onTap: onTap,
+        child: SizedBox(
+          width: double.infinity,
+          height: 56,
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                icon,
+                size: 22,
+                color: selected ? YarisCarTheme.blue : YarisCarTheme.muted,
+              ),
+              const SizedBox(height: 3),
+              Text(
+                label,
+                style: TextStyle(
+                  color: selected ? YarisCarTheme.blue : YarisCarTheme.ink,
+                  fontSize: 12,
+                  fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _MiniMetric extends StatelessWidget {
+  final String label;
+  final String value;
+
+  const _MiniMetric({required this.label, required this.value});
+
+  @override
+  Widget build(BuildContext context) {
+    return Expanded(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            value,
+            style: const TextStyle(
+              color: YarisCarTheme.ink,
+              fontSize: 13.5,
+              fontWeight: FontWeight.w700,
+            ),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+          const SizedBox(height: 2),
+          Text(
+            label,
+            style: const TextStyle(color: YarisCarTheme.muted, fontSize: 10.5),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _MiniDivider extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 1,
+      height: 24,
+      color: YarisCarTheme.line,
+    );
+  }
+}
+
+class _HomeModeChip extends StatelessWidget {
+  final String label;
+  final bool selected;
+  final bool isHeart;
+  final VoidCallback onTap;
+
+  const _HomeModeChip({
+    required this.label,
+    required this.selected,
+    required this.onTap,
+    this.isHeart = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final bg = isHeart
+        ? (selected ? YarisCarTheme.red : YarisCarTheme.rose)
+        : (selected ? YarisCarTheme.periwinkle : YarisCarTheme.neutral);
+    final fg = isHeart
+        ? (selected ? Colors.white : YarisCarTheme.red)
+        : (selected ? YarisCarTheme.blue : YarisCarTheme.ink);
+
+    return Material(
+      color: bg,
+      borderRadius: BorderRadius.circular(12),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 8),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              if (isHeart) ...[
+                Icon(Icons.favorite_rounded, size: 13, color: fg),
+                const SizedBox(width: 3),
+              ],
+              Flexible(
+                child: Text(
+                  label,
+                  style: TextStyle(color: fg, fontSize: 11.5, fontWeight: FontWeight.w600),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }

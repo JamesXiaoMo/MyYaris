@@ -7,6 +7,7 @@ import 'services/storage_service.dart';
 import 'services/system_ui_service.dart';
 import 'services/task_poller_service.dart';
 import 'ui/car_home_page.dart';
+import 'ui/yaris_car_theme.dart';
 
 AudioHandler? globalAudioHandler;
 
@@ -67,15 +68,9 @@ class MyYarisApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'MyYaris 车机助手',
+      title: 'MyYaris 车机端',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData.dark().copyWith(
-        scaffoldBackgroundColor: const Color(0xFF121418),
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: Colors.blueAccent,
-          brightness: Brightness.dark,
-        ),
-      ),
+      theme: YarisCarTheme.light,
       home: CarHomePage(storage: storage, poller: poller),
     );
   }

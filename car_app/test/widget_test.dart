@@ -1,10 +1,4 @@
-// This is a basic Flutter widget test.
-//
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
-
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:my_yaris/main.dart';
 import 'package:my_yaris/services/car_music_sync_service.dart';
@@ -12,7 +6,12 @@ import 'package:my_yaris/services/task_poller_service.dart';
 import 'mock_storage_service.dart';
 
 void main() {
-  testWidgets('MyYarisApp smoke test', (WidgetTester tester) async {
+  testWidgets('MyYarisApp redesigned 4-tab shell smoke test', (WidgetTester tester) async {
+    tester.view.physicalSize = const Size(1280, 720);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
     final mockStorage = MockStorageService();
     final poller = TaskPollerService(storage: mockStorage);
 
@@ -21,27 +20,40 @@ void main() {
       CarMusicSyncService().stop();
     });
 
-    // Build our app and trigger a frame.
     await tester.pumpWidget(MyYarisApp(storage: mockStorage, poller: poller));
 
-    // Verify root widget exists and title is rendered
+    // Verify root widget and 4 navigation rail items
     expect(find.byType(MyYarisApp), findsOneWidget);
-    expect(find.text('MyYaris 车机助手'), findsOneWidget);
-    expect(find.text('连接与调试 (后台与导航)'), findsOneWidget);
-    expect(find.text('当前播放信息与播控'), findsOneWidget);
-    expect(find.text('指定歌曲页面'), findsNothing);
-    expect(find.text('指定歌单页面'), findsNothing);
+    expect(find.text('首页'), findsOneWidget);
+    expect(find.text('音乐'), findsOneWidget);
+    expect(find.text('车况'), findsOneWidget);
+    expect(find.text('设置'), findsOneWidget);
+
+    // Home dashboard cards
+    expect(find.text('手机导航接收'), findsOneWidget);
+    expect(find.text('打开 NAVITIME'), findsOneWidget);
+    expect(find.text('正在播放'), findsOneWidget);
+    expect(find.text('—'), findsAtLeastNWidgets(4));
+
+    // Debug entries must not be exposed
+    expect(find.textContaining('连接与调试'), findsNothing);
     expect(find.textContaining('长轮询'), findsNothing);
+    expect(find.textContaining('实时活动与回执日志'), findsNothing);
+    expect(find.textContaining('全车深度扫描'), findsNothing);
 
-    // Tap to enter secondary debug & connection page
-    await tester.tap(find.text('连接与调试 (后台与导航)'));
+    // Switch to OBD tab
+    await tester.tap(find.text('车况'));
     await tester.pumpAndSettle();
+    expect(find.text('混动与车辆状态'), findsOneWidget);
+    expect(find.text('连接蓝牙 OBD'), findsOneWidget);
 
-    // Verify secondary page contains connection poller controls and live logs
-    expect(find.text('启用轮询'), findsOneWidget);
-    expect(find.textContaining('实时活动与回执日志'), findsOneWidget);
+    // Switch to Settings tab
+    await tester.tap(find.text('设置'));
+    await tester.pumpAndSettle();
+    expect(find.text('后端服务连接'), findsOneWidget);
+    expect(find.text('接收手机导航'), findsOneWidget);
+    expect(find.text('全屏沉浸显示'), findsOneWidget);
 
-    // Explicitly stop background services before invariant verification
     poller.stop();
     CarMusicSyncService().stop();
   });
