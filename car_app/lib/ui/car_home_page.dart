@@ -290,7 +290,7 @@ class _CarHomePageState extends State<CarHomePage> {
                   ),
                 ),
                 const SizedBox(height: 6),
-                // 4-Metric OBD Summary Strip (em-dash when unread)
+                // 3-Metric OBD Summary Strip: Speed, Remaining Fuel, Trip Distance since start
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
                   decoration: BoxDecoration(
@@ -305,19 +305,18 @@ class _CarHomePageState extends State<CarHomePage> {
                       ),
                       _MiniDivider(),
                       _MiniMetric(
-                        label: '动力电池',
-                        value: tel.batterySoc != null ? '${tel.batterySoc!.toStringAsFixed(0)}%' : '—',
+                        label: '剩余油量',
+                        value: tel.fuelLevelLiters != null
+                            ? '${tel.fuelLevelLiters!.toStringAsFixed(1)} L'
+                            : (tel.fuelLevelPercent != null
+                                ? '${tel.fuelLevelPercent!.toStringAsFixed(0)}%'
+                                : '—'),
                       ),
                       _MiniDivider(),
                       _MiniMetric(
-                        label: '冷却水温',
-                        value: tel.coolantTemp != null ? '${tel.coolantTemp!.toInt()}°C' : '—',
-                      ),
-                      _MiniDivider(),
-                      _MiniMetric(
-                        label: '12V 电瓶',
-                        value: tel.aux12vVoltage != null
-                            ? '${tel.aux12vVoltage!.toStringAsFixed(1)}V'
+                        label: '本次里程',
+                        value: tel.tripDistanceKm != null
+                            ? '${tel.tripDistanceKm!.toStringAsFixed(1)} km'
                             : '—',
                       ),
                     ],

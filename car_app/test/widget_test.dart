@@ -33,7 +33,10 @@ void main() {
     expect(find.text('手机导航接收'), findsOneWidget);
     expect(find.text('打开 NAVITIME'), findsOneWidget);
     expect(find.text('正在播放'), findsOneWidget);
-    expect(find.text('—'), findsAtLeastNWidgets(4));
+    expect(find.text('车速'), findsOneWidget);
+    expect(find.text('剩余油量'), findsOneWidget);
+    expect(find.text('本次里程'), findsOneWidget);
+    expect(find.text('—'), findsAtLeastNWidgets(3));
 
     // Debug entries must not be exposed
     expect(find.textContaining('连接与调试'), findsNothing);

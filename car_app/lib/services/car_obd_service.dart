@@ -564,6 +564,38 @@ class CarObdService {
     }
   }
 
+  double? _sessionStartOdometerKm;
+  double? _integratedTripKm;
+  DateTime? _lastSpeedSampleAt;
+
+  void _resetTripTracking() {
+    _sessionStartOdometerKm = null;
+    _integratedTripKm = null;
+    _lastSpeedSampleAt = null;
+  }
+
+  double? _recordSpeedForTrip(double? speedKmh, DateTime now) {
+    if (speedKmh == null || speedKmh < 0) return _integratedTripKm;
+    final prevAt = _lastSpeedSampleAt;
+    _lastSpeedSampleAt = now;
+    _integratedTripKm ??= 0.0;
+    if (prevAt != null) {
+      final dtSec = now.difference(prevAt).inMilliseconds / 1000.0;
+      if (dtSec > 0 && dtSec <= 10.0) {
+        _integratedTripKm = _integratedTripKm! + (speedKmh * dtSec / 3600.0);
+      }
+    }
+    return _integratedTripKm;
+  }
+
+  double? _recordOdometerForTrip(double? odoKm) {
+    if (odoKm == null || odoKm < 0) return _integratedTripKm;
+    _sessionStartOdometerKm ??= odoKm;
+    final delta = odoKm - _sessionStartOdometerKm!;
+    if (delta >= 0) return delta;
+    return _integratedTripKm;
+  }
+
   // Tier 1: 标准 OBD 010D (车速), 010C (转速), 0105 (水温)
   Future<void> _queryStandardEngineTier1() async {
     // 确保使用标准功能寻址
@@ -579,12 +611,18 @@ class CarObdService {
     final coolantResp = await sendRawCommand('0105');
     final coolant = _parseStandardTemp(coolantResp);
 
+    final now = DateTime.now();
+    final integratedTrip = _recordSpeedForTrip(speed, now);
+
     _updateTelemetry(
       (t) => t.copyWith(
         speedKmh: speed ?? t.speedKmh,
         engineRpm: rpm ?? t.engineRpm,
         coolantTemp: coolant ?? t.coolantTemp,
-        lastUpdated: DateTime.now(),
+        tripDistanceKm: _sessionStartOdometerKm != null && t.totalOdometerKm != null
+            ? (t.totalOdometerKm! - _sessionStartOdometerKm!).clamp(0.0, double.infinity)
+            : (integratedTrip ?? t.tripDistanceKm),
+        lastUpdated: now,
       ),
     );
   }
@@ -745,9 +783,11 @@ class CarObdService {
     // 切回标准广播报头
     await sendRawCommand('ATSH7DF');
 
+    final tripFromOdo = _recordOdometerForTrip(odo);
     _updateTelemetry(
       (t) => t.copyWith(
         totalOdometerKm: odo ?? t.totalOdometerKm,
+        tripDistanceKm: tripFromOdo ?? t.tripDistanceKm,
         catalystTemp: catTemp ?? t.catalystTemp,
         catalystTemp2: catTemp2 ?? t.catalystTemp2,
         runTimeSeconds: runTime ?? t.runTimeSeconds,
@@ -1703,6 +1743,7 @@ class CarObdService {
     _knownDisplay = null;
     _knownProtocol = null;
     _knownFormatting = null;
+    _resetTripTracking();
     _updateStatus(ObdConnectionStatus.disconnected, message: '蓝牙连接已断开');
     log('🔌 OBD 蓝牙链路已终止');
   }

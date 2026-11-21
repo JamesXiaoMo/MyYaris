@@ -38,6 +38,7 @@ class ObdTelemetry {
   final double? electricWaterPumpRpm; // 电子水泵实际转速 (RPM)
   final double? electricWaterPumpTargetRpm; // 电子水泵目标转速 (RPM)
   final double? totalOdometerKm; // 整车真实总里程 (km)
+  final double? tripDistanceKm; // 本次启动以来行驶里程 (km)
   final double? fuelLevelLiters; // 剩余油量 (L)
   final double? fuelLevelPercent; // 剩余油量百分比 (%)
   final double? fuelRateLitersPerHour; // 瞬时油耗率 (L/h)
@@ -101,6 +102,7 @@ class ObdTelemetry {
     this.electricWaterPumpRpm,
     this.electricWaterPumpTargetRpm,
     this.totalOdometerKm,
+    this.tripDistanceKm,
     this.fuelLevelLiters,
     this.fuelLevelPercent,
     this.fuelRateLitersPerHour,
@@ -161,6 +163,7 @@ class ObdTelemetry {
     double? electricWaterPumpRpm,
     double? electricWaterPumpTargetRpm,
     double? totalOdometerKm,
+    double? tripDistanceKm,
     double? fuelLevelLiters,
     double? fuelLevelPercent,
     double? fuelRateLitersPerHour,
@@ -221,6 +224,7 @@ class ObdTelemetry {
       electricWaterPumpTargetRpm:
           electricWaterPumpTargetRpm ?? this.electricWaterPumpTargetRpm,
       totalOdometerKm: totalOdometerKm ?? this.totalOdometerKm,
+      tripDistanceKm: tripDistanceKm ?? this.tripDistanceKm,
       fuelLevelLiters: fuelLevelLiters ?? this.fuelLevelLiters,
       fuelLevelPercent: fuelLevelPercent ?? this.fuelLevelPercent,
       fuelRateLitersPerHour: fuelRateLitersPerHour ?? this.fuelRateLitersPerHour,
@@ -285,6 +289,7 @@ class ObdTelemetry {
       'electric_water_pump_rpm': electricWaterPumpRpm,
       'electric_water_pump_target_rpm': electricWaterPumpTargetRpm,
       'total_odometer_km': totalOdometerKm,
+      'trip_distance_km': tripDistanceKm,
       'fuel_level_liters': fuelLevelLiters,
       'fuel_rate_l_h': fuelRateLitersPerHour,
       'intake_air_temp': intakeAirTemp,
