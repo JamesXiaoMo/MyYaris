@@ -60,13 +60,16 @@ class SharedPreferencesStorageService implements IStorageService {
     // Already initialized via factory
   }
 
+  static String sanitizeBackendUrl(String raw) =>
+      raw.trim().replaceAll('：', ':').replaceAll('／', '/');
+
   @override
   String get backendUrl =>
-      _prefs.getString(_keyBackendUrl)?.trim() ?? defaultBackendUrl;
+      sanitizeBackendUrl(_prefs.getString(_keyBackendUrl) ?? defaultBackendUrl);
 
   @override
   Future<void> setBackendUrl(String url) async {
-    await _prefs.setString(_keyBackendUrl, url.trim());
+    await _prefs.setString(_keyBackendUrl, sanitizeBackendUrl(url));
   }
 
   @override

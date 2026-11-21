@@ -138,6 +138,7 @@ class _CarSettingsTabState extends State<CarSettingsTab> {
                     const SizedBox(height: 6),
                     TextField(
                       controller: urlCtrl,
+                      keyboardType: TextInputType.url,
                       decoration: const InputDecoration(hintText: 'https://backend.example.com'),
                     ),
                     const SizedBox(height: 12),
