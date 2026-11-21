@@ -380,8 +380,32 @@ class CarMusicSyncService {
     }
   }
 
-  /// Public handler for remote commands (invoked from WebSocket or HTTP polling fallback)
+  /// Handles user controls initiated directly on the car touchscreen.
+  /// Executes immediately on the local player when the active queue already has
+  /// everything needed (zero network round-trip), and falls back to backend
+  /// orchestration when server-side queue preparation is required.
   Future<void> requestLocalCommand(String action, [Map<String, dynamic> params = const {}]) async {
+    final queueCtrl = CarMusicQueueController();
+    final canExecuteLocally = switch (action) {
+      'pause' || 'stop' => true,
+      'resume' => _playerService.activeRemoteTrack != null || queueCtrl.tracks.isNotEmpty,
+      'next' || 'prev' => queueCtrl.tracks.isNotEmpty,
+      'play_track' =>
+        queueCtrl.tracks.isNotEmpty &&
+            (params['queue_id'] == null || params['queue_id'] == queueCtrl.queueId),
+      'set_playback_mode' =>
+        (params['mode'] == 'list_loop' || params['mode'] == 'shuffle') &&
+            queueCtrl.queueSource == QueueSource.neteaseFavorite &&
+            queueCtrl.isFullyLoaded,
+      _ => false,
+    };
+
+    if (canExecuteLocally) {
+      await handleCommand({'action': action, 'params': params});
+      lastCommandNotifier.value = '已本地执行 $action';
+      return;
+    }
+
     if (!_isRunning || _backendClient == null) {
       lastCommandNotifier.value = '播控不可用：请先连接后端';
       return;

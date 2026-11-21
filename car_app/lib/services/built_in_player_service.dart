@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:audio_session/audio_session.dart';
 import 'package:flutter/foundation.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'in_app_audio_stream_proxy.dart';
 import 'car_music_queue_controller.dart';
 import '../models/music_queue_models.dart';
@@ -36,6 +37,8 @@ class BuiltInPlayerService {
 
   bool _isInitialized = false;
   bool get isInitialized => _isInitialized;
+
+  static const String _savedVolumeKey = 'myyaris_saved_music_volume';
 
   // Safe initial low volume to prevent blasting car speakers
   double _currentVolume = 0.25;
@@ -171,6 +174,14 @@ class BuiltInPlayerService {
           unawaited(serialize(() => _handlePlaybackError('媒体流播放失败')));
         }
       });
+
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        final saved = prefs.getDouble(_savedVolumeKey);
+        if (saved != null && saved >= 0.05 && saved <= 1.0) {
+          _currentVolume = saved;
+        }
+      } catch (_) {}
 
       await _player.setVolume(_currentVolume);
       await _player.setLoopMode(LoopMode.off);
@@ -361,6 +372,10 @@ class BuiltInPlayerService {
   Future<void> setVolume(double val) async {
     _currentVolume = val.clamp(0.0, 1.0);
     await _player.setVolume(_currentVolume);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setDouble(_savedVolumeKey, _currentVolume);
+    } catch (_) {}
   }
 
   Future<void> dispose() async {
