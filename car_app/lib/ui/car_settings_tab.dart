@@ -8,6 +8,7 @@ import '../services/music_service.dart';
 import '../services/storage_service.dart';
 import '../services/system_ui_service.dart';
 import '../services/task_poller_service.dart';
+import '../services/trip_tracker_service.dart';
 import 'yaris_car_theme.dart';
 
 /// Clean user-facing settings tab (no debug logs, no raw ack/URI dump).
@@ -111,6 +112,12 @@ class _CarSettingsTabState extends State<CarSettingsTab> {
 
             if (newUrl.isNotEmpty) {
               CarMusicSyncService().start(
+                baseUrl: newUrl,
+                deviceId: newDeviceId,
+                token: newToken,
+                fallbackDns: newDns,
+              );
+              TripTrackerService().start(
                 baseUrl: newUrl,
                 deviceId: newDeviceId,
                 token: newToken,
@@ -327,6 +334,30 @@ class _CarSettingsTabState extends State<CarSettingsTab> {
                                     } else {
                                       widget.poller.stop();
                                     }
+                                  },
+                                ),
+                                const Divider(height: 1, color: YarisCarTheme.line),
+                                ValueListenableBuilder<bool>(
+                                  valueListenable: TripTrackerService().isRunningNotifier,
+                                  builder: (context, tracking, _) {
+                                    return _SettingsSwitchRow(
+                                      icon: Icons.route_rounded,
+                                      title: '行程位置记录',
+                                      subtitle: tracking ? '每 10 秒自动上传位置' : '已暂停记录',
+                                      value: tracking,
+                                      onChanged: (v) {
+                                        if (v) {
+                                          TripTrackerService().start(
+                                            baseUrl: widget.storage.backendUrl,
+                                            deviceId: widget.storage.deviceId,
+                                            token: widget.storage.carToken,
+                                            fallbackDns: widget.storage.fallbackDns,
+                                          );
+                                        } else {
+                                          TripTrackerService().stop();
+                                        }
+                                      },
+                                    );
                                   },
                                 ),
                                 const Divider(height: 1, color: YarisCarTheme.line),

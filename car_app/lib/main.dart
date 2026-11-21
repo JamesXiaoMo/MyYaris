@@ -6,6 +6,7 @@ import 'services/car_music_sync_service.dart';
 import 'services/storage_service.dart';
 import 'services/system_ui_service.dart';
 import 'services/task_poller_service.dart';
+import 'services/trip_tracker_service.dart';
 import 'ui/car_home_page.dart';
 import 'ui/yaris_car_theme.dart';
 
@@ -42,13 +43,20 @@ void main() async {
     debugPrint('[Main] BuiltInPlayerService init note: $e');
   }
 
-  // 3. Connect CarMusicSyncService into application-level lifecycle
+  // 3. Connect CarMusicSyncService & start 10s TripTrackerService
   if (storage.backendUrl.isNotEmpty) {
     CarMusicSyncService().start(
       baseUrl: storage.backendUrl,
       deviceId: storage.deviceId,
       token: storage.carToken,
       fallbackDns: storage.fallbackDns,
+    );
+    TripTrackerService().start(
+      baseUrl: storage.backendUrl,
+      deviceId: storage.deviceId,
+      token: storage.carToken,
+      fallbackDns: storage.fallbackDns,
+      resetTrip: true,
     );
   }
 

@@ -1,15 +1,22 @@
 package com.myyaris.my_yaris
 
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
 import android.media.MediaMetadata
 import android.media.session.MediaController
 import android.media.session.PlaybackState
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
+import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -21,7 +28,12 @@ class MainActivity : AudioServiceActivity() {
     private val navChannelName = "com.myyaris.my_yaris/navigation"
     private val musicChannelName = "com.myyaris.my_yaris/music"
     private val systemUiChannelName = "com.myyaris.my_yaris/system_ui"
+    private val locationChannelName = "com.myyaris.my_yaris/location"
     private var isFullscreenConfigured: Boolean = true
+    private var locationManager: LocationManager? = null
+    private var locationListener: LocationListener? = null
+    @Volatile
+    private var latestLocation: Location? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -65,7 +77,111 @@ class MainActivity : AudioServiceActivity() {
         setupNavigationChannel(flutterEngine)
         setupMusicChannel(flutterEngine)
         setupSystemUiChannel(flutterEngine)
+        setupLocationChannel(flutterEngine)
         ObdReportExporter.register(this, flutterEngine)
+    }
+
+    override fun onDestroy() {
+        stopNativeLocationTracking()
+        super.onDestroy()
+    }
+
+    private fun hasLocationPermission(): Boolean {
+        val fine = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val coarse = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        return fine || coarse
+    }
+
+    private fun startNativeLocationTracking(): Boolean {
+        if (!hasLocationPermission()) return false
+        val lm = locationManager ?: (getSystemService(Context.LOCATION_SERVICE) as? LocationManager)?.also {
+            locationManager = it
+        } ?: return false
+
+        if (locationListener == null) {
+            val listener = object : LocationListener {
+                override fun onLocationChanged(location: Location) {
+                    latestLocation = location
+                }
+                override fun onProviderEnabled(provider: String) {}
+                override fun onProviderDisabled(provider: String) {}
+                @Deprecated("Deprecated in Java")
+                override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+            }
+            locationListener = listener
+            runOnUiThread {
+                for (provider in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
+                    try {
+                        if (lm.isProviderEnabled(provider)) {
+                            lm.requestLocationUpdates(provider, 5000L, 0f, listener, Looper.getMainLooper())
+                        }
+                    } catch (_: Exception) {}
+                }
+            }
+        }
+        refreshBestLastKnownLocation(lm)
+        return true
+    }
+
+    private fun stopNativeLocationTracking() {
+        val lm = locationManager
+        val listener = locationListener
+        if (lm != null && listener != null) {
+            try {
+                lm.removeUpdates(listener)
+            } catch (_: Exception) {}
+        }
+        locationListener = null
+    }
+
+    private fun refreshBestLastKnownLocation(lm: LocationManager): Location? {
+        if (!hasLocationPermission()) return null
+        var best = latestLocation
+        for (provider in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER)) {
+            try {
+                val cand = lm.getLastKnownLocation(provider) ?: continue
+                if (best == null || cand.time > best.time) {
+                    best = cand
+                }
+            } catch (_: Exception) {}
+        }
+        if (best != null) latestLocation = best
+        return best
+    }
+
+    private fun setupLocationChannel(flutterEngine: FlutterEngine) {
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, locationChannelName).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "startTracking" -> result.success(startNativeLocationTracking())
+                "stopTracking" -> {
+                    stopNativeLocationTracking()
+                    result.success(true)
+                }
+                "getLatestLocation" -> {
+                    if (!hasLocationPermission()) {
+                        result.success(null)
+                        return@setMethodCallHandler
+                    }
+                    val lm = locationManager ?: (getSystemService(Context.LOCATION_SERVICE) as? LocationManager)?.also {
+                        locationManager = it
+                    }
+                    val loc = if (lm != null) refreshBestLastKnownLocation(lm) else latestLocation
+                    if (loc == null) {
+                        result.success(null)
+                    } else {
+                        result.success(mapOf(
+                            "latitude" to loc.latitude,
+                            "longitude" to loc.longitude,
+                            "speed_kmh" to if (loc.hasSpeed()) (loc.speed * 3.6).toDouble() else null,
+                            "accuracy_m" to if (loc.hasAccuracy()) loc.accuracy.toDouble() else null,
+                            "timestamp_ms" to loc.time,
+                            "provider" to (loc.provider ?: "unknown")
+                        ))
+                    }
+                }
+                else -> result.notImplemented()
+            }
+        }
     }
 
     private fun setupSystemUiChannel(flutterEngine: FlutterEngine) {

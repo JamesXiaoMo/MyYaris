@@ -705,6 +705,38 @@ class BackendClient {
     }
   }
 
+  /// Uploads a batch of GPS trip points (POST /api/v1/trips/points).
+  Future<bool> uploadTripPoints({
+    required String baseUrl,
+    required String token,
+    required String deviceId,
+    required String tripId,
+    required List<Map<String, dynamic>> points,
+  }) async {
+    if (points.isEmpty) return true;
+    final base = _normalizeUrl(baseUrl);
+    final uri = Uri.parse('$base/api/v1/trips/points');
+    try {
+      final req = await _httpClient.postUrl(uri);
+      req.headers.set(HttpHeaders.contentTypeHeader, 'application/json');
+      req.headers.set(HttpHeaders.acceptHeader, 'application/json');
+      if (token.isNotEmpty) {
+        req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+        req.headers.set('X-Device-Token', token);
+      }
+      req.add(utf8.encode(jsonEncode({
+        'device_id': deviceId,
+        'trip_id': tripId,
+        'points': points,
+      })));
+      final res = await req.close().timeout(const Duration(seconds: 10));
+      await res.drain<void>();
+      return res.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+
 
   /// Connects to a WebSocket endpoint using the configured HttpClient with DNS fallback and strict TLS verification
   Future<WebSocket> connectWebSocket(
