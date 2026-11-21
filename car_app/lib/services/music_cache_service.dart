@@ -217,14 +217,17 @@ class MusicCacheService {
         );
 
     try {
-      final uri = Uri.parse(fullStreamUrl);
-      if (uri.scheme != 'https' && uri.scheme != 'http') return false;
+      final parsedUri = Uri.parse(fullStreamUrl);
+      if (parsedUri.scheme != 'https' && parsedUri.scheme != 'http') return false;
+      final qp = Map<String, String>.from(parsedUri.queryParameters);
+      qp.putIfAbsent('level', () => 'best');
+      final uri = parsedUri.replace(queryParameters: qp);
       final req = await client.httpClient.getUrl(uri);
       if (token.isNotEmpty) {
         req.headers.set('X-Device-Token', token);
         req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
       }
-      final res = await req.close().timeout(const Duration(seconds: 25));
+      final res = await req.close().timeout(const Duration(seconds: 60));
       if (res.statusCode != 200) {
         await res.drain<void>();
         return false;

@@ -74,7 +74,7 @@ class _CarSettingsTabState extends State<CarSettingsTab> {
           style: TextStyle(color: YarisCarTheme.ink, fontSize: 17, fontWeight: FontWeight.w700),
         ),
         content: const Text(
-          '将把完整「我喜欢的音乐」逐首缓存到 SD 卡以供离线零流量播放。\n\n请确认当前已连接不限量 Wi-Fi（若 Wi-Fi 断开会自动暂停）。',
+          '将按账号最高可用音质（母带 / Hi-Res / 无损 FLAC）把完整「我喜欢的音乐」逐首缓存到 SD 卡，以供离线零流量播放。\n\n请确认当前已连接不限量 Wi-Fi（若 Wi-Fi 断开会自动暂停）。',
           style: TextStyle(color: YarisCarTheme.muted, fontSize: 13.5),
         ),
         actions: [
