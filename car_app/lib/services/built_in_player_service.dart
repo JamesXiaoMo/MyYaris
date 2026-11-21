@@ -5,6 +5,7 @@ import 'package:just_audio/just_audio.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'in_app_audio_stream_proxy.dart';
 import 'car_music_queue_controller.dart';
+import 'music_cache_service.dart';
 import '../models/music_queue_models.dart';
 
 class LocalTrackItem {
@@ -187,12 +188,13 @@ class BuiltInPlayerService {
       await _player.setLoopMode(LoopMode.off);
       await _player.setShuffleModeEnabled(false);
 
-      // 3. Start in-app loopback proxy for ExoPlayer network requests
+      // 3. Start in-app loopback proxy & init SD-card music cache
       try {
         await InAppAudioStreamProxy().start();
       } catch (e) {
         debugPrint('[BuiltInPlayer] InAppAudioStreamProxy start note: $e');
       }
+      unawaited(MusicCacheService().init());
 
       _isInitialized = true;
       debugPrint('[BuiltInPlayer] Initialized successfully with ${tracks.length} tracks.');
@@ -270,12 +272,21 @@ class BuiltInPlayerService {
           headers?['Authorization']?.replaceAll('Bearer ', '') ??
           _currentDeviceToken;
 
-      final resolvedUrl = InAppAudioStreamProxy().resolveStreamUrl(
-        fullStreamUrl,
-        token: token,
-      );
-      final uri = Uri.parse(resolvedUrl);
-      final source = AudioSource.uri(uri, headers: headers);
+      final cachedFile = MusicCacheService().getCachedFile(track.songId);
+      final bool playedFromCache = cachedFile != null;
+      final AudioSource source;
+      if (playedFromCache) {
+        source = AudioSource.file(cachedFile.path);
+        debugPrint('[BuiltInPlayer] Playing song ${track.songId} from local SD cache (0 data)');
+      } else {
+        final resolvedUrl = InAppAudioStreamProxy().resolveStreamUrl(
+          fullStreamUrl,
+          token: token,
+        );
+        final uri = Uri.parse(resolvedUrl);
+        source = AudioSource.uri(uri, headers: headers);
+      }
+
       // setAudioSource retains just_audio's playing flag; pause before preparing a paused mode.
       if (!startPlaying) await _player.pause();
       await _player.setLoopMode(LoopMode.off);
@@ -287,15 +298,22 @@ class BuiltInPlayerService {
         id: track.trackId,
         title: track.title,
         artist: track.artist,
-        assetPath: track.streamUrl,
-        isLocal: false,
-        durationDesc: '${track.durationMs ~/ 1000}秒 • 在线流',
-        tag: track.album ?? '网络歌单',
+        assetPath: playedFromCache ? cachedFile.path : track.streamUrl,
+        isLocal: playedFromCache,
+        durationDesc: '${track.durationMs ~/ 1000}秒 • ${playedFromCache ? "本地 SD 缓存" : "在线流"}',
+        tag: playedFromCache ? 'SD 离线' : (track.album ?? '网络歌单'),
       );
       activeRemoteTrackNotifier.value = _activeRemoteTrack;
 
       if (startPlaying) {
         unawaited(_player.play().catchError((Object _) {}));
+        if (!playedFromCache) {
+          MusicCacheService().cacheInBackgroundIfEnabled(
+            songId: track.songId,
+            fullStreamUrl: fullStreamUrl,
+            token: token,
+          );
+        }
       }
     } catch (e) {
       debugPrint('[BuiltInPlayer] Queue media could not be prepared');

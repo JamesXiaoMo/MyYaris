@@ -4,6 +4,7 @@ import '../models/obd_telemetry.dart';
 import '../services/backend_client.dart';
 import '../services/car_music_sync_service.dart';
 import '../services/car_obd_service.dart';
+import '../services/music_cache_service.dart';
 import '../services/music_service.dart';
 import '../services/storage_service.dart';
 import '../services/system_ui_service.dart';
@@ -38,6 +39,7 @@ class _CarSettingsTabState extends State<CarSettingsTab> {
     super.initState();
     _isFullscreen = widget.storage.isFullscreenEnabled;
     _refreshNotificationPermission();
+    MusicCacheService().init();
   }
 
   Future<void> _refreshNotificationPermission() async {
@@ -59,6 +61,86 @@ class _CarSettingsTabState extends State<CarSettingsTab> {
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('请在系统设置中开启「MyYaris 音乐播控监听」授权')),
     );
+  }
+
+  Future<void> _confirmAndStartBatchCache() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: YarisCarTheme.paper,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: const Text(
+          '批量缓存我喜欢的音乐',
+          style: TextStyle(color: YarisCarTheme.ink, fontSize: 17, fontWeight: FontWeight.w700),
+        ),
+        content: const Text(
+          '将把完整「我喜欢的音乐」逐首缓存到 SD 卡以供离线零流量播放。\n\n请确认当前已连接不限量 Wi-Fi（若 Wi-Fi 断开会自动暂停）。',
+          style: TextStyle(color: YarisCarTheme.muted, fontSize: 13.5),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: YarisCarTheme.blue,
+              foregroundColor: Colors.white,
+            ),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('确认在 Wi-Fi 下开始'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    MusicCacheService().startBatchCacheFavorites(
+      baseUrl: widget.storage.backendUrl,
+      token: widget.storage.carToken,
+      deviceId: widget.storage.deviceId,
+      fallbackDns: widget.storage.fallbackDns,
+    );
+  }
+
+  Future<void> _confirmAndClearCache() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: YarisCarTheme.paper,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: const Text(
+          '清空本地音乐缓存',
+          style: TextStyle(color: YarisCarTheme.ink, fontSize: 17, fontWeight: FontWeight.w700),
+        ),
+        content: const Text(
+          '确定清空已缓存到 SD 卡的离线音频吗？不会影响你的网易云喜欢歌单。',
+          style: TextStyle(color: YarisCarTheme.muted, fontSize: 13.5),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: YarisCarTheme.red,
+              foregroundColor: Colors.white,
+            ),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('清空'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    await MusicCacheService().clearAllCache();
+  }
+
+  String _formatCacheBytes(int bytes) {
+    if (bytes <= 0) return '0 MB';
+    final mb = bytes / (1024 * 1024);
+    if (mb >= 1024) return '${(mb / 1024).toStringAsFixed(2)} GB';
+    return '${mb.toStringAsFixed(1)} MB';
   }
 
   void _showBackendConfigDialog() {
@@ -422,6 +504,143 @@ class _CarSettingsTabState extends State<CarSettingsTab> {
                                       ? YarisCarTheme.green
                                       : YarisCarTheme.blue,
                                   onTap: _openNotificationSettings,
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(height: 16),
+                          const Padding(
+                            padding: EdgeInsets.only(left: 4, bottom: 8),
+                            child: Text(
+                              '离线音乐缓存',
+                              style: TextStyle(
+                                color: YarisCarTheme.muted,
+                                fontSize: 12.5,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ),
+                          Container(
+                            decoration: YarisCarTheme.cardDecoration(),
+                            child: Column(
+                              children: [
+                                ValueListenableBuilder<bool>(
+                                  valueListenable: MusicCacheService().cacheOnPlayNotifier,
+                                  builder: (context, enabled, _) {
+                                    return _SettingsSwitchRow(
+                                      icon: Icons.sd_storage_rounded,
+                                      title: '边听边存到 SD 卡',
+                                      subtitle: enabled ? '播过的歌自动缓存，下次零流量秒播' : '已关闭自动缓存',
+                                      value: enabled,
+                                      onChanged: (v) => MusicCacheService().setCacheOnPlay(v),
+                                    );
+                                  },
+                                ),
+                                const Divider(height: 1, color: YarisCarTheme.line),
+                                ValueListenableBuilder<BatchCacheProgress>(
+                                  valueListenable: MusicCacheService().batchProgressNotifier,
+                                  builder: (context, prog, _) {
+                                    final isRunning = prog.state == BatchCacheState.running;
+                                    return Padding(
+                                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                                      child: Column(
+                                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                                        children: [
+                                          Row(
+                                            children: [
+                                              const Icon(Icons.download_for_offline_rounded,
+                                                  size: 20, color: YarisCarTheme.blue),
+                                              const SizedBox(width: 12),
+                                              Expanded(
+                                                child: ValueListenableBuilder<int>(
+                                                  valueListenable:
+                                                      MusicCacheService().cachedCountNotifier,
+                                                  builder: (context, count, _) {
+                                                    return ValueListenableBuilder<int>(
+                                                      valueListenable:
+                                                          MusicCacheService().cachedBytesNotifier,
+                                                      builder: (context, bytes, _) {
+                                                        return Column(
+                                                          crossAxisAlignment:
+                                                              CrossAxisAlignment.start,
+                                                          children: [
+                                                            const Text(
+                                                              'Wi-Fi 批量缓存喜欢歌单',
+                                                              style: TextStyle(
+                                                                color: YarisCarTheme.ink,
+                                                                fontSize: 14,
+                                                                fontWeight: FontWeight.w600,
+                                                              ),
+                                                            ),
+                                                            Text(
+                                                              '${MusicCacheService().storageSummaryNotifier.value} · 已存 $count 首 (${_formatCacheBytes(bytes)})',
+                                                              style: const TextStyle(
+                                                                color: YarisCarTheme.muted,
+                                                                fontSize: 11,
+                                                              ),
+                                                            ),
+                                                          ],
+                                                        );
+                                                      },
+                                                    );
+                                                  },
+                                                ),
+                                              ),
+                                              const SizedBox(width: 8),
+                                              if (isRunning)
+                                                OutlinedButton(
+                                                  onPressed: () => MusicCacheService().pauseBatch(),
+                                                  child: const Text('暂停'),
+                                                )
+                                              else
+                                                FilledButton(
+                                                  style: FilledButton.styleFrom(
+                                                    backgroundColor: YarisCarTheme.blue,
+                                                    foregroundColor: Colors.white,
+                                                    padding: const EdgeInsets.symmetric(
+                                                        horizontal: 12, vertical: 8),
+                                                  ),
+                                                  onPressed: _confirmAndStartBatchCache,
+                                                  child: const Text('开始缓存',
+                                                      style: TextStyle(fontSize: 12.5)),
+                                                ),
+                                            ],
+                                          ),
+                                          if (prog.message.isNotEmpty) ...[
+                                            const SizedBox(height: 8),
+                                            Text(
+                                              prog.message,
+                                              style: TextStyle(
+                                                color: prog.state == BatchCacheState.error
+                                                    ? YarisCarTheme.red
+                                                    : YarisCarTheme.muted,
+                                                fontSize: 11.5,
+                                              ),
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                            ),
+                                          ],
+                                          if (isRunning && prog.total > 0) ...[
+                                            const SizedBox(height: 6),
+                                            LinearProgressIndicator(
+                                              value: (prog.done / prog.total).clamp(0.0, 1.0),
+                                              backgroundColor: YarisCarTheme.neutral,
+                                              color: YarisCarTheme.blue,
+                                              borderRadius: BorderRadius.circular(4),
+                                            ),
+                                          ],
+                                        ],
+                                      ),
+                                    );
+                                  },
+                                ),
+                                const Divider(height: 1, color: YarisCarTheme.line),
+                                _SettingsActionRow(
+                                  icon: Icons.delete_sweep_rounded,
+                                  title: '清空本地音乐缓存',
+                                  trailingText: '释放空间',
+                                  trailingColor: YarisCarTheme.red,
+                                  onTap: _confirmAndClearCache,
                                 ),
                               ],
                             ),

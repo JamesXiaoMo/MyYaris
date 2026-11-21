@@ -10,11 +10,15 @@ import android.location.LocationManager
 import android.media.MediaMetadata
 import android.media.session.MediaController
 import android.media.session.PlaybackState
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Looper
 import android.os.PowerManager
+import android.os.StatFs
 import android.provider.Settings
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
@@ -29,6 +33,7 @@ class MainActivity : AudioServiceActivity() {
     private val musicChannelName = "com.myyaris.my_yaris/music"
     private val systemUiChannelName = "com.myyaris.my_yaris/system_ui"
     private val locationChannelName = "com.myyaris.my_yaris/location"
+    private val storageChannelName = "com.myyaris.my_yaris/storage"
     private var isFullscreenConfigured: Boolean = true
     private var locationManager: LocationManager? = null
     private var locationListener: LocationListener? = null
@@ -78,7 +83,61 @@ class MainActivity : AudioServiceActivity() {
         setupMusicChannel(flutterEngine)
         setupSystemUiChannel(flutterEngine)
         setupLocationChannel(flutterEngine)
+        setupStorageChannel(flutterEngine)
         ObdReportExporter.register(this, flutterEngine)
+    }
+
+    private fun setupStorageChannel(flutterEngine: FlutterEngine) {
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, storageChannelName).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "getMusicCacheDir" -> {
+                    try {
+                        val dirs = getExternalFilesDirs(null)?.filterNotNull() ?: emptyList()
+                        var chosen: java.io.File? = null
+                        var isSd = false
+                        // Prefer removable mounted SD card first
+                        for (d in dirs) {
+                            try {
+                                val removable = Environment.isExternalStorageRemovable(d)
+                                val state = Environment.getExternalStorageState(d)
+                                if (removable && state == Environment.MEDIA_MOUNTED) {
+                                    chosen = d
+                                    isSd = true
+                                    break
+                                }
+                            } catch (_: Exception) {}
+                        }
+                        if (chosen == null) {
+                            chosen = dirs.firstOrNull() ?: filesDir
+                            isSd = false
+                        }
+                        val cacheDir = java.io.File(chosen, "music_cache")
+                        if (!cacheDir.exists()) cacheDir.mkdirs()
+                        val stat = StatFs(cacheDir.absolutePath)
+                        val freeBytes = stat.availableBytes
+                        result.success(mapOf(
+                            "path" to cacheDir.absolutePath,
+                            "isSdCard" to isSd,
+                            "freeBytes" to freeBytes
+                        ))
+                    } catch (e: Exception) {
+                        result.error("STORAGE_ERROR", e.localizedMessage ?: "Cannot resolve cache dir", null)
+                    }
+                }
+                "isOnWifi" -> {
+                    try {
+                        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                        val active = cm?.activeNetwork
+                        val caps = if (active != null) cm.getNetworkCapabilities(active) else null
+                        val onWifi = caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+                        result.success(onWifi)
+                    } catch (_: Exception) {
+                        result.success(false)
+                    }
+                }
+                else -> result.notImplemented()
+            }
+        }
     }
 
     override fun onDestroy() {
