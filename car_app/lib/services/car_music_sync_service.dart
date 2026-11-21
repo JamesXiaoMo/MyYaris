@@ -725,8 +725,15 @@ class CarMusicSyncService {
             }
           } else {
             final source = params['source']?.toString() ?? QueueSource.neteaseFavorite;
-            final candidate = await queueCtrl.fetchAndValidateQueueSnapshot(
+            var candidate = await queueCtrl.fetchAndValidateQueueSnapshot(
               queueId: serverQueueId, queueVersion: serverQueueVersion, source: source);
+            if ((candidate == null || candidate.tracks.isEmpty) &&
+                source == QueueSource.neteaseFavorite &&
+                serverQueueId != null &&
+                (expectedQueueId == null || expectedQueueId.isEmpty)) {
+              debugPrint('[CarMusicSync] Stale favorite snapshot ($serverQueueId) expired on server; fetching latest favorite snapshot.');
+              candidate = await queueCtrl.fetchAndValidateQueueSnapshot(source: QueueSource.neteaseFavorite);
+            }
             if (candidate == null || candidate.tracks.isEmpty) throw BackendException(409, 'No complete queue for resume');
             final trackId = params['track_id']?.toString();
             final found = candidate.tracks.indexWhere((t) => t.trackId == trackId);
