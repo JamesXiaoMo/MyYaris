@@ -1,14 +1,19 @@
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:qr_flutter/qr_flutter.dart';
 import '../models/music_queue_models.dart';
+import '../services/backend_client.dart';
 import '../services/built_in_player_service.dart';
 import '../services/car_music_queue_controller.dart';
 import '../services/car_music_sync_service.dart';
+import '../services/storage_service.dart';
 import 'yaris_car_theme.dart';
 
 /// Full-featured music playback & queue tab matching the redesigned iOS style.
 class CarMusicTab extends StatefulWidget {
-  const CarMusicTab({super.key});
+  final IStorageService? storage;
+
+  const CarMusicTab({super.key, this.storage});
 
   @override
   State<CarMusicTab> createState() => _CarMusicTabState();
@@ -32,6 +37,150 @@ class _CarMusicTabState extends State<CarMusicTab> {
 
   Future<void> _sendMode(String mode) async {
     await CarMusicSyncService().requestLocalCommand('set_playback_mode', {'mode': mode});
+  }
+
+  Future<void> _openGuestDjQrDialog() async {
+    final storage = widget.storage;
+    if (storage == null || storage.backendUrl.isEmpty) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('请先在设置中配置后端服务连接')),
+      );
+      return;
+    }
+
+    String? qrUrl;
+    String? errorMsg;
+    bool loading = true;
+
+    Future<void> loadSession(void Function(void Function()) setDialogState, {bool forceNew = false}) async {
+      setDialogState(() {
+        loading = true;
+        errorMsg = null;
+      });
+      final client = BackendClient(fallbackDns: storage.fallbackDns);
+      try {
+        final data = await client.createDjSession(
+          baseUrl: storage.backendUrl,
+          token: storage.carToken,
+          deviceId: storage.deviceId,
+          forceNew: forceNew,
+        );
+        if (!mounted) return;
+        setDialogState(() {
+          qrUrl = data['url']?.toString();
+          loading = false;
+        });
+      } catch (e) {
+        if (!mounted) return;
+        setDialogState(() {
+          errorMsg = '生成点歌二维码失败，请检查网络连接';
+          loading = false;
+        });
+      } finally {
+        client.close();
+      }
+    }
+
+    bool started = false;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          if (!started) {
+            started = true;
+            Future.microtask(() => loadSession(setDialogState));
+          }
+          return AlertDialog(
+            backgroundColor: YarisCarTheme.paper,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+            title: const Row(
+              children: [
+                Icon(Icons.qr_code_2_rounded, color: YarisCarTheme.blue, size: 22),
+                SizedBox(width: 8),
+                Text(
+                  '副驾 / 后排扫码点歌',
+                  style: TextStyle(color: YarisCarTheme.ink, fontSize: 17, fontWeight: FontWeight.w700),
+                ),
+              ],
+            ),
+            content: SizedBox(
+              width: 300,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (loading)
+                    const SizedBox(
+                      height: 200,
+                      child: Center(child: CircularProgressIndicator()),
+                    )
+                  else if (errorMsg != null)
+                    SizedBox(
+                      height: 160,
+                      child: Center(
+                        child: Text(
+                          errorMsg!,
+                          style: const TextStyle(color: YarisCarTheme.red, fontSize: 13.5),
+                          textAlign: TextAlign.center,
+                        ),
+                      ),
+                    )
+                  else if (qrUrl != null && qrUrl!.isNotEmpty)
+                    Container(
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(18),
+                        border: Border.all(color: YarisCarTheme.line),
+                      ),
+                      child: QrImageView(
+                        data: qrUrl!,
+                        version: QrVersions.auto,
+                        size: 196,
+                        backgroundColor: Colors.white,
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: loading
+                    ? null
+                    : () async {
+                        final client = BackendClient(fallbackDns: storage.fallbackDns);
+                        await client.revokeDjSession(
+                          baseUrl: storage.backendUrl,
+                          token: storage.carToken,
+                          deviceId: storage.deviceId,
+                        );
+                        client.close();
+                        if (ctx.mounted) Navigator.pop(ctx);
+                        if (mounted) {
+                          ScaffoldMessenger.of(this.context).showSnackBar(
+                            const SnackBar(content: Text('已关闭扫码点歌')),
+                          );
+                        }
+                      },
+                child: const Text('关闭点歌', style: TextStyle(color: YarisCarTheme.red)),
+              ),
+              TextButton(
+                onPressed: loading ? null : () => loadSession(setDialogState, forceNew: true),
+                child: const Text('刷新二维码'),
+              ),
+              FilledButton(
+                style: FilledButton.styleFrom(
+                  backgroundColor: YarisCarTheme.blue,
+                  foregroundColor: Colors.white,
+                ),
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('完成'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
   }
 
   @override
@@ -321,13 +470,35 @@ class _CarMusicTabState extends State<CarMusicTab> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          const Text(
-            '当前播放队列',
-            style: TextStyle(
-              color: YarisCarTheme.ink,
-              fontSize: 16,
-              fontWeight: FontWeight.w700,
-            ),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text(
+                '当前播放队列',
+                style: TextStyle(
+                  color: YarisCarTheme.ink,
+                  fontSize: 16,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              FilledButton.tonalIcon(
+                style: FilledButton.styleFrom(
+                  backgroundColor: YarisCarTheme.periwinkle,
+                  foregroundColor: YarisCarTheme.blue,
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  minimumSize: const Size(0, 32),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                ),
+                onPressed: _openGuestDjQrDialog,
+                icon: const Icon(Icons.qr_code_2_rounded, size: 16),
+                label: const Text(
+                  '扫码点歌',
+                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+                ),
+              ),
+            ],
           ),
           const SizedBox(height: 10),
           Expanded(

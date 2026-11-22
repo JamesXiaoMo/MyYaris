@@ -39,6 +39,7 @@ dependencies:
   audio_session: ^0.2.4
   audio_service: ^0.18.19
   flutter_blue_plus: ^2.3.14
+  qr_flutter: ^4.1.0
 
 dev_dependencies:
   flutter_test:

@@ -738,6 +738,56 @@ class BackendClient {
   }
 
 
+  /// Creates or fetches an active Guest DJ QR session URL for passenger song requests.
+  Future<Map<String, dynamic>> createDjSession({
+    required String baseUrl,
+    required String token,
+    required String deviceId,
+    bool forceNew = false,
+  }) async {
+    final base = _normalizeUrl(baseUrl);
+    final uri = Uri.parse('$base/api/v1/dj/session').replace(queryParameters: {
+      'device_id': deviceId,
+      if (forceNew) 'force_new': 'true',
+    });
+    final req = await _httpClient.postUrl(uri);
+    req.headers.set(HttpHeaders.acceptHeader, 'application/json');
+    if (token.isNotEmpty) {
+      req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+      req.headers.set('X-Device-Token', token);
+    }
+    final res = await req.close().timeout(const Duration(seconds: 10));
+    final body = await utf8.decodeStream(res);
+    if (res.statusCode == 200) {
+      return jsonDecode(body) as Map<String, dynamic>;
+    }
+    throw BackendException(res.statusCode, body);
+  }
+
+  /// Revokes the active Guest DJ session immediately.
+  Future<bool> revokeDjSession({
+    required String baseUrl,
+    required String token,
+    required String deviceId,
+  }) async {
+    final base = _normalizeUrl(baseUrl);
+    final uri = Uri.parse('$base/api/v1/dj/session').replace(queryParameters: {
+      'device_id': deviceId,
+    });
+    try {
+      final req = await _httpClient.deleteUrl(uri);
+      req.headers.set(HttpHeaders.acceptHeader, 'application/json');
+      if (token.isNotEmpty) {
+        req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+        req.headers.set('X-Device-Token', token);
+      }
+      final res = await req.close().timeout(const Duration(seconds: 10));
+      return res.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// Connects to a WebSocket endpoint using the configured HttpClient with DNS fallback and strict TLS verification
   Future<WebSocket> connectWebSocket(
     Uri uri, {

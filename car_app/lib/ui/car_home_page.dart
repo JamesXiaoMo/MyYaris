@@ -97,7 +97,7 @@ class _CarHomePageState extends State<CarHomePage> {
                   index: _selectedTab,
                   children: [
                     _buildHomeDashboard(),
-                    const CarMusicTab(),
+                    CarMusicTab(storage: widget.storage),
                     const CarObdTab(),
                     CarSettingsTab(
                       storage: widget.storage,
