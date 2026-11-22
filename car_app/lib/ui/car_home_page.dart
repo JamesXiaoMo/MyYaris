@@ -474,7 +474,11 @@ class _CarHomePageState extends State<CarHomePage> {
                   final hasTrack = track.id.isNotEmpty && track.title != '无播放曲目';
                   return Row(
                     children: [
-                      const YarisMusicArtwork(size: 80, borderRadius: 18),
+                      YarisMusicArtwork(
+                        size: 80,
+                        borderRadius: 18,
+                        coverUrl: hasTrack ? track.coverUrl : null,
+                      ),
                       const SizedBox(width: 14),
                       Expanded(
                         child: Column(

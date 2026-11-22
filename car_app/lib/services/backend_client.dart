@@ -764,6 +764,41 @@ class BackendClient {
     throw BackendException(res.statusCode, body);
   }
 
+  /// Uploads an OBD-II telemetry snapshot to `/api/v1/vehicle/telemetry`.
+  Future<bool> uploadVehicleTelemetry({
+    required String baseUrl,
+    required String token,
+    required String deviceId,
+    required Map<String, dynamic> telemetry,
+  }) async {
+    final base = _normalizeUrl(baseUrl);
+    final uri = Uri.parse('$base/api/v1/vehicle/telemetry');
+    try {
+      final req = await _httpClient.postUrl(uri);
+      req.headers.set(HttpHeaders.contentTypeHeader, 'application/json');
+      req.headers.set(HttpHeaders.acceptHeader, 'application/json');
+      if (token.isNotEmpty) {
+        req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+        req.headers.set('X-Device-Token', token);
+      }
+      final payload = <String, dynamic>{
+        'device_id': deviceId,
+        'recorded_at': DateTime.now().toUtc().toIso8601String(),
+      };
+      telemetry.forEach((key, value) {
+        if (value == null || key == 'status' || key == 'last_updated') return;
+        if (value is List && value.isEmpty) return;
+        payload[key] = value;
+      });
+      req.add(utf8.encode(jsonEncode(payload)));
+      final res = await req.close().timeout(const Duration(seconds: 10));
+      await res.drain<void>();
+      return res.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// Revokes the active Guest DJ session immediately.
   Future<bool> revokeDjSession({
     required String baseUrl,

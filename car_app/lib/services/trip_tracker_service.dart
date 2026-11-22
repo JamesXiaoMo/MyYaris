@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import '../models/obd_telemetry.dart';
 import 'backend_client.dart';
+import 'car_obd_service.dart';
 
 /// Samples GPS location from Android LocationManager every 10 seconds and
 /// uploads batches to `/api/v1/trips/points` with in-memory offline buffering.
@@ -133,18 +135,42 @@ class TripTrackerService {
         }
       }
 
-      if (_pendingPoints.isEmpty) return;
-
-      final batch = List<Map<String, dynamic>>.from(
-        _pendingPoints.take(100),
-      );
-      final ok = await _postBatch(batch);
-      if (ok) {
-        _pendingPoints.removeRange(0, batch.length);
-        uploadedPointsNotifier.value += batch.length;
+      if (_pendingPoints.isNotEmpty) {
+        final batch = List<Map<String, dynamic>>.from(
+          _pendingPoints.take(100),
+        );
+        final ok = await _postBatch(batch);
+        if (ok) {
+          _pendingPoints.removeRange(0, batch.length);
+          uploadedPointsNotifier.value += batch.length;
+        }
       }
+
+      await _uploadObdSnapshotIfReady();
     } finally {
       _uploadInFlight = false;
+    }
+  }
+
+  Future<void> _uploadObdSnapshotIfReady() async {
+    final telemetry = CarObdService().currentTelemetry;
+    if (telemetry.status != ObdConnectionStatus.ready) return;
+    try {
+      final client = BackendClient(
+        fallbackDns: _fallbackDns.isNotEmpty ? _fallbackDns : null,
+      );
+      try {
+        await client.uploadVehicleTelemetry(
+          baseUrl: _baseUrl,
+          token: _token,
+          deviceId: _deviceId,
+          telemetry: telemetry.toJson(),
+        );
+      } finally {
+        client.close();
+      }
+    } catch (e) {
+      debugPrint('[TripTracker] OBD upload deferred: $e');
     }
   }
 

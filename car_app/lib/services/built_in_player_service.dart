@@ -17,6 +17,7 @@ class LocalTrackItem {
   final bool isLocal;
   final String durationDesc;
   final String tag;
+  final String? coverUrl;
 
   const LocalTrackItem({
     required this.id,
@@ -26,6 +27,7 @@ class LocalTrackItem {
     required this.isLocal,
     required this.durationDesc,
     required this.tag,
+    this.coverUrl,
   });
 }
 
@@ -54,7 +56,7 @@ class BuiltInPlayerService {
 
   List<LocalTrackItem> get tracks => CarMusicQueueController().tracks.map((t) => LocalTrackItem(
     id: t.trackId, title: t.title, artist: t.artist, assetPath: t.streamUrl,
-    isLocal: false, durationDesc: '${t.durationMs ~/ 1000}秒', tag: '网易云')).toList();
+    isLocal: false, durationDesc: '${t.durationMs ~/ 1000}秒', tag: '网易云', coverUrl: t.coverUrl)).toList();
 
   Future<void> Function(String action, Map<String, dynamic> params)? requestUserCommand;
   Future<void> _operationTail = Future.value();
@@ -105,6 +107,7 @@ class BuiltInPlayerService {
         isLocal: false,
         durationDesc: '${queueTrack.durationMs ~/ 1000}秒 • 在线流',
         tag: queueTrack.album ?? '网络歌单',
+        coverUrl: queueTrack.coverUrl,
       );
     }
     return const LocalTrackItem(
@@ -330,6 +333,7 @@ class BuiltInPlayerService {
         isLocal: playedFromCache,
         durationDesc: '${track.durationMs ~/ 1000}秒 • ${playedFromCache ? "本地 SD 缓存" : "在线流"}',
         tag: playedFromCache ? 'SD 离线' : (track.album ?? '网络歌单'),
+        coverUrl: track.coverUrl,
       );
       activeRemoteTrackNotifier.value = _activeRemoteTrack;
       _savedLastTrack = track;

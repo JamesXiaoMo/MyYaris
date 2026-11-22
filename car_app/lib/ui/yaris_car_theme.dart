@@ -73,100 +73,130 @@ abstract final class YarisCarTheme {
   }
 }
 
-/// Reusable geometric vinyl artwork matching the iOS music card aesthetic.
+/// Reusable album artwork with network cover image and geometric vinyl fallback.
 class YarisMusicArtwork extends StatelessWidget {
   final double size;
   final double borderRadius;
   final String? badgeLabel;
+  final String? coverUrl;
 
   const YarisMusicArtwork({
     super.key,
     this.size = 84,
     this.borderRadius = 18,
     this.badgeLabel,
+    this.coverUrl,
   });
+
+  String? get _normalizedCoverUrl {
+    final raw = coverUrl?.trim();
+    if (raw == null || raw.isEmpty) return null;
+    if (raw.startsWith('http://') && raw.contains('music.126.net')) {
+      return 'https://${raw.substring('http://'.length)}';
+    }
+    return raw;
+  }
+
+  Widget _buildFallback() {
+    return Container(
+      width: size,
+      height: size,
+      color: YarisCarTheme.blue,
+      child: Stack(
+        children: [
+          Positioned(
+            right: -size * 0.14,
+            top: -size * 0.12,
+            child: Container(
+              width: size * 0.92,
+              height: size * 0.92,
+              decoration: const BoxDecoration(
+                color: Color(0xFFFF6B6B),
+                shape: BoxShape.circle,
+              ),
+            ),
+          ),
+          Positioned(
+            right: size * 0.02,
+            top: size * 0.04,
+            child: Container(
+              width: size * 0.60,
+              height: size * 0.60,
+              decoration: const BoxDecoration(
+                color: Color(0xFFFFB4A2),
+                shape: BoxShape.circle,
+              ),
+            ),
+          ),
+          Positioned(
+            right: size * 0.14,
+            top: size * 0.16,
+            child: Container(
+              width: size * 0.36,
+              height: size * 0.36,
+              decoration: const BoxDecoration(
+                color: Color(0xFFFFE5D9),
+                shape: BoxShape.circle,
+              ),
+            ),
+          ),
+          Positioned(
+            right: size * 0.24,
+            top: size * 0.26,
+            child: Container(
+              width: size * 0.16,
+              height: size * 0.16,
+              decoration: const BoxDecoration(
+                color: YarisCarTheme.blue,
+                shape: BoxShape.circle,
+              ),
+            ),
+          ),
+          if (badgeLabel != null && badgeLabel!.isNotEmpty)
+            Positioned(
+              left: 8,
+              bottom: 8,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.22),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Text(
+                  badgeLabel!,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
+    final url = _normalizedCoverUrl;
     return ClipRRect(
       borderRadius: BorderRadius.circular(borderRadius),
-      child: Container(
-        width: size,
-        height: size,
-        color: YarisCarTheme.blue,
-        child: Stack(
-          children: [
-            Positioned(
-              right: -size * 0.14,
-              top: -size * 0.12,
-              child: Container(
-                width: size * 0.92,
-                height: size * 0.92,
-                decoration: const BoxDecoration(
-                  color: Color(0xFFFF6B6B),
-                  shape: BoxShape.circle,
-                ),
+      child: url != null
+          ? SizedBox(
+              width: size,
+              height: size,
+              child: Image.network(
+                url,
+                width: size,
+                height: size,
+                fit: BoxFit.cover,
+                errorBuilder: (_, _, _) => _buildFallback(),
+                loadingBuilder: (context, child, progress) =>
+                    progress == null ? child : _buildFallback(),
               ),
-            ),
-            Positioned(
-              right: size * 0.02,
-              top: size * 0.04,
-              child: Container(
-                width: size * 0.60,
-                height: size * 0.60,
-                decoration: const BoxDecoration(
-                  color: Color(0xFFFFB4A2),
-                  shape: BoxShape.circle,
-                ),
-              ),
-            ),
-            Positioned(
-              right: size * 0.14,
-              top: size * 0.16,
-              child: Container(
-                width: size * 0.36,
-                height: size * 0.36,
-                decoration: const BoxDecoration(
-                  color: Color(0xFFFFE5D9),
-                  shape: BoxShape.circle,
-                ),
-              ),
-            ),
-            Positioned(
-              right: size * 0.24,
-              top: size * 0.26,
-              child: Container(
-                width: size * 0.16,
-                height: size * 0.16,
-                decoration: const BoxDecoration(
-                  color: YarisCarTheme.blue,
-                  shape: BoxShape.circle,
-                ),
-              ),
-            ),
-            if (badgeLabel != null && badgeLabel!.isNotEmpty)
-              Positioned(
-                left: 8,
-                bottom: 8,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                  decoration: BoxDecoration(
-                    color: Colors.black.withValues(alpha: 0.22),
-                    borderRadius: BorderRadius.circular(6),
-                  ),
-                  child: Text(
-                    badgeLabel!,
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 10,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ),
-              ),
-          ],
-        ),
-      ),
+            )
+          : _buildFallback(),
     );
   }
 }

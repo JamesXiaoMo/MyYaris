@@ -221,7 +221,11 @@ class _CarMusicTabState extends State<CarMusicTab> {
                     final hasTrack = track.id.isNotEmpty && track.title != '无播放曲目';
                     return Row(
                       children: [
-                        const YarisMusicArtwork(size: 108, borderRadius: 22),
+                        YarisMusicArtwork(
+                          size: 108,
+                          borderRadius: 22,
+                          coverUrl: hasTrack ? track.coverUrl : null,
+                        ),
                         const SizedBox(width: 16),
                         Expanded(
                           child: Column(
@@ -557,6 +561,12 @@ class _CarMusicTabState extends State<CarMusicTab> {
                                 ),
                               ),
                               const SizedBox(width: 6),
+                              YarisMusicArtwork(
+                                size: 36,
+                                borderRadius: 9,
+                                coverUrl: item.coverUrl,
+                              ),
+                              const SizedBox(width: 10),
                               Expanded(
                                 child: Column(
                                   crossAxisAlignment: CrossAxisAlignment.start,
