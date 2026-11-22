@@ -34,6 +34,7 @@ class _CarSettingsTabState extends State<CarSettingsTab> {
   final MusicService _musicService = MusicService();
   late bool _isFullscreen;
   bool _hasNotificationPermission = false;
+  String _appVersion = AppUpdateService.currentVersion;
 
   @override
   void initState() {
@@ -41,6 +42,11 @@ class _CarSettingsTabState extends State<CarSettingsTab> {
     _isFullscreen = widget.storage.isFullscreenEnabled;
     _refreshNotificationPermission();
     MusicCacheService().init();
+    AppUpdateService.getCurrentVersion().then((v) {
+      if (mounted && v != _appVersion) {
+        setState(() => _appVersion = v);
+      }
+    });
   }
 
   Future<void> _refreshNotificationPermission() async {
@@ -809,7 +815,7 @@ class _CarSettingsTabState extends State<CarSettingsTab> {
                             child: _SettingsActionRow(
                               icon: Icons.system_update_rounded,
                               title: '检查 GitHub 更新',
-                              trailingText: 'v${AppUpdateService.currentVersion}',
+                              trailingText: 'v$_appVersion',
                               trailingColor: YarisCarTheme.blue,
                               onTap: _checkForGithubUpdate,
                             ),

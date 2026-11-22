@@ -21,11 +21,28 @@ class AppUpdateInfo {
 }
 
 class AppUpdateService {
-  static const String currentVersion = '1.1.0';
+  static const String currentVersion = '1.2.1';
   static const String latestReleaseApi =
       'https://api.github.com/repos/JamesXiaoMo/MyYaris/releases/latest';
   static const MethodChannel _channel =
       MethodChannel('com.myyaris.my_yaris/updater');
+
+  static String? _cachedVersion;
+
+  /// Reads the real installed Android `versionName` dynamically from PackageManager.
+  static Future<String> getCurrentVersion() async {
+    if (_cachedVersion != null && _cachedVersion!.isNotEmpty) {
+      return _cachedVersion!;
+    }
+    try {
+      final v = await _channel.invokeMethod<String>('getAppVersion');
+      if (v != null && v.trim().isNotEmpty) {
+        _cachedVersion = v.trim();
+        return _cachedVersion!;
+      }
+    } catch (_) {}
+    return currentVersion;
+  }
 
   static bool isNewerVersion(String remote, String local) {
     List<int> parse(String v) {
@@ -45,17 +62,18 @@ class AppUpdateService {
   }
 
   Future<AppUpdateInfo> checkForUpdate() async {
+    final localVersion = await getCurrentVersion();
     final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
     try {
       final req = await client.getUrl(Uri.parse(latestReleaseApi));
-      req.headers.set(HttpHeaders.userAgentHeader, 'MyYaris-CarApp/$currentVersion');
+      req.headers.set(HttpHeaders.userAgentHeader, 'MyYaris-CarApp/$localVersion');
       req.headers.set(HttpHeaders.acceptHeader, 'application/vnd.github+json');
       final res = await req.close().timeout(const Duration(seconds: 12));
       final body = await utf8.decodeStream(res);
       if (res.statusCode == 404) {
-        return const AppUpdateInfo(
-          currentVersion: currentVersion,
-          latestVersion: currentVersion,
+        return AppUpdateInfo(
+          currentVersion: localVersion,
+          latestVersion: localVersion,
           releaseNotes: 'GitHub 仓库暂无已发布的 Release 版本',
           apkUrl: null,
           apkSizeBytes: 0,
@@ -86,11 +104,11 @@ class AppUpdateService {
       }
       final cleanLatest = tag.replaceFirst(RegExp(r'^[vV]'), '');
       final hasUpdate = cleanLatest.isNotEmpty &&
-          isNewerVersion(cleanLatest, currentVersion) &&
+          isNewerVersion(cleanLatest, localVersion) &&
           apkUrl != null;
       return AppUpdateInfo(
-        currentVersion: currentVersion,
-        latestVersion: cleanLatest.isEmpty ? currentVersion : cleanLatest,
+        currentVersion: localVersion,
+        latestVersion: cleanLatest.isEmpty ? localVersion : cleanLatest,
         releaseNotes: notes,
         apkUrl: apkUrl,
         apkSizeBytes: apkSize,

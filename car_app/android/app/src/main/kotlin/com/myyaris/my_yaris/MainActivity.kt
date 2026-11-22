@@ -91,6 +91,19 @@ class MainActivity : AudioServiceActivity() {
     private fun setupUpdaterChannel(flutterEngine: FlutterEngine) {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.myyaris.my_yaris/updater").setMethodCallHandler { call, result ->
             when (call.method) {
+                "getAppVersion" -> {
+                    try {
+                        val pkgInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            packageManager.getPackageInfo(packageName, android.content.pm.PackageManager.PackageInfoFlags.of(0))
+                        } else {
+                            @Suppress("DEPRECATION")
+                            packageManager.getPackageInfo(packageName, 0)
+                        }
+                        result.success(pkgInfo.versionName ?: "")
+                    } catch (e: Exception) {
+                        result.success("")
+                    }
+                }
                 "getUpdateCacheDir" -> {
                     try {
                         val dir = java.io.File(cacheDir, "updates")
