@@ -408,7 +408,6 @@ class _CarSettingsTabState extends State<CarSettingsTab> {
                                 _SettingsSwitchRow(
                                   icon: Icons.navigation_rounded,
                                   title: '接收手机导航',
-                                  subtitle: pollerRunning ? '收到目的地后自动唤起 NAVITIME' : '已暂停接收',
                                   value: pollerRunning,
                                   onChanged: (v) {
                                     if (v) {
@@ -425,7 +424,6 @@ class _CarSettingsTabState extends State<CarSettingsTab> {
                                     return _SettingsSwitchRow(
                                       icon: Icons.route_rounded,
                                       title: '行程位置记录',
-                                      subtitle: tracking ? '每 10 秒自动上传位置' : '已暂停记录',
                                       value: tracking,
                                       onChanged: (v) {
                                         if (v) {
@@ -491,7 +489,6 @@ class _CarSettingsTabState extends State<CarSettingsTab> {
                                 _SettingsSwitchRow(
                                   icon: Icons.fullscreen_rounded,
                                   title: '全屏沉浸显示',
-                                  subtitle: _isFullscreen ? '隐藏系统状态栏' : '显示系统状态栏',
                                   value: _isFullscreen,
                                   onChanged: _toggleFullscreen,
                                 ),
@@ -530,7 +527,6 @@ class _CarSettingsTabState extends State<CarSettingsTab> {
                                     return _SettingsSwitchRow(
                                       icon: Icons.sd_storage_rounded,
                                       title: '边听边存到 SD 卡',
-                                      subtitle: enabled ? '播过的歌自动缓存，下次零流量秒播' : '已关闭自动缓存',
                                       value: enabled,
                                       onChanged: (v) => MusicCacheService().setCacheOnPlay(v),
                                     );
@@ -742,14 +738,12 @@ class _SettingsActionRow extends StatelessWidget {
 class _SettingsSwitchRow extends StatelessWidget {
   final IconData icon;
   final String title;
-  final String subtitle;
   final bool value;
   final ValueChanged<bool> onChanged;
 
   const _SettingsSwitchRow({
     required this.icon,
     required this.title,
-    required this.subtitle,
     required this.value,
     required this.onChanged,
   });
@@ -763,22 +757,13 @@ class _SettingsSwitchRow extends StatelessWidget {
           Icon(icon, size: 20, color: YarisCarTheme.blue),
           const SizedBox(width: 12),
           Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  title,
-                  style: const TextStyle(
-                    color: YarisCarTheme.ink,
-                    fontSize: 14.5,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-                Text(
-                  subtitle,
-                  style: const TextStyle(color: YarisCarTheme.muted, fontSize: 11.5),
-                ),
-              ],
+            child: Text(
+              title,
+              style: const TextStyle(
+                color: YarisCarTheme.ink,
+                fontSize: 14.5,
+                fontWeight: FontWeight.w600,
+              ),
             ),
           ),
           Switch(

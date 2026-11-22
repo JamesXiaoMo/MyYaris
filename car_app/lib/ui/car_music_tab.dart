@@ -103,18 +103,18 @@ class _CarMusicTabState extends State<CarMusicTab> {
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
                               ),
-                              const SizedBox(height: 4),
-                              Text(
-                                hasTrack && track.artist.isNotEmpty
-                                    ? '${track.artist} · 网易云音乐'
-                                    : '点击播放使用完整喜欢歌单',
-                                style: const TextStyle(
-                                  color: YarisCarTheme.muted,
-                                  fontSize: 13,
+                              if (hasTrack && track.artist.isNotEmpty) ...[
+                                const SizedBox(height: 4),
+                                Text(
+                                  track.artist,
+                                  style: const TextStyle(
+                                    color: YarisCarTheme.muted,
+                                    fontSize: 13,
+                                  ),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
                                 ),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                              ),
+                              ],
                             ],
                           ),
                         ),
@@ -321,25 +321,13 @@ class _CarMusicTabState extends State<CarMusicTab> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              const Text(
-                '当前播放队列',
-                style: TextStyle(
-                  color: YarisCarTheme.ink,
-                  fontSize: 16,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-              Text(
-                '支持手机远程同步',
-                style: TextStyle(
-                  color: YarisCarTheme.muted.withValues(alpha: 0.85),
-                  fontSize: 11.5,
-                ),
-              ),
-            ],
+          const Text(
+            '当前播放队列',
+            style: TextStyle(
+              color: YarisCarTheme.ink,
+              fontSize: 16,
+              fontWeight: FontWeight.w700,
+            ),
           ),
           const SizedBox(height: 10),
           Expanded(
@@ -364,12 +352,6 @@ class _CarMusicTabState extends State<CarMusicTab> {
                               fontSize: 14,
                               fontWeight: FontWeight.w600,
                             ),
-                          ),
-                          SizedBox(height: 4),
-                          Text(
-                            '点击左侧播放按钮使用完整喜欢歌单，或在手机端选歌发送到车机。',
-                            style: TextStyle(color: YarisCarTheme.muted, fontSize: 12),
-                            textAlign: TextAlign.center,
                           ),
                         ],
                       ),

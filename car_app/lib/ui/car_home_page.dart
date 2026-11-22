@@ -382,30 +382,18 @@ class _CarHomePageState extends State<CarHomePage> {
                     ),
                     const SizedBox(width: 10),
                     Expanded(
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            latest?.title ?? '等待手机发送目的地',
-                            style: const TextStyle(
-                              color: YarisCarTheme.ink,
-                              fontSize: 15,
-                              fontWeight: FontWeight.w700,
-                            ),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
+                      child: Align(
+                        alignment: Alignment.centerLeft,
+                        child: Text(
+                          latest?.title ?? '等待手机发送目的地',
+                          style: const TextStyle(
+                            color: YarisCarTheme.ink,
+                            fontSize: 15,
+                            fontWeight: FontWeight.w700,
                           ),
-                          const SizedBox(height: 2),
-                          Text(
-                            latest != null
-                                ? '来自 iPhone · 已收到目的地'
-                                : (isRunning ? '在 iPhone 选好地点发送即可自动唤起' : '请在设置中开启接收手机导航'),
-                            style: const TextStyle(color: YarisCarTheme.muted, fontSize: 11.5),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ],
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
                       ),
                     ),
                   ],
@@ -502,15 +490,15 @@ class _CarHomePageState extends State<CarHomePage> {
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
                             ),
-                            const SizedBox(height: 4),
-                            Text(
-                              hasTrack && track.artist.isNotEmpty
-                                  ? '${track.artist} · 网易云音乐'
-                                  : '默认播放完整喜欢歌单',
-                              style: const TextStyle(color: YarisCarTheme.muted, fontSize: 12.5),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                            ),
+                            if (hasTrack && track.artist.isNotEmpty) ...[
+                              const SizedBox(height: 4),
+                              Text(
+                                track.artist,
+                                style: const TextStyle(color: YarisCarTheme.muted, fontSize: 12.5),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ],
                           ],
                         ),
                       ),
