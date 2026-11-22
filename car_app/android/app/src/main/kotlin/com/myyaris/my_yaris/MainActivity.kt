@@ -84,7 +84,57 @@ class MainActivity : AudioServiceActivity() {
         setupSystemUiChannel(flutterEngine)
         setupLocationChannel(flutterEngine)
         setupStorageChannel(flutterEngine)
+        setupUpdaterChannel(flutterEngine)
         ObdReportExporter.register(this, flutterEngine)
+    }
+
+    private fun setupUpdaterChannel(flutterEngine: FlutterEngine) {
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.myyaris.my_yaris/updater").setMethodCallHandler { call, result ->
+            when (call.method) {
+                "getUpdateCacheDir" -> {
+                    try {
+                        val dir = java.io.File(cacheDir, "updates")
+                        if (!dir.exists()) dir.mkdirs()
+                        result.success(dir.absolutePath)
+                    } catch (e: Exception) {
+                        result.error("DIR_ERROR", e.localizedMessage, null)
+                    }
+                }
+                "installApk" -> {
+                    val apkPath = call.argument<String>("path")
+                    if (apkPath.isNullOrBlank()) {
+                        result.error("INVALID_PATH", "APK path is required", null)
+                        return@setMethodCallHandler
+                    }
+                    try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !packageManager.canRequestPackageInstalls()) {
+                            val permIntent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).apply {
+                                data = Uri.parse("package:$packageName")
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            }
+                            startActivity(permIntent)
+                            result.success("PERMISSION_REQUIRED")
+                            return@setMethodCallHandler
+                        }
+                        val file = java.io.File(apkPath)
+                        val uri = androidx.core.content.FileProvider.getUriForFile(
+                            this,
+                            "$packageName.obd_reports",
+                            file
+                        )
+                        val intent = Intent(Intent.ACTION_VIEW).apply {
+                            setDataAndType(uri, "application/vnd.android.package-archive")
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        startActivity(intent)
+                        result.success("STARTED")
+                    } catch (e: Exception) {
+                        result.error("INSTALL_ERROR", e.localizedMessage ?: "Failed to launch installer", null)
+                    }
+                }
+                else -> result.notImplemented()
+            }
+        }
     }
 
     private fun setupStorageChannel(flutterEngine: FlutterEngine) {

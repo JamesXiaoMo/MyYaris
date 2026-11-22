@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import '../models/obd_telemetry.dart';
+import '../services/app_update_service.dart';
 import '../services/backend_client.dart';
 import '../services/car_music_sync_service.dart';
 import '../services/car_obd_service.dart';
@@ -134,6 +135,156 @@ class _CarSettingsTabState extends State<CarSettingsTab> {
     );
     if (confirmed != true || !mounted) return;
     await MusicCacheService().clearAllCache();
+  }
+
+  Future<void> _checkForGithubUpdate() async {
+    final updater = AppUpdateService();
+    AppUpdateInfo? info;
+    String? error;
+    bool checking = true;
+    bool downloading = false;
+    double progress = 0;
+
+    bool started = false;
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          if (!started) {
+            started = true;
+            updater.checkForUpdate().then((res) {
+              if (!ctx.mounted) return;
+              setDialogState(() {
+                info = res;
+                checking = false;
+              });
+            }).catchError((Object e) {
+              if (!ctx.mounted) return;
+              setDialogState(() {
+                error = '检查更新失败，请确认车机网络可访问 GitHub';
+                checking = false;
+              });
+            });
+          }
+
+          return AlertDialog(
+            backgroundColor: YarisCarTheme.paper,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+            title: const Text(
+              '检查车机端更新',
+              style: TextStyle(color: YarisCarTheme.ink, fontSize: 17, fontWeight: FontWeight.w700),
+            ),
+            content: SizedBox(
+              width: 400,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (checking)
+                    const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 20),
+                      child: Row(
+                        children: [
+                          SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2.2)),
+                          SizedBox(width: 12),
+                          Text('正在检查 GitHub 最新版本…', style: TextStyle(color: YarisCarTheme.muted)),
+                        ],
+                      ),
+                    )
+                  else if (error != null)
+                    Text(error!, style: const TextStyle(color: YarisCarTheme.red, fontSize: 13.5))
+                  else if (info != null && !info!.hasUpdate)
+                    Text(
+                      '当前已是最新版本（v${info!.currentVersion}）',
+                      style: const TextStyle(color: YarisCarTheme.ink, fontSize: 14),
+                    )
+                  else if (info != null) ...[
+                    Text(
+                      '发现新版本：v${info!.latestVersion}（当前 v${info!.currentVersion}）',
+                      style: const TextStyle(
+                        color: YarisCarTheme.ink,
+                        fontSize: 14.5,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    if (info!.releaseNotes.isNotEmpty) ...[
+                      const SizedBox(height: 8),
+                      ConstrainedBox(
+                        constraints: const BoxConstraints(maxHeight: 120),
+                        child: SingleChildScrollView(
+                          child: Text(
+                            info!.releaseNotes,
+                            style: const TextStyle(color: YarisCarTheme.muted, fontSize: 12.5),
+                          ),
+                        ),
+                      ),
+                    ],
+                    if (downloading) ...[
+                      const SizedBox(height: 12),
+                      LinearProgressIndicator(
+                        value: progress > 0 ? progress : null,
+                        backgroundColor: YarisCarTheme.neutral,
+                        color: YarisCarTheme.blue,
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        '正在下载安装包 ${(progress * 100).toStringAsFixed(0)}%',
+                        style: const TextStyle(color: YarisCarTheme.muted, fontSize: 12),
+                      ),
+                    ],
+                  ],
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: downloading ? null : () => Navigator.pop(ctx),
+                child: const Text('关闭'),
+              ),
+              if (!checking && info != null && info!.hasUpdate && info!.apkUrl != null)
+                FilledButton(
+                  style: FilledButton.styleFrom(
+                    backgroundColor: YarisCarTheme.blue,
+                    foregroundColor: Colors.white,
+                  ),
+                  onPressed: downloading
+                      ? null
+                      : () async {
+                          setDialogState(() {
+                            downloading = true;
+                            progress = 0;
+                            error = null;
+                          });
+                          try {
+                            final status = await updater.downloadAndInstall(
+                              apkUrl: info!.apkUrl!,
+                              onProgress: (p) {
+                                if (ctx.mounted) setDialogState(() => progress = p);
+                              },
+                            );
+                            if (ctx.mounted) Navigator.pop(ctx);
+                            if (mounted && status == 'PERMISSION_REQUIRED') {
+                              ScaffoldMessenger.of(this.context).showSnackBar(
+                                const SnackBar(content: Text('请先开启「允许安装未知应用」，返回后再次点击安装')),
+                              );
+                            }
+                          } catch (_) {
+                            if (ctx.mounted) {
+                              setDialogState(() {
+                                downloading = false;
+                                error = '下载或拉起安装失败，请稍后重试';
+                              });
+                            }
+                          }
+                        },
+                  child: Text(downloading ? '下载中…' : '下载并安装'),
+                ),
+            ],
+          );
+        },
+      ),
+    );
   }
 
   String _formatCacheBytes(int bytes) {
@@ -656,12 +807,11 @@ class _CarSettingsTabState extends State<CarSettingsTab> {
                           Container(
                             decoration: YarisCarTheme.cardDecoration(),
                             child: _SettingsActionRow(
-                              icon: Icons.info_outline_rounded,
-                              title: '关于 MyYaris 车机端',
-                              trailingText: 'v1.0.0',
-                              trailingColor: YarisCarTheme.muted,
-                              showChevron: false,
-                              onTap: () {},
+                              icon: Icons.system_update_rounded,
+                              title: '检查 GitHub 更新',
+                              trailingText: 'v${AppUpdateService.currentVersion}',
+                              trailingColor: YarisCarTheme.blue,
+                              onTap: _checkForGithubUpdate,
                             ),
                           ),
                         ],
@@ -683,7 +833,6 @@ class _SettingsActionRow extends StatelessWidget {
   final String title;
   final String trailingText;
   final Color trailingColor;
-  final bool showChevron;
   final VoidCallback onTap;
 
   const _SettingsActionRow({
@@ -692,7 +841,6 @@ class _SettingsActionRow extends StatelessWidget {
     required this.trailingText,
     required this.trailingColor,
     required this.onTap,
-    this.showChevron = true,
   });
 
   @override
@@ -724,10 +872,8 @@ class _SettingsActionRow extends StatelessWidget {
                 fontWeight: FontWeight.w600,
               ),
             ),
-            if (showChevron) ...[
-              const SizedBox(width: 4),
-              const Icon(Icons.chevron_right_rounded, size: 18, color: YarisCarTheme.muted),
-            ],
+            const SizedBox(width: 4),
+            const Icon(Icons.chevron_right_rounded, size: 18, color: YarisCarTheme.muted),
           ],
         ),
       ),
