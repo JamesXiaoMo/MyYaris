@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:audio_session/audio_session.dart';
 import 'package:flutter/foundation.dart';
 import 'package:just_audio/just_audio.dart';
@@ -40,6 +41,12 @@ class BuiltInPlayerService {
   bool get isInitialized => _isInitialized;
 
   static const String _savedVolumeKey = 'myyaris_saved_music_volume';
+  static const String _savedLastTrackKey = 'myyaris_saved_last_track_v1';
+
+  NeteaseQueueTrackItem? _savedLastTrack;
+  NeteaseQueueTrackItem? get savedLastTrack => _savedLastTrack;
+  int _savedLastPositionMs = 0;
+  int get savedLastPositionMs => _savedLastPositionMs;
 
   // Safe initial low volume to prevent blasting car speakers
   double _currentVolume = 0.25;
@@ -182,6 +189,27 @@ class BuiltInPlayerService {
         if (saved != null && saved >= 0.05 && saved <= 1.0) {
           _currentVolume = saved;
         }
+        final rawLast = prefs.getString(_savedLastTrackKey);
+        if (rawLast != null && rawLast.isNotEmpty) {
+          final decoded = jsonDecode(rawLast);
+          if (decoded is Map<String, dynamic>) {
+            final item = NeteaseQueueTrackItem.fromJson(decoded);
+            if (item.songId > 0 && item.title.isNotEmpty) {
+              _savedLastTrack = item;
+              _savedLastPositionMs = (decoded['position_ms'] as num?)?.toInt() ?? 0;
+              _activeRemoteTrack ??= LocalTrackItem(
+                id: item.trackId,
+                title: item.title,
+                artist: item.artist,
+                assetPath: item.streamUrl,
+                isLocal: false,
+                durationDesc: '${item.durationMs ~/ 1000}秒',
+                tag: item.album ?? '网络歌单',
+              );
+              activeRemoteTrackNotifier.value = _activeRemoteTrack;
+            }
+          }
+        }
       } catch (_) {}
 
       await _player.setVolume(_currentVolume);
@@ -304,6 +332,9 @@ class BuiltInPlayerService {
         tag: playedFromCache ? 'SD 离线' : (track.album ?? '网络歌单'),
       );
       activeRemoteTrackNotifier.value = _activeRemoteTrack;
+      _savedLastTrack = track;
+      _savedLastPositionMs = (initialPosition ?? Duration.zero).inMilliseconds;
+      unawaited(_persistLastTrack(track, _savedLastPositionMs));
 
       if (startPlaying) {
         unawaited(_player.play().catchError((Object _) {}));
@@ -325,9 +356,37 @@ class BuiltInPlayerService {
     } finally { _loadingSource = false; }
   }
 
+  Future<void> _persistLastTrack(NeteaseQueueTrackItem track, int positionMs) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+        _savedLastTrackKey,
+        jsonEncode({
+          'song_id': track.songId,
+          'track_id': track.trackId,
+          'title': track.title,
+          'artist': track.artist,
+          'album': track.album,
+          'duration_ms': track.durationMs,
+          'stream_url': track.streamUrl,
+          'playable': track.playable,
+          'position_ms': positionMs < 0 ? 0 : positionMs,
+        }),
+      );
+    } catch (_) {}
+  }
+
   Future<void> play() async {
     if (!_isInitialized) await init();
     if (_activeRemoteTrack == null) throw StateError('请显式选择默认喜欢歌单播放');
+    if (_player.audioSource == null && _savedLastTrack != null) {
+      await playQueueTrack(
+        _savedLastTrack!,
+        initialPosition: Duration(milliseconds: _savedLastPositionMs),
+        startPlaying: true,
+      );
+      return;
+    }
     _stopped = false;
     unawaited(_player.play().catchError((Object _) {}));
   }
@@ -335,6 +394,10 @@ class BuiltInPlayerService {
   Future<void> pause() async {
     _resumeAfterInterruption = false;
     await _player.pause();
+    if (_savedLastTrack != null) {
+      _savedLastPositionMs = _player.position.inMilliseconds;
+      unawaited(_persistLastTrack(_savedLastTrack!, _savedLastPositionMs));
+    }
   }
 
   Future<void> stop() async {
