@@ -323,12 +323,21 @@ class MainActivity : AudioServiceActivity() {
                         }
                         val cacheDir = java.io.File(chosen, "music_cache")
                         if (!cacheDir.exists()) cacheDir.mkdirs()
+                        val allPaths = mutableListOf<String>()
+                        allPaths.add(cacheDir.absolutePath)
+                        for (d in dirs) {
+                            val alt = java.io.File(d, "music_cache").absolutePath
+                            if (!allPaths.contains(alt) && java.io.File(alt).exists()) {
+                                allPaths.add(alt)
+                            }
+                        }
                         val stat = StatFs(cacheDir.absolutePath)
                         val freeBytes = stat.availableBytes
                         result.success(mapOf(
                             "path" to cacheDir.absolutePath,
                             "isSdCard" to isSd,
-                            "freeBytes" to freeBytes
+                            "freeBytes" to freeBytes,
+                            "allPaths" to allPaths
                         ))
                     } catch (e: Exception) {
                         result.error("STORAGE_ERROR", e.localizedMessage ?: "Cannot resolve cache dir", null)

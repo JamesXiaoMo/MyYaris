@@ -53,9 +53,11 @@ class MusicCacheService {
       ValueNotifier(const BatchCacheProgress());
 
   Directory? _cacheDir;
+  final List<Directory> _allCacheDirs = [];
   bool _isSdCard = false;
   int _freeBytes = 0;
   bool _initialized = false;
+  bool _hasOverrideDir = false;
 
   // Guard concurrent downloads of the same song
   final Set<int> _inFlightSongs = {};
@@ -69,14 +71,18 @@ class MusicCacheService {
 
   Future<void> init({Directory? overrideDir}) async {
     if (overrideDir != null) {
+      _hasOverrideDir = true;
       _cacheDir = overrideDir;
+      _allCacheDirs
+        ..clear()
+        ..add(overrideDir);
       if (!await _cacheDir!.exists()) await _cacheDir!.create(recursive: true);
       _isSdCard = true;
       _initialized = true;
       await refreshStats();
       return;
     }
-    if (_initialized && _cacheDir != null) return;
+    if (_initialized && _cacheDir != null && _isSdCard) return;
 
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -85,6 +91,16 @@ class MusicCacheService {
           prefs.getInt(_prefBatchSpeedLimitKey) ?? 0;
     } catch (_) {}
 
+    await refreshStorageLocation();
+    _initialized = true;
+    await _cleanupOrphanedTmpFiles();
+    await refreshStats();
+  }
+
+  /// Re-queries Android storage so if the removable SD card mounted after app boot,
+  /// caching immediately switches to the SD card instead of duplicating into internal storage.
+  Future<void> refreshStorageLocation() async {
+    if (_hasOverrideDir) return;
     try {
       final info = await _storageChannel.invokeMapMethod<String, dynamic>(
         'getMusicCacheDir',
@@ -97,14 +113,21 @@ class MusicCacheService {
         }
         _isSdCard = info?['isSdCard'] == true;
         _freeBytes = (info?['freeBytes'] as num?)?.toInt() ?? 0;
+        _allCacheDirs.clear();
+        _allCacheDirs.add(_cacheDir!);
+        final rawAll = info?['allPaths'];
+        if (rawAll is List) {
+          for (final p in rawAll) {
+            final s = p?.toString() ?? '';
+            if (s.isNotEmpty && s != _cacheDir!.path) {
+              _allCacheDirs.add(Directory(s));
+            }
+          }
+        }
       }
     } catch (e) {
       debugPrint('[MusicCache] Native storage channel unavailable: $e');
     }
-
-    _initialized = true;
-    await _cleanupOrphanedTmpFiles();
-    await refreshStats();
   }
 
   Future<void> _cleanupOrphanedTmpFiles() async {
@@ -147,15 +170,20 @@ class MusicCacheService {
     return File('${_cacheDir!.path}/song_$songId.audio');
   }
 
-  /// Returns a validated local audio file if cached on SD card / storage.
+  /// Returns a validated local audio file if cached in the active SD card or fallback cache dir.
   File? getCachedFile(int songId) {
-    final file = _fileForSong(songId);
-    if (file == null) return null;
-    try {
-      if (file.existsSync() && file.lengthSync() >= minValidAudioBytes) {
-        return file;
-      }
-    } catch (_) {}
+    if (songId <= 0) return null;
+    final dirs = _allCacheDirs.isNotEmpty
+        ? _allCacheDirs
+        : (_cacheDir != null ? [_cacheDir!] : const <Directory>[]);
+    for (final dir in dirs) {
+      final file = File('${dir.path}/song_$songId.audio');
+      try {
+        if (file.existsSync() && file.lengthSync() >= minValidAudioBytes) {
+          return file;
+        }
+      } catch (_) {}
+    }
     return null;
   }
 
@@ -365,7 +393,13 @@ class MusicCacheService {
     BackendClient? overrideClient,
   }) async {
     if (batchProgressNotifier.value.state == BatchCacheState.running) return;
-    if (!_initialized) await init();
+    if (!_initialized) {
+      await init();
+    } else if (!_isSdCard && !_hasOverrideDir) {
+      // Re-check if removable SD card has finished mounting since app boot
+      await refreshStorageLocation();
+      await refreshStats();
+    }
     if (_cacheDir == null) {
       batchProgressNotifier.value = const BatchCacheProgress(
         state: BatchCacheState.error,
@@ -424,7 +458,16 @@ class MusicCacheService {
         tracks = snap.tracks;
       }
 
-      final total = tracks.length;
+      // Deduplicate by songId so no track can ever be queued twice in one batch
+      final dedupedTracks = <NeteaseQueueTrackItem>[];
+      final seenSongIds = <int>{};
+      for (final item in tracks) {
+        if (item.songId > 0 && seenSongIds.add(item.songId)) {
+          dedupedTracks.add(item);
+        }
+      }
+
+      final total = dedupedTracks.length;
       int done = 0;
       int skipped = 0;
       int failed = 0;
@@ -454,7 +497,7 @@ class MusicCacheService {
           return;
         }
 
-        final t = tracks[i];
+        final t = dedupedTracks[i];
         if (getCachedFile(t.songId) != null) {
           done++;
           skipped++;
