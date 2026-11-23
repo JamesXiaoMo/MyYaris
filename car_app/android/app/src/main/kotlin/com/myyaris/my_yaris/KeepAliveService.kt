@@ -30,7 +30,7 @@ class KeepAliveService : Service() {
         const val CHANNEL_ID = "myyaris_keepalive_channel"
         const val NOTIFICATION_ID = 1001
         private const val BUFFER_FILE_NAME = "native_trip_points.jsonl"
-        private const val MAX_BUFFERED_LINES = 2000
+        private const val MAX_BUFFERED_LINES = 6000
 
         private val bufferLock = Any()
 
@@ -97,7 +97,8 @@ class KeepAliveService : Service() {
     private var locationManager: LocationManager? = null
     private var locationListener: LocationListener? = null
     private var samplerExecutor: ScheduledExecutorService? = null
-    private var lastSampledTimeMs: Long = 0L
+    private var lastRecordedWallMs: Long = 0L
+    private var lastRecordedLocation: Location? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -182,7 +183,7 @@ class KeepAliveService : Service() {
             locationListener = listener
             try {
                 if (lm.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
-                    lm.requestLocationUpdates(LocationManager.GPS_PROVIDER, 5000L, 0f, listener, Looper.getMainLooper())
+                    lm.requestLocationUpdates(LocationManager.GPS_PROVIDER, 1500L, 0f, listener, Looper.getMainLooper())
                 }
             } catch (_: Exception) {}
             try {
@@ -195,11 +196,12 @@ class KeepAliveService : Service() {
         if (samplerExecutor == null) {
             val exec = Executors.newSingleThreadScheduledExecutor()
             samplerExecutor = exec
+            // Adaptive native sampler: 2s when moving (speed >= 1 km/h or moved >= 3m), 30s when stationary
             exec.scheduleAtFixedRate({
                 try {
                     recordCurrentSample(lm)
                 } catch (_: Exception) {}
-            }, 2L, 10L, TimeUnit.SECONDS)
+            }, 2L, 2L, TimeUnit.SECONDS)
         }
     }
 
@@ -219,14 +221,23 @@ class KeepAliveService : Service() {
 
         if (loc.latitude == 0.0 && loc.longitude == 0.0) return
         val nowMs = System.currentTimeMillis()
-        // Use actual sample time, avoiding stale cached points older than 60s
-        if (nowMs - loc.time > 60_000L && lastSampledTimeMs == loc.time) return
-        lastSampledTimeMs = loc.time
+        val prevLoc = lastRecordedLocation
+        val elapsedMs = nowMs - lastRecordedWallMs
+        val speedKmh = if (loc.hasSpeed()) (loc.speed * 3.6).toDouble() else null
+        val movedMeters = if (prevLoc != null) loc.distanceTo(prevLoc).toDouble() else 999.0
+        val isMoving = (speedKmh != null && speedKmh >= 1.0) || movedMeters >= 3.0
+
+        // While stationary, throttle recording to every 30s to avoid redundant points
+        if (!isMoving && prevLoc != null && elapsedMs < 30_000L) return
+        if (elapsedMs < 1_800L) return
+
+        lastRecordedWallMs = nowMs
+        lastRecordedLocation = loc
 
         val obj = JSONObject().apply {
             put("latitude", loc.latitude)
             put("longitude", loc.longitude)
-            put("speed_kmh", if (loc.hasSpeed()) (loc.speed * 3.6).toDouble() else JSONObject.NULL)
+            put("speed_kmh", speedKmh ?: JSONObject.NULL)
             put("accuracy_m", if (loc.hasAccuracy()) loc.accuracy.toDouble() else JSONObject.NULL)
             put("timestamp_ms", nowMs)
             put("provider", loc.provider ?: "gps")
@@ -236,7 +247,7 @@ class KeepAliveService : Service() {
             val file = File(filesDir, BUFFER_FILE_NAME)
             try {
                 file.appendText(obj.toString() + "\n")
-                if (file.length() > 320_000L) {
+                if (file.length() > 960_000L) {
                     val lines = file.readLines().filter { it.isNotBlank() }
                     if (lines.size > MAX_BUFFERED_LINES) {
                         val trimmed = lines.subList(lines.size - MAX_BUFFERED_LINES, lines.size)
