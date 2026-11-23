@@ -38,9 +38,14 @@ class MusicCacheService {
   static const MethodChannel _storageChannel =
       MethodChannel('com.myyaris.my_yaris/storage');
   static const String _prefCacheOnPlayKey = 'myyaris_music_cache_on_play';
+  static const String _prefBatchSpeedLimitKey = 'myyaris_music_batch_speed_limit_kbps';
   static const int minValidAudioBytes = 8192;
 
+  /// Supported Wi-Fi batch cache speed limit presets (KB/s; 0 = unlimited).
+  static const List<int> speedLimitPresetsKBps = [0, 512, 1024, 2048, 5120];
+
   final ValueNotifier<bool> cacheOnPlayNotifier = ValueNotifier(true);
+  final ValueNotifier<int> batchSpeedLimitKBpsNotifier = ValueNotifier(0);
   final ValueNotifier<int> cachedCountNotifier = ValueNotifier(0);
   final ValueNotifier<int> cachedBytesNotifier = ValueNotifier(0);
   final ValueNotifier<String> storageSummaryNotifier = ValueNotifier('正在检测存储…');
@@ -76,6 +81,8 @@ class MusicCacheService {
     try {
       final prefs = await SharedPreferences.getInstance();
       cacheOnPlayNotifier.value = prefs.getBool(_prefCacheOnPlayKey) ?? true;
+      batchSpeedLimitKBpsNotifier.value =
+          prefs.getInt(_prefBatchSpeedLimitKey) ?? 0;
     } catch (_) {}
 
     try {
@@ -105,6 +112,21 @@ class MusicCacheService {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool(_prefCacheOnPlayKey, enabled);
     } catch (_) {}
+  }
+
+  Future<void> setBatchSpeedLimitKBps(int kbps) async {
+    final safe = kbps < 0 ? 0 : kbps;
+    batchSpeedLimitKBpsNotifier.value = safe;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt(_prefBatchSpeedLimitKey, safe);
+    } catch (_) {}
+  }
+
+  static String formatSpeedLimitLabel(int kbps) {
+    if (kbps <= 0) return '不限速';
+    if (kbps >= 1024 && kbps % 1024 == 0) return '${kbps ~/ 1024} MB/s';
+    return '$kbps KB/s';
   }
 
   File? _fileForSong(int songId) {
@@ -195,12 +217,16 @@ class MusicCacheService {
   }
 
   /// Downloads one track atomically to `.tmp` then renames to `.audio`.
+  /// Supports optional byte-rate throttling (`maxBytesPerSecond > 0`) and
+  /// mid-file abort when batch caching is paused.
   Future<bool> downloadTrack({
     required int songId,
     required String fullStreamUrl,
     required String token,
     BackendClient? backendClient,
     Map<String, String>? fallbackDns,
+    int maxBytesPerSecond = 0,
+    bool abortOnBatchStop = false,
   }) async {
     if (!_initialized) await init();
     if (_cacheDir == null || songId <= 0) return false;
@@ -237,22 +263,42 @@ class MusicCacheService {
       final sink = tmpFile.openWrite();
       final headerBytes = <int>[];
       int totalBytes = 0;
+      final sw = Stopwatch()..start();
+      bool aborted = false;
 
       try {
         await for (final chunk in res) {
+          if (abortOnBatchStop && _batchStopRequested) {
+            aborted = true;
+            break;
+          }
           if (headerBytes.length < 16) {
             final need = 16 - headerBytes.length;
             headerBytes.addAll(chunk.take(need));
           }
           totalBytes += chunk.length;
           sink.add(chunk);
+
+          // Live dynamic speed limit check (respects user changing limit mid-download)
+          final activeLimitBps = abortOnBatchStop
+              ? (batchSpeedLimitKBpsNotifier.value * 1024)
+              : maxBytesPerSecond;
+          if (activeLimitBps > 0) {
+            final expectedMs = (totalBytes * 1000) ~/ activeLimitBps;
+            final deltaMs = expectedMs - sw.elapsedMilliseconds;
+            if (deltaMs > 15) {
+              await Future<void>.delayed(Duration(milliseconds: deltaMs.clamp(15, 2000)));
+            }
+          }
         }
-        await sink.flush();
+        if (!aborted) {
+          await sink.flush();
+        }
       } finally {
         await sink.close();
       }
 
-      if (totalBytes < minValidAudioBytes || !hasValidAudioHeader(headerBytes)) {
+      if (aborted || totalBytes < minValidAudioBytes || !hasValidAudioHeader(headerBytes)) {
         if (await tmpFile.exists()) await tmpFile.delete();
         return false;
       }
@@ -415,13 +461,14 @@ class MusicCacheService {
             ? '$normalizedBase${t.streamUrl}'
             : t.streamUrl;
 
+        final limitLabel = formatSpeedLimitLabel(batchSpeedLimitKBpsNotifier.value);
         batchProgressNotifier.value = BatchCacheProgress(
           state: BatchCacheState.running,
           total: total,
           done: done,
           skipped: skipped,
           failed: failed,
-          message: '正在缓存（${done + 1}/$total）：${t.title}',
+          message: '正在缓存（${done + 1}/$total · $limitLabel）：${t.title}',
         );
 
         final ok = await downloadTrack(
@@ -429,6 +476,8 @@ class MusicCacheService {
           fullStreamUrl: url,
           token: token,
           backendClient: client,
+          maxBytesPerSecond: batchSpeedLimitKBpsNotifier.value * 1024,
+          abortOnBatchStop: true,
         );
         if (ok) {
           done++;

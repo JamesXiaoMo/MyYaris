@@ -623,8 +623,9 @@ class CarMusicSyncService {
 
           if (candidate.tracks.isNotEmpty) {
             final targetTrack = candidate.tracks[targetIdx];
-            if (targetTrack.trackId != prevActiveTrack?.id) {
-              await _playerService.playQueueTrack(targetTrack, startPlaying: wasPlaying, rethrowOnError: true);
+            final shouldPlay = wasPlaying || params['autoplay'] == true;
+            if (targetTrack.trackId != prevActiveTrack?.id || shouldPlay) {
+              await _playerService.playQueueTrack(targetTrack, startPlaying: shouldPlay, rethrowOnError: true);
             }
           }
           queueCtrl.applyQueueSnapshot(candidate, targetIndex: targetIdx,

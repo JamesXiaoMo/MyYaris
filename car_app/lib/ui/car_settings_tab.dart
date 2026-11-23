@@ -811,6 +811,79 @@ class _CarSettingsTabState extends State<CarSettingsTab> {
                                   },
                                 ),
                                 const Divider(height: 1, color: YarisCarTheme.line),
+                                ValueListenableBuilder<int>(
+                                  valueListenable:
+                                      MusicCacheService().batchSpeedLimitKBpsNotifier,
+                                  builder: (context, limitKbps, _) {
+                                    return Padding(
+                                      padding: const EdgeInsets.symmetric(
+                                          horizontal: 16, vertical: 11),
+                                      child: Column(
+                                        crossAxisAlignment: CrossAxisAlignment.start,
+                                        children: [
+                                          Row(
+                                            children: [
+                                              const Icon(Icons.speed_rounded,
+                                                  size: 19, color: YarisCarTheme.blue),
+                                              const SizedBox(width: 12),
+                                              const Text(
+                                                'Wi-Fi 批量缓存限速',
+                                                style: TextStyle(
+                                                  color: YarisCarTheme.ink,
+                                                  fontSize: 13.5,
+                                                  fontWeight: FontWeight.w600,
+                                                ),
+                                              ),
+                                              const Spacer(),
+                                              Text(
+                                                MusicCacheService.formatSpeedLimitLabel(
+                                                    limitKbps),
+                                                style: const TextStyle(
+                                                  color: YarisCarTheme.blue,
+                                                  fontSize: 12,
+                                                  fontWeight: FontWeight.w700,
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                          const SizedBox(height: 8),
+                                          Wrap(
+                                            spacing: 8,
+                                            runSpacing: 6,
+                                            children: [
+                                              for (final preset
+                                                  in MusicCacheService.speedLimitPresetsKBps)
+                                                ChoiceChip(
+                                                  label: Text(
+                                                    MusicCacheService.formatSpeedLimitLabel(
+                                                        preset),
+                                                    style: TextStyle(
+                                                      fontSize: 11.5,
+                                                      fontWeight: FontWeight.w600,
+                                                      color: limitKbps == preset
+                                                          ? Colors.white
+                                                          : YarisCarTheme.ink,
+                                                    ),
+                                                  ),
+                                                  selected: limitKbps == preset,
+                                                  selectedColor: YarisCarTheme.blue,
+                                                  backgroundColor: YarisCarTheme.canvas,
+                                                  side: BorderSide(
+                                                    color: limitKbps == preset
+                                                        ? YarisCarTheme.blue
+                                                        : YarisCarTheme.line,
+                                                  ),
+                                                  onSelected: (_) => MusicCacheService()
+                                                      .setBatchSpeedLimitKBps(preset),
+                                                ),
+                                            ],
+                                          ),
+                                        ],
+                                      ),
+                                    );
+                                  },
+                                ),
+                                const Divider(height: 1, color: YarisCarTheme.line),
                                 _SettingsActionRow(
                                   icon: Icons.delete_sweep_rounded,
                                   title: '清空本地音乐缓存',
