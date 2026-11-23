@@ -103,7 +103,20 @@ class MusicCacheService {
     }
 
     _initialized = true;
+    await _cleanupOrphanedTmpFiles();
     await refreshStats();
+  }
+
+  Future<void> _cleanupOrphanedTmpFiles() async {
+    final dir = _cacheDir;
+    if (dir == null || !await dir.exists()) return;
+    try {
+      await for (final entity in dir.list(followLinks: false)) {
+        if (entity is File && entity.path.endsWith('.tmp')) {
+          await entity.delete();
+        }
+      }
+    } catch (_) {}
   }
 
   Future<void> setCacheOnPlay(bool enabled) async {
@@ -225,6 +238,7 @@ class MusicCacheService {
     required String token,
     BackendClient? backendClient,
     Map<String, String>? fallbackDns,
+    String qualityLevel = 'exhigh',
     int maxBytesPerSecond = 0,
     bool abortOnBatchStop = false,
   }) async {
@@ -246,14 +260,14 @@ class MusicCacheService {
       final parsedUri = Uri.parse(fullStreamUrl);
       if (parsedUri.scheme != 'https' && parsedUri.scheme != 'http') return false;
       final qp = Map<String, String>.from(parsedUri.queryParameters);
-      qp.putIfAbsent('level', () => 'best');
+      qp.putIfAbsent('level', () => qualityLevel);
       final uri = parsedUri.replace(queryParameters: qp);
       final req = await client.httpClient.getUrl(uri);
       if (token.isNotEmpty) {
         req.headers.set('X-Device-Token', token);
         req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
       }
-      final res = await req.close().timeout(const Duration(seconds: 60));
+      final res = await req.close().timeout(const Duration(seconds: 180));
       if (res.statusCode != 200) {
         await res.drain<void>();
         return false;
@@ -320,6 +334,7 @@ class MusicCacheService {
   }
 
   /// Mode A: Background cache-on-play hook (never blocks playback).
+  /// Uses `exhigh` (320kbps) so it reuses the server's cached stream with zero duplicate downloads.
   void cacheInBackgroundIfEnabled({
     required int songId,
     required String fullStreamUrl,
@@ -327,6 +342,7 @@ class MusicCacheService {
     Map<String, String>? fallbackDns,
   }) {
     if (!cacheOnPlayNotifier.value) return;
+    if (batchProgressNotifier.value.state == BatchCacheState.running) return;
     if (getCachedFile(songId) != null) return;
     unawaited(
       downloadTrack(
@@ -334,6 +350,7 @@ class MusicCacheService {
         fullStreamUrl: fullStreamUrl,
         token: token,
         fallbackDns: fallbackDns,
+        qualityLevel: 'exhigh',
       ),
     );
   }
@@ -476,6 +493,7 @@ class MusicCacheService {
           fullStreamUrl: url,
           token: token,
           backendClient: client,
+          qualityLevel: 'lossless',
           maxBytesPerSecond: batchSpeedLimitKBpsNotifier.value * 1024,
           abortOnBatchStop: true,
         );
