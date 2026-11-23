@@ -258,12 +258,19 @@ class MainActivity : AudioServiceActivity() {
 
     private fun refreshBestLastKnownLocation(lm: LocationManager): Location? {
         if (!hasLocationPermission()) return null
-        var best = latestLocation
+        var best = KeepAliveService.latestValidLocation ?: latestLocation
         for (provider in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER)) {
             try {
                 val cand = lm.getLastKnownLocation(provider) ?: continue
-                if (best == null || cand.time > best.time) {
+                if (best == null) {
                     best = cand
+                } else {
+                    val curIsGps = best.provider == LocationManager.GPS_PROVIDER
+                    val candIsGps = cand.provider == LocationManager.GPS_PROVIDER
+                    val delta = cand.time - best.time
+                    if (!(curIsGps && !candIsGps && delta < 20_000L) && (cand.time > best.time || (candIsGps && !curIsGps && delta > -15_000L))) {
+                        best = cand
+                    }
                 }
             } catch (_: Exception) {}
         }
@@ -274,10 +281,16 @@ class MainActivity : AudioServiceActivity() {
     private fun setupLocationChannel(flutterEngine: FlutterEngine) {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, locationChannelName).setMethodCallHandler { call, result ->
             when (call.method) {
-                "startTracking" -> result.success(startNativeLocationTracking())
+                "startTracking" -> {
+                    KeepAliveService.start(this)
+                    result.success(startNativeLocationTracking())
+                }
                 "stopTracking" -> {
                     stopNativeLocationTracking()
                     result.success(true)
+                }
+                "drainBufferedLocations" -> {
+                    result.success(KeepAliveService.drainBufferedPoints(this))
                 }
                 "getLatestLocation" -> {
                     if (!hasLocationPermission()) {

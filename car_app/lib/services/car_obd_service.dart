@@ -425,7 +425,9 @@ class CarObdService {
       ).positive) {
         canBusReady = true;
         canBusReadyNotifier.value = true;
-        log('🎉 车辆 ECU 已成功响应 PID 0100，标准 CAN 总线已联机');
+        enableStandardPolling = true;
+        enableStandardPollingNotifier.value = true;
+        log('🎉 车辆 ECU 已成功响应 PID 0100，已自动开启标准 Mode 01 轮询');
       } else {
         canBusReady = false;
         canBusReadyNotifier.value = false;
@@ -481,9 +483,32 @@ class CarObdService {
         );
       }
 
-      // 仅当车辆 CAN 总线已明确就绪 (PID 0100 有效响应) 且用户显式启用标准轮询时，才读取标准 Mode 01 PID
+      // 若连接时车辆尚未挂 READY，每 ~15s 重试一次标准 0100 握手
+      if (!canBusReady && _pollCycleCount % 6 == 0) {
+        final resp0100 = await sendRawCommand('0100');
+        if (ElmObdParser.classify(
+          ElmReply(
+            resp0100,
+            resp0100.startsWith('TIMEOUT') || resp0100.startsWith('ERROR')
+                ? 'incomplete'
+                : 'prompt',
+          ),
+          '0100',
+        ).positive) {
+          canBusReady = true;
+          canBusReadyNotifier.value = true;
+          enableStandardPolling = true;
+          enableStandardPollingNotifier.value = true;
+          log('🎉 车辆通电就绪，已自动恢复标准 Mode 01 轮询');
+        }
+      }
+
+      // 仅当车辆 CAN 总线已明确就绪 (PID 0100 有效响应) 且启用标准轮询时，读取标准只读 Mode 01 PID
       if (canBusReady && enableStandardPolling) {
         await _queryStandardEngineTier1();
+        if (_pollCycleCount >= 2 && _pollCycleCount % 6 == 2) {
+          await _queryStandardEngineSlowTier();
+        }
       }
 
       // 未经验证的私有 Mode 21/22 指令严格默认完全关闭！绝不在普通连接中自动发送
@@ -596,20 +621,11 @@ class CarObdService {
     return _integratedTripKm;
   }
 
-  // Tier 1: 标准 OBD 010D (车速), 010C (转速), 0105 (水温)
+  // Tier 1: 标准 OBD 高频只读 PID (车速 010D, 转速 010C, 水温 0105)
   Future<void> _queryStandardEngineTier1() async {
-    // 确保使用标准功能寻址
-    // 1. 车速 (010D)
-    final speedResp = await sendRawCommand('010D');
-    final speed = _parseStandardSpeed(speedResp);
-
-    // 2. 转速 (010C)
-    final rpmResp = await sendRawCommand('010C');
-    final rpm = _parseStandardRpm(rpmResp);
-
-    // 3. 水温 (0105)
-    final coolantResp = await sendRawCommand('0105');
-    final coolant = _parseStandardTemp(coolantResp);
+    final speed = _parseStandardSpeed(await sendRawCommand('010D'));
+    final rpm = _parseStandardRpm(await sendRawCommand('010C'));
+    final coolant = _parseStandardTemp(await sendRawCommand('0105'));
 
     final now = DateTime.now();
     final integratedTrip = _recordSpeedForTrip(speed, now);
@@ -623,6 +639,38 @@ class CarObdService {
             ? (t.totalOdometerKm! - _sessionStartOdometerKm!).clamp(0.0, double.infinity)
             : (integratedTrip ?? t.tripDistanceKm),
         lastUpdated: now,
+      ),
+    );
+  }
+
+  // Tier 1B: 标准 OBD 扩展只读 PID (~15s: 节气门 0111, 负荷 0104, 油量 012F, 环境温度 0146, 进气温度 010F, 运行时间 011F, 大气压 0133, 总里程 01A6)
+  Future<void> _queryStandardEngineSlowTier() async {
+    final throttle = _parsePercent(await sendRawCommand('0111'));
+    final load = _parsePercent(await sendRawCommand('0104'));
+    final fuelPct = _parsePercent(await sendRawCommand('012F'));
+    final ambient = _parseStandardTemp(await sendRawCommand('0146'));
+    final intake = _parseStandardTemp(await sendRawCommand('010F'));
+    final runTime = _parseRunTime(await sendRawCommand('011F'));
+    final baro = _parseStandardBaro(await sendRawCommand('0133'));
+    final odo = _parseStandardOdometer(await sendRawCommand('01A6'));
+
+    final fuelLiters = fuelPct != null ? (fuelPct / 100.0) * 36.0 : null;
+    if (odo != null) {
+      _recordOdometerForTrip(odo);
+    }
+
+    _updateTelemetry(
+      (t) => t.copyWith(
+        throttlePosition: throttle ?? t.throttlePosition,
+        engineLoad: load ?? t.engineLoad,
+        fuelLevelPercent: fuelPct ?? t.fuelLevelPercent,
+        fuelLevelLiters: fuelLiters ?? t.fuelLevelLiters,
+        ambientAirTemp: ambient ?? t.ambientAirTemp,
+        intakeAirTemp: intake ?? t.intakeAirTemp,
+        runTimeSeconds: runTime ?? t.runTimeSeconds,
+        barometricPressureKpa: baro ?? t.barometricPressureKpa,
+        totalOdometerKm: odo ?? t.totalOdometerKm,
+        lastUpdated: DateTime.now(),
       ),
     );
   }

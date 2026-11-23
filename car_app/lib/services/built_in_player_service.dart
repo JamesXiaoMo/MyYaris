@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'package:audio_session/audio_session.dart';
 import 'package:flutter/foundation.dart';
 import 'package:just_audio/just_audio.dart';
@@ -335,6 +336,7 @@ class BuiltInPlayerService {
         tag: playedFromCache ? 'SD 离线' : (track.album ?? '网络歌单'),
         coverUrl: track.coverUrl,
       );
+      unawaited(_prefetchNextTrackOnBackend());
       activeRemoteTrackNotifier.value = _activeRemoteTrack;
       _savedLastTrack = track;
       _savedLastPositionMs = (initialPosition ?? Duration.zero).inMilliseconds;
@@ -377,6 +379,24 @@ class BuiltInPlayerService {
           'position_ms': positionMs < 0 ? 0 : positionMs,
         }),
       );
+    } catch (_) {}
+  }
+
+  Future<void> _prefetchNextTrackOnBackend() async {
+    if (_currentBaseUrl.isEmpty || _currentDeviceToken.isEmpty) return;
+    final ctrl = CarMusicQueueController();
+    final tracks = ctrl.tracks;
+    if (tracks.length < 2) return;
+    final nextIdx = (ctrl.currentIndex + 1) % tracks.length;
+    final nextTrack = tracks[nextIdx];
+    if (nextTrack.songId <= 0) return;
+    try {
+      final uri = Uri.parse('$_currentBaseUrl/api/v1/music/netease/prefetch/${nextTrack.songId}');
+      final req = await HttpClient().postUrl(uri).timeout(const Duration(seconds: 4));
+      req.headers.set('Authorization', 'Bearer $_currentDeviceToken');
+      req.headers.set('X-Device-Token', _currentDeviceToken);
+      final res = await req.close().timeout(const Duration(seconds: 4));
+      await res.drain<void>();
     } catch (_) {}
   }
 
