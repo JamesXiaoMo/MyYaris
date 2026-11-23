@@ -30,11 +30,16 @@ enum PlaybackMode {
   }
 }
 
-/// Supported queue source types defined in V2.2.0 contract
+/// Supported queue source types defined in V2.2.0 contract + Guest DJ / AI voice queues
 class QueueSource {
   static const String neteaseFavorite = 'netease_favorite';
   static const String neteaseIntelligence = 'netease_intelligence';
   static const String singleTrack = 'single_track';
+  static const String djQueue = 'dj_queue';
+  static const String aiQueue = 'ai_queue';
+
+  static bool isTemporary(String source) =>
+      source == djQueue || source == aiQueue || source == singleTrack;
 }
 
 /// Single queue track item conforming to Section 3.1 of V2.2.0 contract

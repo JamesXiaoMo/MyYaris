@@ -645,6 +645,10 @@ class CarMusicSyncService {
               targetSource = QueueSource.neteaseFavorite;
             } else if (serverQueueId.startsWith('q_intel_')) {
               targetSource = QueueSource.neteaseIntelligence;
+            } else if (serverQueueId.startsWith('q_dj_')) {
+              targetSource = QueueSource.djQueue;
+            } else if (serverQueueId.startsWith('q_ai_')) {
+              targetSource = QueueSource.aiQueue;
             } else if (serverQueueId.startsWith('q_single_')) {
               targetSource = QueueSource.singleTrack;
             } else {

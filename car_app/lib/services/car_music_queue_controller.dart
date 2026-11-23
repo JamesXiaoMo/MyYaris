@@ -127,13 +127,44 @@ class CarMusicQueueController {
   String? _errorDetail;
   String? get errorDetail => _errorDetail;
 
-  // Memory backup of favorite queue context when temporarily entering single_track
+  // Memory backup of favorite queue context when temporarily entering single_track / dj_queue / ai_queue
   String _previousFavoriteQueueId = '';
   int _previousFavoriteQueueVersion = 0;
   int _previousFavoriteIndex = 0;
   List<NeteaseQueueTrackItem> _previousFavoriteTracks = [];
   int _previousFavoriteTotal = 0;
   bool _previousFavoriteComplete = false;
+  PlaybackMode _previousFavoriteMode = PlaybackMode.listLoop;
+
+  bool get hasSavedFavoriteBackup => _previousFavoriteTracks.isNotEmpty;
+
+  void _backupFavoriteContextIfActive() {
+    if (_queueSource == QueueSource.neteaseFavorite && _tracks.isNotEmpty) {
+      _previousFavoriteQueueId = _queueId;
+      _previousFavoriteQueueVersion = _queueVersion;
+      _previousFavoriteIndex = _currentIndex;
+      _previousFavoriteTracks = List<NeteaseQueueTrackItem>.from(_tracks);
+      _previousFavoriteTotal = _total;
+      _previousFavoriteComplete = _isComplete;
+      _previousFavoriteMode = _appliedMode;
+    }
+  }
+
+  /// Removes an upcoming track from a temporary DJ/AI queue without interrupting playback.
+  bool removeTemporaryTrackAt(int index) {
+    if (!QueueSource.isTemporary(_queueSource)) return false;
+    if (index < 0 || index >= _tracks.length || index == _currentIndex) {
+      return false;
+    }
+    _tracks.removeAt(index);
+    if (index < _currentIndex) {
+      _currentIndex = (_currentIndex - 1).clamp(0, _tracks.length - 1);
+    }
+    _total = _tracks.length;
+    queueVersionNotifier.value = _queueVersion + 1;
+    currentTrackNotifier.value = currentTrack;
+    return true;
+  }
 
   // Intelligence continuation state
   int _intelligenceBatchIndex = 0;
@@ -440,6 +471,10 @@ class CarMusicQueueController {
     int targetIndex = 0,
     PlaybackMode? mode,
   }) {
+    if (QueueSource.isTemporary(snapshot.source)) {
+      _backupFavoriteContextIfActive();
+    }
+
     _tracks.clear();
     _tracks.addAll(snapshot.tracks);
     _queueId = snapshot.queueId;
@@ -692,6 +727,45 @@ class CarMusicQueueController {
         _errorDetail = '心动模式推荐曲目已播完且续批失败';
         debugPrint('[CarMusicQueue] Intelligence queue exhausted. Playback stopped.');
         return null;
+      }
+    }
+
+    // Temporary DJ / AI queues: advance through all requested songs, then seamlessly
+    // auto-return to the saved "My Favorites" main playlist instead of looping forever.
+    if ((_queueSource == QueueSource.djQueue || _queueSource == QueueSource.aiQueue) &&
+        _appliedMode != PlaybackMode.singleLoop) {
+      if (_currentIndex + 1 < _tracks.length) {
+        _currentIndex++;
+        currentTrackNotifier.value = currentTrack;
+        return currentTrack;
+      }
+      if (_previousFavoriteTracks.isNotEmpty) {
+        debugPrint(
+          '[CarMusicQueue] Temporary queue ($_queueSource) finished; auto-resuming saved favorite queue.',
+        );
+        final resumeIdx = (_previousFavoriteIndex + 1) % _previousFavoriteTracks.length;
+        _queueSource = QueueSource.neteaseFavorite;
+        _queueId = _previousFavoriteQueueId;
+        _queueVersion = _previousFavoriteQueueVersion;
+        _queueName = '我喜欢的音乐';
+        _tracks
+          ..clear()
+          ..addAll(_previousFavoriteTracks);
+        _total = _previousFavoriteTotal;
+        _isComplete = _previousFavoriteComplete;
+        _isFullyLoaded = true;
+        _currentIndex = resumeIdx;
+        _appliedMode = _previousFavoriteMode == PlaybackMode.shuffle
+            ? PlaybackMode.shuffle
+            : PlaybackMode.listLoop;
+        _requestedMode = _appliedMode;
+        if (_appliedMode == PlaybackMode.shuffle) {
+          _generateShuffleOrder(seedIndex: _currentIndex);
+        }
+        queueVersionNotifier.value = _queueVersion;
+        appliedModeNotifier.value = _appliedMode;
+        currentTrackNotifier.value = currentTrack;
+        return currentTrack;
       }
     }
 

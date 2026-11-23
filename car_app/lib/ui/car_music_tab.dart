@@ -467,149 +467,273 @@ class _CarMusicTabState extends State<CarMusicTab> {
     );
   }
 
+  Future<void> _returnToFavorites() async {
+    final ctrl = CarMusicQueueController();
+    if (ctrl.hasSavedFavoriteBackup) {
+      ctrl.switchQueue(source: QueueSource.neteaseFavorite);
+      final target = ctrl.currentTrack;
+      if (target != null) {
+        await _playerService.playQueueTrack(target, startPlaying: true);
+      }
+      if (mounted) setState(() {});
+      return;
+    }
+    await CarMusicSyncService().requestLocalCommand('switch_queue', {
+      'source': QueueSource.neteaseFavorite,
+    });
+  }
+
+  ({String label, Color bg, Color fg, IconData icon}) _queueSourceBadge(String source) {
+    switch (source) {
+      case QueueSource.djQueue:
+        return (
+          label: '扫码点歌',
+          bg: YarisCarTheme.periwinkle,
+          fg: YarisCarTheme.blue,
+          icon: Icons.qr_code_2_rounded,
+        );
+      case QueueSource.aiQueue:
+        return (
+          label: 'AI 歌单',
+          bg: const Color(0xFFEDE7F6),
+          fg: const Color(0xFF5E35B1),
+          icon: Icons.auto_awesome_rounded,
+        );
+      case QueueSource.neteaseIntelligence:
+        return (
+          label: '心动模式',
+          bg: YarisCarTheme.rose,
+          fg: YarisCarTheme.red,
+          icon: Icons.favorite_rounded,
+        );
+      case QueueSource.singleTrack:
+        return (
+          label: '单曲插播',
+          bg: YarisCarTheme.neutral,
+          fg: YarisCarTheme.ink,
+          icon: Icons.music_note_rounded,
+        );
+      default:
+        return (
+          label: '我喜欢的音乐',
+          bg: YarisCarTheme.rose,
+          fg: YarisCarTheme.red,
+          icon: Icons.favorite_rounded,
+        );
+    }
+  }
+
   Widget _buildQueueCard() {
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: YarisCarTheme.cardDecoration(),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      child: ValueListenableBuilder(
+        valueListenable: CarMusicQueueController().currentTrackNotifier,
+        builder: (context, _, _) {
+          final ctrl = CarMusicQueueController();
+          final source = ctrl.queueSource;
+          final isTemp = QueueSource.isTemporary(source);
+          final badge = _queueSourceBadge(source);
+          final tracks = _playerService.tracks;
+          final currentIdx = ctrl.currentIndex;
+
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              const Text(
-                '当前播放队列',
-                style: TextStyle(
-                  color: YarisCarTheme.ink,
-                  fontSize: 16,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-              FilledButton.tonalIcon(
-                style: FilledButton.styleFrom(
-                  backgroundColor: YarisCarTheme.periwinkle,
-                  foregroundColor: YarisCarTheme.blue,
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                  minimumSize: const Size(0, 32),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(999),
-                  ),
-                ),
-                onPressed: _openGuestDjQrDialog,
-                icon: const Icon(Icons.qr_code_2_rounded, size: 16),
-                label: const Text(
-                  '扫码点歌',
-                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 10),
-          Expanded(
-            child: ValueListenableBuilder(
-              valueListenable: CarMusicQueueController().currentTrackNotifier,
-              builder: (context, _, _) {
-                final tracks = _playerService.tracks;
-                final currentIdx = CarMusicQueueController().currentIndex;
-                if (tracks.isEmpty) {
-                  return Center(
-                    child: Padding(
-                      padding: const EdgeInsets.all(16),
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: const [
-                          Icon(Icons.queue_music_rounded, size: 36, color: YarisCarTheme.muted),
-                          SizedBox(height: 10),
-                          Text(
-                            '播放队列为空',
-                            style: TextStyle(
-                              color: YarisCarTheme.ink,
-                              fontSize: 14,
-                              fontWeight: FontWeight.w600,
-                            ),
+              Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: badge.bg,
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(badge.icon, size: 13.5, color: badge.fg),
+                        const SizedBox(width: 4),
+                        Text(
+                          badge.label,
+                          style: TextStyle(
+                            color: badge.fg,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w700,
                           ),
-                        ],
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    '${tracks.length} 首',
+                    style: const TextStyle(
+                      color: YarisCarTheme.muted,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const Spacer(),
+                  if (isTemp) ...[
+                    TextButton.icon(
+                      style: TextButton.styleFrom(
+                        foregroundColor: YarisCarTheme.red,
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                        minimumSize: const Size(0, 30),
+                      ),
+                      onPressed: _returnToFavorites,
+                      icon: const Icon(Icons.favorite_rounded, size: 14),
+                      label: const Text(
+                        '回我喜欢',
+                        style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w700),
                       ),
                     ),
-                  );
-                }
-                return ListView.separated(
-                  itemCount: tracks.length,
-                  separatorBuilder: (_, _) => const SizedBox(height: 6),
-                  itemBuilder: (context, i) {
-                    final item = tracks[i];
-                    final selected = i == currentIdx;
-                    return Material(
-                      color: selected ? YarisCarTheme.periwinkle : YarisCarTheme.canvas,
-                      borderRadius: BorderRadius.circular(14),
-                      child: InkWell(
-                        borderRadius: BorderRadius.circular(14),
-                        onTap: () => _playerService.selectTrack(i),
+                    const SizedBox(width: 4),
+                  ],
+                  FilledButton.tonalIcon(
+                    style: FilledButton.styleFrom(
+                      backgroundColor: YarisCarTheme.periwinkle,
+                      foregroundColor: YarisCarTheme.blue,
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                      minimumSize: const Size(0, 32),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(999),
+                      ),
+                    ),
+                    onPressed: _openGuestDjQrDialog,
+                    icon: const Icon(Icons.qr_code_2_rounded, size: 16),
+                    label: const Text(
+                      '扫码点歌',
+                      style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+                    ),
+                  ),
+                ],
+              ),
+              if (isTemp)
+                const Padding(
+                  padding: EdgeInsets.only(top: 6),
+                  child: Text(
+                    '播完当前临时队列后，将自动续播「我喜欢的音乐」',
+                    style: TextStyle(
+                      color: YarisCarTheme.muted,
+                      fontSize: 11,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ),
+              const SizedBox(height: 10),
+              Expanded(
+                child: tracks.isEmpty
+                    ? const Center(
                         child: Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                          child: Row(
+                          padding: EdgeInsets.all(16),
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
                             children: [
-                              SizedBox(
-                                width: 22,
-                                child: Text(
-                                  '${i + 1}',
-                                  style: TextStyle(
-                                    color: selected ? YarisCarTheme.blue : YarisCarTheme.muted,
-                                    fontSize: 12.5,
-                                    fontWeight: FontWeight.w700,
-                                  ),
+                              Icon(Icons.queue_music_rounded, size: 36, color: YarisCarTheme.muted),
+                              SizedBox(height: 10),
+                              Text(
+                                '播放队列为空',
+                                style: TextStyle(
+                                  color: YarisCarTheme.ink,
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.w600,
                                 ),
-                              ),
-                              const SizedBox(width: 6),
-                              YarisMusicArtwork(
-                                size: 36,
-                                borderRadius: 9,
-                                coverUrl: item.coverUrl,
-                              ),
-                              const SizedBox(width: 10),
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      item.title,
-                                      style: TextStyle(
-                                        color: selected ? YarisCarTheme.blue : YarisCarTheme.ink,
-                                        fontSize: 13.5,
-                                        fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
-                                      ),
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                    ),
-                                    if (item.artist.isNotEmpty)
-                                      Text(
-                                        item.artist,
-                                        style: const TextStyle(
-                                          color: YarisCarTheme.muted,
-                                          fontSize: 11,
-                                        ),
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                      ),
-                                  ],
-                                ),
-                              ),
-                              Icon(
-                                selected ? Icons.equalizer_rounded : Icons.play_arrow_rounded,
-                                size: 18,
-                                color: selected ? YarisCarTheme.blue : YarisCarTheme.muted,
                               ),
                             ],
                           ),
                         ),
+                      )
+                    : ListView.separated(
+                        itemCount: tracks.length,
+                        separatorBuilder: (_, _) => const SizedBox(height: 6),
+                        itemBuilder: (context, i) {
+                          final item = tracks[i];
+                          final selected = i == currentIdx;
+                          return Material(
+                            color: selected ? YarisCarTheme.periwinkle : YarisCarTheme.canvas,
+                            borderRadius: BorderRadius.circular(14),
+                            child: InkWell(
+                              borderRadius: BorderRadius.circular(14),
+                              onTap: () => _playerService.selectTrack(i),
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                                child: Row(
+                                  children: [
+                                    SizedBox(
+                                      width: 22,
+                                      child: Text(
+                                        '${i + 1}',
+                                        style: TextStyle(
+                                          color: selected ? YarisCarTheme.blue : YarisCarTheme.muted,
+                                          fontSize: 12.5,
+                                          fontWeight: FontWeight.w700,
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 6),
+                                    YarisMusicArtwork(
+                                      size: 36,
+                                      borderRadius: 9,
+                                      coverUrl: item.coverUrl,
+                                    ),
+                                    const SizedBox(width: 10),
+                                    Expanded(
+                                      child: Column(
+                                        crossAxisAlignment: CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            item.title,
+                                            style: TextStyle(
+                                              color: selected ? YarisCarTheme.blue : YarisCarTheme.ink,
+                                              fontSize: 13.5,
+                                              fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                                            ),
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                          ),
+                                          if (item.artist.isNotEmpty)
+                                            Text(
+                                              item.artist,
+                                              style: const TextStyle(
+                                                color: YarisCarTheme.muted,
+                                                fontSize: 11,
+                                              ),
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                            ),
+                                        ],
+                                      ),
+                                    ),
+                                    if (isTemp && !selected)
+                                      IconButton(
+                                        icon: const Icon(Icons.close_rounded, size: 16, color: YarisCarTheme.muted),
+                                        padding: EdgeInsets.zero,
+                                        constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                                        tooltip: '从临时队列移除',
+                                        onPressed: () {
+                                          if (ctrl.removeTemporaryTrackAt(i) && mounted) {
+                                            setState(() {});
+                                          }
+                                        },
+                                      )
+                                    else
+                                      Icon(
+                                        selected ? Icons.equalizer_rounded : Icons.play_arrow_rounded,
+                                        size: 18,
+                                        color: selected ? YarisCarTheme.blue : YarisCarTheme.muted,
+                                      ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          );
+                        },
                       ),
-                    );
-                  },
-                );
-              },
-            ),
-          ),
-        ],
+              ),
+            ],
+          );
+        },
       ),
     );
   }
