@@ -85,7 +85,154 @@ class MainActivity : AudioServiceActivity() {
         setupLocationChannel(flutterEngine)
         setupStorageChannel(flutterEngine)
         setupUpdaterChannel(flutterEngine)
+        setupVoiceChannel(flutterEngine)
         ObdReportExporter.register(this, flutterEngine)
+    }
+
+    @Volatile
+    private var voiceRecordingActive = false
+    private var voiceAudioRecord: android.media.AudioRecord? = null
+    private var voicePcmBuffer: java.io.ByteArrayOutputStream? = null
+    private var voiceRecordThread: Thread? = null
+
+    private fun setupVoiceChannel(flutterEngine: FlutterEngine) {
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.myyaris.my_yaris/voice").setMethodCallHandler { call, result ->
+            when (call.method) {
+                "startRecording" -> {
+                    val granted = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+                    if (!granted) {
+                        androidx.core.app.ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 4102)
+                        result.success("PERMISSION_REQUESTED")
+                        return@setMethodCallHandler
+                    }
+                    try {
+                        stopVoiceRecorderInternal()
+                        val sampleRate = 16000
+                        val channelConfig = android.media.AudioFormat.CHANNEL_IN_MONO
+                        val audioFormat = android.media.AudioFormat.ENCODING_PCM_16BIT
+                        val minBuf = android.media.AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
+                        val bufSize = maxOf(minBuf * 2, 8192)
+                        var rec = android.media.AudioRecord(
+                            android.media.MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                            sampleRate,
+                            channelConfig,
+                            audioFormat,
+                            bufSize
+                        )
+                        if (rec.state != android.media.AudioRecord.STATE_INITIALIZED) {
+                            rec.release()
+                            rec = android.media.AudioRecord(
+                                android.media.MediaRecorder.AudioSource.MIC,
+                                sampleRate,
+                                channelConfig,
+                                audioFormat,
+                                bufSize
+                            )
+                        }
+                        if (rec.state != android.media.AudioRecord.STATE_INITIALIZED) {
+                            rec.release()
+                            result.error("RECORDER_INIT_FAILED", "无法初始化车机麦克风", null)
+                            return@setMethodCallHandler
+                        }
+                        val out = java.io.ByteArrayOutputStream()
+                        voiceAudioRecord = rec
+                        voicePcmBuffer = out
+                        voiceRecordingActive = true
+                        rec.startRecording()
+                        voiceRecordThread = Thread {
+                            val chunk = ByteArray(4096)
+                            val maxBytes = sampleRate * 2 * 12 // 12s safety cap
+                            while (voiceRecordingActive && out.size() < maxBytes) {
+                                val read = rec.read(chunk, 0, chunk.size)
+                                if (read > 0) {
+                                    synchronized(out) {
+                                        out.write(chunk, 0, read)
+                                    }
+                                }
+                            }
+                        }.apply { start() }
+                        result.success("STARTED")
+                    } catch (e: Exception) {
+                        stopVoiceRecorderInternal()
+                        result.error("RECORDER_ERROR", e.localizedMessage ?: "录音启动失败", null)
+                    }
+                }
+                "stopRecording" -> {
+                    try {
+                        val pcmBytes = stopVoiceRecorderInternal()
+                        if (pcmBytes.size < 1600) {
+                            result.success("")
+                            return@setMethodCallHandler
+                        }
+                        val wavFile = java.io.File(cacheDir, "ai_voice_input.wav")
+                        writePcm16MonoWav(wavFile, pcmBytes, 16000)
+                        result.success(wavFile.absolutePath)
+                    } catch (e: Exception) {
+                        result.error("STOP_ERROR", e.localizedMessage ?: "录音保存失败", null)
+                    }
+                }
+                "cancelRecording" -> {
+                    stopVoiceRecorderInternal()
+                    result.success(true)
+                }
+                else -> result.notImplemented()
+            }
+        }
+    }
+
+    private fun stopVoiceRecorderInternal(): ByteArray {
+        voiceRecordingActive = false
+        try {
+            voiceAudioRecord?.stop()
+        } catch (_: Exception) {}
+        try {
+            voiceRecordThread?.join(500)
+        } catch (_: Exception) {}
+        try {
+            voiceAudioRecord?.release()
+        } catch (_: Exception) {}
+        voiceAudioRecord = null
+        voiceRecordThread = null
+        val bytes = voicePcmBuffer?.let { buf ->
+            synchronized(buf) { buf.toByteArray() }
+        } ?: ByteArray(0)
+        voicePcmBuffer = null
+        return bytes
+    }
+
+    private fun writePcm16MonoWav(file: java.io.File, pcmData: ByteArray, sampleRate: Int) {
+        val totalDataLen = pcmData.size + 36
+        val byteRate = sampleRate * 2
+        val header = ByteArray(44)
+        header[0] = 'R'.code.toByte(); header[1] = 'I'.code.toByte(); header[2] = 'F'.code.toByte(); header[3] = 'F'.code.toByte()
+        header[4] = (totalDataLen and 0xff).toByte()
+        header[5] = ((totalDataLen shr 8) and 0xff).toByte()
+        header[6] = ((totalDataLen shr 16) and 0xff).toByte()
+        header[7] = ((totalDataLen shr 24) and 0xff).toByte()
+        header[8] = 'W'.code.toByte(); header[9] = 'A'.code.toByte(); header[10] = 'V'.code.toByte(); header[11] = 'E'.code.toByte()
+        header[12] = 'f'.code.toByte(); header[13] = 'm'.code.toByte(); header[14] = 't'.code.toByte(); header[15] = ' '.code.toByte()
+        header[16] = 16; header[17] = 0; header[18] = 0; header[19] = 0
+        header[20] = 1; header[21] = 0 // PCM
+        header[22] = 1; header[23] = 0 // Mono
+        header[24] = (sampleRate and 0xff).toByte()
+        header[25] = ((sampleRate shr 8) and 0xff).toByte()
+        header[26] = ((sampleRate shr 16) and 0xff).toByte()
+        header[27] = ((sampleRate shr 24) and 0xff).toByte()
+        header[28] = (byteRate and 0xff).toByte()
+        header[29] = ((byteRate shr 8) and 0xff).toByte()
+        header[30] = ((byteRate shr 16) and 0xff).toByte()
+        header[31] = ((byteRate shr 24) and 0xff).toByte()
+        header[32] = 2; header[33] = 0 // block align
+        header[34] = 16; header[35] = 0 // bits per sample
+        header[36] = 'd'.code.toByte(); header[37] = 'a'.code.toByte(); header[38] = 't'.code.toByte(); header[39] = 'a'.code.toByte()
+        header[40] = (pcmData.size and 0xff).toByte()
+        header[41] = ((pcmData.size shr 8) and 0xff).toByte()
+        header[42] = ((pcmData.size shr 16) and 0xff).toByte()
+        header[43] = ((pcmData.size shr 24) and 0xff).toByte()
+        java.io.FileOutputStream(file).use { fos ->
+            fos.write(header)
+            fos.write(pcmData)
+        }
     }
 
     private fun setupUpdaterChannel(flutterEngine: FlutterEngine) {

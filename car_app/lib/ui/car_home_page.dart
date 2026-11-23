@@ -7,6 +7,7 @@ import '../services/built_in_player_service.dart';
 import '../services/car_music_queue_controller.dart';
 import '../services/car_music_sync_service.dart';
 import '../services/car_obd_service.dart';
+import '../services/car_voice_assistant_service.dart';
 import '../services/storage_service.dart';
 import '../services/task_poller_service.dart';
 import 'car_dashboard_mode_page.dart';
@@ -92,21 +93,26 @@ class _CarHomePageState extends State<CarHomePage> {
           children: [
             _buildNavigationRail(),
             Expanded(
-              child: Padding(
-                padding: const EdgeInsets.all(14),
-                child: IndexedStack(
-                  index: _selectedTab,
-                  children: [
-                    _buildHomeDashboard(),
-                    CarMusicTab(storage: widget.storage),
-                    const CarObdTab(),
-                    CarSettingsTab(
-                      storage: widget.storage,
-                      poller: widget.poller,
-                      onOpenObdTab: () => setState(() => _selectedTab = 2),
+              child: Stack(
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.all(14),
+                    child: IndexedStack(
+                      index: _selectedTab,
+                      children: [
+                        _buildHomeDashboard(),
+                        CarMusicTab(storage: widget.storage),
+                        const CarObdTab(),
+                        CarSettingsTab(
+                          storage: widget.storage,
+                          poller: widget.poller,
+                          onOpenObdTab: () => setState(() => _selectedTab = 2),
+                        ),
+                      ],
                     ),
-                  ],
-                ),
+                  ),
+                  _buildVoiceAssistantBanner(),
+                ],
               ),
             ),
           ],
@@ -143,6 +149,69 @@ class _CarHomePageState extends State<CarHomePage> {
             const SizedBox(height: 8),
           ],
           const Spacer(),
+          ListenableBuilder(
+            listenable: CarVoiceAssistantService(),
+            builder: (context, _) {
+              final voice = CarVoiceAssistantService();
+              final recording = voice.isRecording;
+              final busy = voice.isBusy;
+              final bg = recording
+                  ? YarisCarTheme.red
+                  : (busy ? YarisCarTheme.red.withValues(alpha: 0.14) : Colors.transparent);
+              final fg = recording
+                  ? Colors.white
+                  : (busy ? YarisCarTheme.red : YarisCarTheme.ink);
+              return Material(
+                color: bg,
+                borderRadius: BorderRadius.circular(14),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(14),
+                  onTap: busy ? null : () => voice.toggleVoice(widget.storage),
+                  child: Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.symmetric(vertical: 10),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(14),
+                      border: Border.all(
+                        color: recording
+                            ? YarisCarTheme.red
+                            : YarisCarTheme.red.withValues(alpha: 0.35),
+                        width: 1.2,
+                      ),
+                    ),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          recording
+                              ? Icons.stop_rounded
+                              : (busy ? Icons.graphic_eq_rounded : Icons.mic_rounded),
+                          color: fg,
+                          size: 24,
+                        ),
+                        const SizedBox(height: 3),
+                        Text(
+                          recording
+                              ? '结束'
+                              : (voice.state == VoiceAssistantState.thinking
+                                  ? '思考中'
+                                  : (voice.state == VoiceAssistantState.speaking
+                                      ? '播报中'
+                                      : '语音')),
+                          style: TextStyle(
+                            color: fg,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
+          const SizedBox(height: 8),
           _RailItem(
             icon: Icons.speed_rounded,
             label: '仪表',
@@ -183,6 +252,136 @@ class _CarHomePageState extends State<CarHomePage> {
           ),
         ],
       ),
+    );
+  }
+
+  Widget _buildVoiceAssistantBanner() {
+    return ListenableBuilder(
+      listenable: CarVoiceAssistantService(),
+      builder: (context, _) {
+        final voice = CarVoiceAssistantService();
+        if (!voice.bannerVisible) return const SizedBox.shrink();
+        final isRec = voice.isRecording;
+        final isErr = voice.state == VoiceAssistantState.error;
+        return Positioned(
+          left: 20,
+          right: 20,
+          top: 16,
+          child: Material(
+            color: const Color(0xF0121826),
+            elevation: 10,
+            borderRadius: BorderRadius.circular(18),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(18),
+                border: Border.all(
+                  color: isRec
+                      ? YarisCarTheme.red
+                      : (isErr ? Colors.orangeAccent : const Color(0xFF2D3B5E)),
+                  width: 1.4,
+                ),
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Icon(
+                        isRec
+                            ? Icons.mic_rounded
+                            : (voice.isBusy
+                                ? Icons.auto_awesome_rounded
+                                : Icons.assistant_rounded),
+                        color: isRec ? YarisCarTheme.red : const Color(0xFF4C9BFF),
+                        size: 22,
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          voice.statusText.isNotEmpty ? voice.statusText : 'AI 语音助手',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 15,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                      if (isRec)
+                        FilledButton.icon(
+                          style: FilledButton.styleFrom(
+                            backgroundColor: YarisCarTheme.red,
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 14,
+                              vertical: 8,
+                            ),
+                          ),
+                          onPressed: () => voice.toggleVoice(widget.storage),
+                          icon: const Icon(Icons.stop_rounded, size: 18),
+                          label: const Text('说完发送'),
+                        )
+                      else
+                        IconButton(
+                          icon: const Icon(Icons.close_rounded, color: Colors.white70),
+                          onPressed: voice.dismissBanner,
+                          tooltip: '关闭',
+                        ),
+                    ],
+                  ),
+                  if (voice.transcript.isNotEmpty) ...[
+                    const SizedBox(height: 6),
+                    Text(
+                      '你说：${voice.transcript}',
+                      style: const TextStyle(
+                        color: Color(0xFF9FB0D1),
+                        fontSize: 13.5,
+                      ),
+                    ),
+                  ],
+                  if (voice.replyText.isNotEmpty) ...[
+                    const SizedBox(height: 6),
+                    Text(
+                      voice.replyText,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 14.5,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                  if (voice.candidates.isNotEmpty) ...[
+                    const SizedBox(height: 10),
+                    Wrap(
+                      spacing: 10,
+                      runSpacing: 8,
+                      children: [
+                        for (int i = 0; i < voice.candidates.length; i++)
+                          ActionChip(
+                            backgroundColor: const Color(0xFF1F2B46),
+                            side: const BorderSide(color: Color(0xFF3E5485)),
+                            label: Text(
+                              '${i + 1}. ${voice.candidates[i].name}'
+                              '${voice.candidates[i].distanceKm != null ? ' · ${voice.candidates[i].distanceKm!.toStringAsFixed(1)}km' : ''}'
+                              '${voice.candidates[i].rating != null ? ' · ${voice.candidates[i].rating!.toStringAsFixed(1)}★' : ''}',
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 13,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                            onPressed: () => voice.selectCandidate(widget.storage, i + 1),
+                          ),
+                      ],
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 

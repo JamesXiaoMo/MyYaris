@@ -435,6 +435,53 @@ class BuiltInPlayerService {
     }
   }
 
+  /// Ducks music volume sharply while the driver is speaking to the AI assistant.
+  Future<void> duckForVoiceInput() async {
+    try {
+      final duckVol = (_currentVolume * 0.15).clamp(0.03, 0.25);
+      await _player.setVolume(duckVol);
+    } catch (_) {}
+  }
+
+  /// Restores music volume back to the user's configured level.
+  Future<void> restoreMusicVolume() async {
+    try {
+      await _player.setVolume(_currentVolume);
+    } catch (_) {}
+  }
+
+  /// Plays a Chinese AI TTS voice response over ducked music, then restores volume.
+  Future<void> playVoiceReply(String ttsUrl) async {
+    if (ttsUrl.trim().isEmpty) {
+      await restoreMusicVolume();
+      return;
+    }
+    try {
+      String fullUrl = ttsUrl.trim();
+      if (fullUrl.startsWith('/') && _currentBaseUrl.isNotEmpty) {
+        fullUrl = '$_currentBaseUrl$fullUrl';
+      }
+      final resolved = InAppAudioStreamProxy().resolveStreamUrl(
+        fullUrl,
+        token: _currentDeviceToken,
+      );
+      _sfxPlayer ??= AudioPlayer();
+      final duckVol = (_currentVolume * 0.28).clamp(0.05, 0.35);
+      await _player.setVolume(duckVol);
+      await _sfxPlayer!.setVolume(1.0);
+      await _sfxPlayer!.setAudioSource(AudioSource.uri(Uri.parse(resolved)));
+      final done = _sfxPlayer!.playerStateStream
+          .firstWhere((s) => s.processingState == ProcessingState.completed)
+          .timeout(const Duration(seconds: 15), onTimeout: () => _sfxPlayer!.playerState);
+      await _sfxPlayer!.play();
+      await done;
+    } catch (e) {
+      debugPrint('[BuiltInPlayer] Voice reply playback note: $e');
+    } finally {
+      await restoreMusicVolume();
+    }
+  }
+
   Future<void> play() async {
     if (!_isInitialized) await init();
     if (_activeRemoteTrack == null) throw StateError('请显式选择默认喜欢歌单播放');
