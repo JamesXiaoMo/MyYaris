@@ -39,6 +39,7 @@ class BuiltInPlayerService {
 
   final AudioPlayer _player = AudioPlayer();
   AudioPlayer get player => _player;
+  AudioPlayer? _sfxPlayer;
 
   bool _isInitialized = false;
   bool get isInitialized => _isInitialized;
@@ -398,6 +399,40 @@ class BuiltInPlayerService {
       final res = await req.close().timeout(const Duration(seconds: 4));
       await res.drain<void>();
     } catch (_) {}
+  }
+
+  /// Plays a short DJ sound effect overlaid on top of current music (briefly ducking volume).
+  Future<void> playSoundEffect(String sfxUrl) async {
+    if (sfxUrl.trim().isEmpty) return;
+    try {
+      String fullUrl = sfxUrl.trim();
+      if (fullUrl.startsWith('/') && _currentBaseUrl.isNotEmpty) {
+        fullUrl = '$_currentBaseUrl$fullUrl';
+      }
+      final resolved = InAppAudioStreamProxy().resolveStreamUrl(
+        fullUrl,
+        token: _currentDeviceToken,
+      );
+      _sfxPlayer ??= AudioPlayer();
+      final prevVol = _currentVolume;
+      final duckVol = (prevVol * 0.45).clamp(0.05, 1.0);
+      if (_player.playing) {
+        await _player.setVolume(duckVol);
+      }
+      await _sfxPlayer!.setVolume((prevVol * 1.35).clamp(0.35, 1.0));
+      await _sfxPlayer!.setAudioSource(AudioSource.uri(Uri.parse(resolved)));
+      await _sfxPlayer!.play();
+      // Restore music volume smoothly after the short effect
+      unawaited(
+        Future<void>.delayed(const Duration(milliseconds: 1800), () async {
+          try {
+            await _player.setVolume(_currentVolume);
+          } catch (_) {}
+        }),
+      );
+    } catch (e) {
+      debugPrint('[BuiltInPlayer] SFX playback note: $e');
+    }
   }
 
   Future<void> play() async {

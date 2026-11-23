@@ -769,6 +769,14 @@ class CarMusicSyncService {
           await _playerService.seek(Duration(milliseconds: positionMs));
           break;
 
+        case 'play_sfx':
+          final sfxUrl = params['sfx_url']?.toString() ??
+              (params['sfx_id'] != null ? '/api/v1/dj/sfx/${params['sfx_id']}.wav' : '');
+          if (sfxUrl.isNotEmpty) {
+            unawaited(_playerService.playSoundEffect(sfxUrl));
+          }
+          break;
+
         case 'set_volume':
           final vol = (params['volume'] as num?)?.toDouble() ?? 0.25;
           await _playerService.setVolume(vol);

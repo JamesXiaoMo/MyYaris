@@ -9,6 +9,7 @@ import '../services/car_music_sync_service.dart';
 import '../services/car_obd_service.dart';
 import '../services/storage_service.dart';
 import '../services/task_poller_service.dart';
+import 'car_dashboard_mode_page.dart';
 import 'car_music_tab.dart';
 import 'car_obd_tab.dart';
 import 'car_settings_tab.dart';
@@ -142,6 +143,16 @@ class _CarHomePageState extends State<CarHomePage> {
             const SizedBox(height: 8),
           ],
           const Spacer(),
+          _RailItem(
+            icon: Icons.speed_rounded,
+            label: '仪表',
+            selected: false,
+            onTap: () => Navigator.push<void>(
+              context,
+              MaterialPageRoute(builder: (_) => const CarDashboardModePage()),
+            ),
+          ),
+          const SizedBox(height: 10),
           ValueListenableBuilder<bool>(
             valueListenable: CarMusicSyncService().isHealthyNotifier,
             builder: (context, healthy, _) {
