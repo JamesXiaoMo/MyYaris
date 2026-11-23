@@ -51,6 +51,7 @@ class _CarHomePageState extends State<CarHomePage> {
       );
     }
     _playerService.init();
+    CarObdService().startAutoConnectLoop();
   }
 
   String _formatDuration(Duration d) {

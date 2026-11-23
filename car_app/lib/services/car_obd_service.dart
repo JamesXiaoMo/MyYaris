@@ -111,6 +111,104 @@ class CarObdService {
 
   static const String _prefLastDeviceAddress = 'obd_last_device_address';
   static const String _prefLastDeviceName = 'obd_last_device_name';
+  static const String _prefAutoConnectEnabled = 'obd_auto_connect_enabled';
+
+  final ValueNotifier<bool> autoConnectEnabledNotifier = ValueNotifier<bool>(true);
+  Timer? _autoReconnectTimer;
+  bool _autoReconnectInFlight = false;
+  bool _manualDisconnect = false;
+  bool _autoConnectLoopStarted = false;
+
+  Future<void> setAutoConnectEnabled(bool enabled) async {
+    autoConnectEnabledNotifier.value = enabled;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_prefAutoConnectEnabled, enabled);
+    } catch (_) {}
+    if (enabled) {
+      _manualDisconnect = false;
+      unawaited(tryAutoConnectSavedDevice());
+    }
+  }
+
+  /// Starts automatic startup connection & 25-second watchdog reconnect for the last paired OBD device.
+  Future<void> startAutoConnectLoop() async {
+    if (_autoConnectLoopStarted) return;
+    _autoConnectLoopStarted = true;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      autoConnectEnabledNotifier.value = prefs.getBool(_prefAutoConnectEnabled) ?? true;
+    } catch (_) {}
+
+    // Initial connect attempt shortly after launch once Bluetooth stack settles
+    Future<void>.delayed(const Duration(seconds: 2), () {
+      unawaited(tryAutoConnectSavedDevice());
+    });
+
+    _autoReconnectTimer?.cancel();
+    _autoReconnectTimer = Timer.periodic(const Duration(seconds: 25), (_) {
+      unawaited(tryAutoConnectSavedDevice());
+    });
+  }
+
+  /// Attempts to reconnect to the last successfully paired OBD BLE adapter without blocking UI.
+  Future<bool> tryAutoConnectSavedDevice() async {
+    if (!autoConnectEnabledNotifier.value || _manualDisconnect || _autoReconnectInFlight) {
+      return false;
+    }
+    final curStatus = telemetryNotifier.value.status;
+    if (curStatus == ObdConnectionStatus.ready ||
+        curStatus == ObdConnectionStatus.connecting ||
+        curStatus == ObdConnectionStatus.initializing ||
+        curStatus == ObdConnectionStatus.scanning) {
+      return false;
+    }
+
+    _autoReconnectInFlight = true;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final savedId = prefs.getString(_prefLastDeviceAddress)?.trim() ?? '';
+      final savedName = prefs.getString(_prefLastDeviceName)?.trim() ?? savedId;
+      if (savedId.isEmpty) return false;
+
+      if (await FlutterBluePlus.isSupported == false) return false;
+      final adapterState = await FlutterBluePlus.adapterState.first
+          .timeout(const Duration(seconds: 2), onTimeout: () => BluetoothAdapterState.unknown);
+      if (adapterState != BluetoothAdapterState.on) return false;
+
+      log('🔄 自动重连上次 OBD 设备: $savedName ($savedId)');
+      final directDevice = BluetoothDevice.fromId(savedId);
+      final ok = await connect(directDevice);
+      if (ok) return true;
+
+      // Fallback: brief 4s scan to wake BLE address cache on Android head units
+      BluetoothDevice? found;
+      final sub = FlutterBluePlus.scanResults.listen((results) {
+        for (final r in results) {
+          if (r.device.remoteId.str.toUpperCase() == savedId.toUpperCase()) {
+            found = r.device;
+            break;
+          }
+        }
+      });
+      try {
+        await FlutterBluePlus.startScan(timeout: const Duration(seconds: 4));
+        await FlutterBluePlus.isScanning.where((s) => !s).first
+            .timeout(const Duration(seconds: 5), onTimeout: () => false);
+      } finally {
+        await sub.cancel();
+      }
+      if (found != null) {
+        return await connect(found!);
+      }
+      return false;
+    } catch (e) {
+      log('自动连接 OBD 跳过: $e');
+      return false;
+    } finally {
+      _autoReconnectInFlight = false;
+    }
+  }
 
   /// 当前生效的车型协议数据集配置文件
   String get currentProfileName => ToyotaTngaHybridProfile.profileName;
@@ -234,6 +332,7 @@ class CarObdService {
 
   // --- 2. 设备连接与串口 GATT 服务协商 ---
   Future<bool> connect(BluetoothDevice device) async {
+    _manualDisconnect = false;
     await stopScan();
     await disconnect();
 
@@ -1796,7 +1895,10 @@ class CarObdService {
     log('🔌 OBD 蓝牙链路已终止');
   }
 
-  Future<void> disconnect() async {
+  Future<void> disconnect({bool userInitiated = false}) async {
+    if (userInitiated) {
+      _manualDisconnect = true;
+    }
     _handleDisconnection();
     _pollingTimer?.cancel();
     _notifySubscription?.cancel();
