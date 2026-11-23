@@ -319,6 +319,48 @@ class MainActivity : AudioServiceActivity() {
         }
     }
 
+    private fun postNavigationLaunchNotification(navIntent: Intent, title: String) {
+        try {
+            val channelId = "myyaris_nav_launch_channel"
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? android.app.NotificationManager ?: return
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val ch = android.app.NotificationChannel(
+                    channelId,
+                    "远程导航目的地提醒",
+                    android.app.NotificationManager.IMPORTANCE_HIGH
+                ).apply {
+                    description = "收到手机发送的目的地时自动唤起 CAR NAVITIME"
+                    lockscreenVisibility = android.app.Notification.VISIBILITY_PUBLIC
+                }
+                nm.createNotificationChannel(ch)
+            }
+            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                android.app.PendingIntent.FLAG_IMMUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT
+            } else {
+                android.app.PendingIntent.FLAG_UPDATE_CURRENT
+            }
+            val pendingIntent = android.app.PendingIntent.getActivity(this, 2001, navIntent, flags)
+            val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                android.app.Notification.Builder(this, channelId)
+            } else {
+                @Suppress("DEPRECATION")
+                android.app.Notification.Builder(this)
+            }
+            val destLabel = if (title.isNotBlank()) title else "新导航目的地"
+            val notification = builder
+                .setSmallIcon(R.mipmap.ic_launcher)
+                .setContentTitle("正在启动 CAR NAVITIME")
+                .setContentText("目的地：$destLabel（轻点立即导航）")
+                .setCategory(android.app.Notification.CATEGORY_NAVIGATION)
+                .setAutoCancel(true)
+                .setTimeoutAfter(12_000L)
+                .setContentIntent(pendingIntent)
+                .setFullScreenIntent(pendingIntent, true)
+                .build()
+            nm.notify(2001, notification)
+        } catch (_: Exception) {}
+    }
+
     private fun setupSystemUiChannel(flutterEngine: FlutterEngine) {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, systemUiChannelName).setMethodCallHandler { call, result ->
             when (call.method) {
@@ -346,25 +388,61 @@ class MainActivity : AudioServiceActivity() {
                         return@setMethodCallHandler
                     }
                     try {
-                        val intent = Intent(this, NavTransitionActivity::class.java).apply {
-                            putExtra(NavTransitionActivity.EXTRA_GEO_URI, geoUriString)
-                            putExtra(NavTransitionActivity.EXTRA_TITLE, title)
-                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+                        val navIntent = Intent(Intent.ACTION_VIEW, Uri.parse(geoUriString)).apply {
+                            setPackage("com.navitime.local.carnavitime")
+                            addFlags(
+                                Intent.FLAG_ACTIVITY_NEW_TASK or
+                                    Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                                    Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+                            )
                         }
-                        startActivity(intent)
-                        overridePendingTransition(0, 0)
-                        result.success(mapOf("success" to true, "mode" to "transition_activity", "uri" to geoUriString))
-                    } catch (e: Exception) {
-                        try {
-                            val directIntent = Intent(Intent.ACTION_VIEW, Uri.parse(geoUriString)).apply {
-                                setPackage("com.navitime.local.carnavitime")
+                        val targetIntent = if (navIntent.resolveActivity(packageManager) != null) {
+                            navIntent
+                        } else {
+                            Intent(Intent.ACTION_VIEW, Uri.parse(geoUriString)).apply {
                                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                             }
-                            startActivity(directIntent)
-                            result.success(mapOf("success" to true, "mode" to "geo_uri_direct", "uri" to geoUriString))
-                        } catch (ex: Exception) {
-                            result.error("LAUNCH_FAILED", ex.localizedMessage ?: "Failed to launch $geoUriString", null)
                         }
+
+                        // Always attempt direct launch (works immediately in foreground or when SYSTEM_ALERT_WINDOW is granted)
+                        applicationContext.startActivity(targetIntent)
+
+                        // Also post a high-priority full-screen / heads-up notification when overlay permission is missing
+                        // so Android 10+ background activity launch restrictions never swallow the destination silently.
+                        val canOverlay = Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this)
+                        if (!canOverlay) {
+                            postNavigationLaunchNotification(targetIntent, title)
+                        }
+
+                        result.success(
+                            mapOf(
+                                "success" to true,
+                                "mode" to if (canOverlay) "direct_overlay" else "direct_with_notification",
+                                "uri" to geoUriString
+                            )
+                        )
+                    } catch (ex: Exception) {
+                        result.error("LAUNCH_FAILED", ex.localizedMessage ?: "Failed to launch $geoUriString", null)
+                    }
+                }
+                "hasOverlayPermission" -> {
+                    val granted = Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this)
+                    result.success(granted)
+                }
+                "openOverlaySettings" -> {
+                    try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                            val intent = Intent(
+                                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                Uri.parse("package:$packageName")
+                            ).apply {
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            }
+                            startActivity(intent)
+                        }
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("OVERLAY_SETTINGS_FAILED", e.localizedMessage, null)
                     }
                 }
                 "checkNavitimeInstalled" -> {

@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import '../models/obd_telemetry.dart';
 import '../services/app_update_service.dart';
 import '../services/backend_client.dart';
@@ -32,8 +33,12 @@ class CarSettingsTab extends StatefulWidget {
 
 class _CarSettingsTabState extends State<CarSettingsTab> {
   final MusicService _musicService = MusicService();
+  static const MethodChannel _navChannel =
+      MethodChannel('com.myyaris.my_yaris/navigation');
+
   late bool _isFullscreen;
   bool _hasNotificationPermission = false;
+  bool _hasOverlayPermission = false;
   String _appVersion = AppUpdateService.currentVersion;
 
   @override
@@ -41,12 +46,30 @@ class _CarSettingsTabState extends State<CarSettingsTab> {
     super.initState();
     _isFullscreen = widget.storage.isFullscreenEnabled;
     _refreshNotificationPermission();
+    _refreshOverlayPermission();
     MusicCacheService().init();
     AppUpdateService.getCurrentVersion().then((v) {
       if (mounted && v != _appVersion) {
         setState(() => _appVersion = v);
       }
     });
+  }
+
+  Future<void> _refreshOverlayPermission() async {
+    try {
+      final granted = await _navChannel.invokeMethod<bool>('hasOverlayPermission') ?? false;
+      if (mounted) setState(() => _hasOverlayPermission = granted);
+    } catch (_) {}
+  }
+
+  Future<void> _openOverlaySettings() async {
+    try {
+      await _navChannel.invokeMethod<bool>('openOverlaySettings');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('请在系统设置中允许 MyYaris「显示在其他应用上层」，即可后台自动弹出导航')),
+      );
+    } catch (_) {}
   }
 
   Future<void> _refreshNotificationPermission() async {
@@ -812,12 +835,26 @@ class _CarSettingsTabState extends State<CarSettingsTab> {
                           ),
                           Container(
                             decoration: YarisCarTheme.cardDecoration(),
-                            child: _SettingsActionRow(
-                              icon: Icons.system_update_rounded,
-                              title: '检查 GitHub 更新',
-                              trailingText: 'v$_appVersion',
-                              trailingColor: YarisCarTheme.blue,
-                              onTap: _checkForGithubUpdate,
+                            child: Column(
+                              children: [
+                                _SettingsActionRow(
+                                  icon: Icons.layers_rounded,
+                                  title: '后台自动弹出导航权限',
+                                  trailingText: _hasOverlayPermission ? '已开启' : '去开启',
+                                  trailingColor: _hasOverlayPermission
+                                      ? YarisCarTheme.green
+                                      : YarisCarTheme.red,
+                                  onTap: _openOverlaySettings,
+                                ),
+                                const Divider(height: 1, color: YarisCarTheme.line),
+                                _SettingsActionRow(
+                                  icon: Icons.system_update_rounded,
+                                  title: '检查 GitHub 更新',
+                                  trailingText: 'v$_appVersion',
+                                  trailingColor: YarisCarTheme.blue,
+                                  onTap: _checkForGithubUpdate,
+                                ),
+                              ],
                             ),
                           ),
                         ],
