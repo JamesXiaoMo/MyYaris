@@ -692,10 +692,44 @@ class CarObdService {
   double? _integratedTripKm;
   DateTime? _lastSpeedSampleAt;
 
+  double? _sessionFuelConsumedLiters;
+  DateTime? _lastFuelSampleAt;
+
   void _resetTripTracking() {
     _sessionStartOdometerKm = null;
     _integratedTripKm = null;
     _lastSpeedSampleAt = null;
+    _sessionFuelConsumedLiters = null;
+    _lastFuelSampleAt = null;
+  }
+
+  double? _recordFuelRateForTrip(double? fuelRateLh, DateTime now) {
+    if (fuelRateLh == null || fuelRateLh < 0) return _sessionFuelConsumedLiters;
+    final prevAt = _lastFuelSampleAt;
+    _lastFuelSampleAt = now;
+    _sessionFuelConsumedLiters ??= 0.0;
+    if (prevAt != null) {
+      final dtSec = now.difference(prevAt).inMilliseconds / 1000.0;
+      if (dtSec > 0 && dtSec <= 15.0) {
+        _sessionFuelConsumedLiters =
+            _sessionFuelConsumedLiters! + (fuelRateLh * dtSec / 3600.0);
+      }
+    }
+    return _sessionFuelConsumedLiters;
+  }
+
+  /// Parses Toyota Combination Meter (`7C0` -> `21 29`) response `61 29 XX`.
+  /// On Yaris Hybrid (36L tank), `XX * 0.5` yields remaining fuel in liters.
+  double? _parseToyotaMeter2129Liters(String resp) {
+    final clean = _matchedPayload(resp, const ['2129']);
+    if (clean.isEmpty) return null;
+    final idx = clean.indexOf('6129');
+    if (idx < 0 || idx + 6 > clean.length) return null;
+    final rawByte = int.tryParse(clean.substring(idx + 4, idx + 6), radix: 16);
+    if (rawByte == null) return null;
+    final liters = rawByte * 0.5;
+    if (liters < 0 || liters > 45.0) return null;
+    return liters;
   }
 
   double? _recordSpeedForTrip(double? speedKmh, DateTime now) {
@@ -720,20 +754,36 @@ class CarObdService {
     return _integratedTripKm;
   }
 
-  // Tier 1: 标准 OBD 高频只读 PID (车速 010D, 转速 010C, 水温 0105)
+  // Tier 1: 标准 OBD 高频只读 PID (车速 010D, 转速 010C, 水温 0105; 第2周期起附加标准 MAF 0110 计算实时油耗)
   Future<void> _queryStandardEngineTier1() async {
     final speed = _parseStandardSpeed(await sendRawCommand('010D'));
     final rpm = _parseStandardRpm(await sendRawCommand('010C'));
     final coolant = _parseStandardTemp(await sendRawCommand('0105'));
+    final double? maf = _pollCycleCount >= 2
+        ? _parseStandardMaf(await sendRawCommand('0110'))
+        : null;
 
     final now = DateTime.now();
     final integratedTrip = _recordSpeedForTrip(speed, now);
+
+    double? fuelRateLh;
+    if (rpm != null && rpm <= 50) {
+      // Yaris Hybrid 纯电滑行 / 发动机停机时瞬时油耗为 0 L/h
+      fuelRateLh = 0.0;
+    } else if (maf != null && maf >= 0) {
+      // 汽油化学计量空燃比 14.7:1，汽油密度 745 g/L -> L/h = (MAF / 14.7 / 745) * 3600
+      fuelRateLh = (maf / 14.7 / 745.0) * 3600.0;
+    }
+    final consumedLiters = _recordFuelRateForTrip(fuelRateLh, now);
 
     _updateTelemetry(
       (t) => t.copyWith(
         speedKmh: speed ?? t.speedKmh,
         engineRpm: rpm ?? t.engineRpm,
         coolantTemp: coolant ?? t.coolantTemp,
+        mafGramsPerSec: maf ?? t.mafGramsPerSec,
+        fuelRateLitersPerHour: fuelRateLh ?? t.fuelRateLitersPerHour,
+        totalFuelConsumedLiters: consumedLiters ?? t.totalFuelConsumedLiters,
         tripDistanceKm: _sessionStartOdometerKm != null && t.totalOdometerKm != null
             ? (t.totalOdometerKm! - _sessionStartOdometerKm!).clamp(0.0, double.infinity)
             : (integratedTrip ?? t.tripDistanceKm),
@@ -742,18 +792,35 @@ class CarObdService {
     );
   }
 
-  // Tier 1B: 标准 OBD 扩展只读 PID (~15s: 节气门 0111, 负荷 0104, 油量 012F, 环境温度 0146, 进气温度 010F, 运行时间 011F, 大气压 0133, 总里程 01A6)
+  // Tier 1B: 标准 OBD 扩展只读 PID (~15s: 节气门 0111, 负荷 0104, 油量 012F/7C0-2129, 环境温度 0146, 进气温度 010F, 运行时间 011F, 大气压 0133, 总里程 01A6)
   Future<void> _queryStandardEngineSlowTier() async {
     final throttle = _parsePercent(await sendRawCommand('0111'));
     final load = _parsePercent(await sendRawCommand('0104'));
-    final fuelPct = _parsePercent(await sendRawCommand('012F'));
+    double? fuelPct = _parsePercent(await sendRawCommand('012F'));
+    double? fuelLiters = fuelPct != null ? (fuelPct / 100.0) * 36.0 : null;
+
+    // 丰田 TNGA Yaris Hybrid 发动机 ECU 通常不应答标准 012F，油量传感器在组合仪表 ECU (7C0)
+    if (fuelPct == null) {
+      try {
+        await sendRawCommand('ATSH7C0');
+        final r2129 = await sendRawCommand('2129', timeout: const Duration(milliseconds: 1200));
+        final meterLiters = _parseToyotaMeter2129Liters(r2129);
+        if (meterLiters != null) {
+          fuelLiters = meterLiters;
+          fuelPct = (meterLiters / 36.0 * 100.0).clamp(0.0, 100.0);
+        }
+      } catch (_) {
+      } finally {
+        await sendRawCommand('ATSH7DF');
+      }
+    }
+
     final ambient = _parseStandardTemp(await sendRawCommand('0146'));
     final intake = _parseStandardTemp(await sendRawCommand('010F'));
     final runTime = _parseRunTime(await sendRawCommand('011F'));
     final baro = _parseStandardBaro(await sendRawCommand('0133'));
     final odo = _parseStandardOdometer(await sendRawCommand('01A6'));
 
-    final fuelLiters = fuelPct != null ? (fuelPct / 100.0) * 36.0 : null;
     if (odo != null) {
       _recordOdometerForTrip(odo);
     }
