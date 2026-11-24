@@ -91,6 +91,62 @@ class KeepAliveService : Service() {
                 return result
             }
         }
+
+        /** Non-destructive read of oldest buffered GPS points (safe across crashes/offline). */
+        fun peekBufferedPoints(context: Context, maxCount: Int = 120): List<Map<String, Any?>> {
+            synchronized(bufferLock) {
+                val file = File(context.filesDir, BUFFER_FILE_NAME)
+                if (!file.exists()) return emptyList()
+                val lines = try {
+                    file.readLines().filter { it.isNotBlank() }
+                } catch (_: Exception) {
+                    return emptyList()
+                }
+                if (lines.isEmpty()) return emptyList()
+                val takeCount = minOf(maxCount, lines.size)
+                val taken = lines.subList(0, takeCount)
+                val result = ArrayList<Map<String, Any?>>(taken.size)
+                for (line in taken) {
+                    try {
+                        val obj = JSONObject(line)
+                        val map = HashMap<String, Any?>()
+                        map["latitude"] = obj.getDouble("latitude")
+                        map["longitude"] = obj.getDouble("longitude")
+                        map["speed_kmh"] = if (obj.isNull("speed_kmh")) null else obj.getDouble("speed_kmh")
+                        map["accuracy_m"] = if (obj.isNull("accuracy_m")) null else obj.getDouble("accuracy_m")
+                        map["timestamp_ms"] = obj.getLong("timestamp_ms")
+                        map["provider"] = obj.optString("provider", "gps")
+                        result.add(map)
+                    } catch (_: Exception) {}
+                }
+                return result
+            }
+        }
+
+        /** Removes the oldest [count] buffered lines ONLY after HTTP upload succeeds. */
+        fun ackBufferedPoints(context: Context, count: Int): Int {
+            if (count <= 0) return 0
+            synchronized(bufferLock) {
+                val file = File(context.filesDir, BUFFER_FILE_NAME)
+                if (!file.exists()) return 0
+                val lines = try {
+                    file.readLines().filter { it.isNotBlank() }
+                } catch (_: Exception) {
+                    return 0
+                }
+                if (lines.isEmpty()) return 0
+                val drop = minOf(count, lines.size)
+                val remaining = if (drop < lines.size) lines.subList(drop, lines.size) else emptyList()
+                try {
+                    if (remaining.isEmpty()) {
+                        file.delete()
+                    } else {
+                        file.writeText(remaining.joinToString("\n") + "\n")
+                    }
+                } catch (_: Exception) {}
+                return drop
+            }
+        }
     }
 
     private var wakeLock: PowerManager.WakeLock? = null
@@ -173,6 +229,10 @@ class KeepAliveService : Service() {
                 override fun onLocationChanged(location: Location) {
                     if (isBetterLocation(location, latestValidLocation)) {
                         latestValidLocation = location
+                        // Record immediately on fresh GPS callback so corners/turns are never missed
+                        try {
+                            persistLocationIfEligible(location)
+                        } catch (_: Exception) {}
                     }
                 }
                 override fun onProviderEnabled(provider: String) {}
@@ -218,7 +278,10 @@ class KeepAliveService : Service() {
         }
         val loc = best ?: return
         latestValidLocation = loc
+        persistLocationIfEligible(loc)
+    }
 
+    private fun persistLocationIfEligible(loc: Location) {
         if (loc.latitude == 0.0 && loc.longitude == 0.0) return
         val nowMs = System.currentTimeMillis()
         val prevLoc = lastRecordedLocation

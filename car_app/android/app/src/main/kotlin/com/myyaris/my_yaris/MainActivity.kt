@@ -448,6 +448,14 @@ class MainActivity : AudioServiceActivity() {
                 "drainBufferedLocations" -> {
                     result.success(KeepAliveService.drainBufferedPoints(this))
                 }
+                "peekBufferedLocations" -> {
+                    val maxCount = call.argument<Int>("maxCount") ?: 120
+                    result.success(KeepAliveService.peekBufferedPoints(this, maxCount))
+                }
+                "ackBufferedLocations" -> {
+                    val count = call.argument<Int>("count") ?: 0
+                    result.success(KeepAliveService.ackBufferedPoints(this, count))
+                }
                 "getLatestLocation" -> {
                     if (!hasLocationPermission()) {
                         result.success(null)

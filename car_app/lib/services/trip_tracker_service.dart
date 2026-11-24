@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../models/obd_telemetry.dart';
 import 'backend_client.dart';
 import 'car_obd_service.dart';
@@ -23,6 +24,9 @@ class TripTrackerService {
   final ValueNotifier<bool> isRunningNotifier = ValueNotifier(false);
   final ValueNotifier<int> uploadedPointsNotifier = ValueNotifier(0);
 
+  static const String _prefTripIdKey = 'myyaris_active_trip_id';
+  static const String _prefLastPointMsKey = 'myyaris_active_trip_last_ms';
+
   Timer? _timer;
   bool _isRunning = false;
   bool _uploadInFlight = false;
@@ -34,6 +38,41 @@ class TripTrackerService {
   Map<String, String> _fallbackDns = const {};
   BackendClient? _persistentClient;
   final List<Map<String, dynamic>> _pendingPoints = [];
+
+  Future<void> _restoreOrInitTripId(bool resetTrip) async {
+    if (!resetTrip && _tripId.isEmpty) {
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        final savedId = prefs.getString(_prefTripIdKey) ?? '';
+        final savedMs = prefs.getInt(_prefLastPointMsKey) ?? 0;
+        if (savedId.isNotEmpty && savedMs > 0) {
+          final lastDt = DateTime.fromMillisecondsSinceEpoch(savedMs, isUtc: true);
+          if (DateTime.now().toUtc().difference(lastDt).abs() < tripSplitGap) {
+            _tripId = savedId;
+            _lastPointTime = lastDt;
+          }
+        }
+      } catch (_) {}
+    }
+    if (resetTrip || _tripId.isEmpty) {
+      _tripId = 'trip_${DateTime.now().toUtc().millisecondsSinceEpoch}';
+      uploadedPointsNotifier.value = 0;
+      unawaited(_persistTripState());
+    }
+  }
+
+  Future<void> _persistTripState() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_prefTripIdKey, _tripId);
+      if (_lastPointTime != null) {
+        await prefs.setInt(
+          _prefLastPointMsKey,
+          _lastPointTime!.millisecondsSinceEpoch,
+        );
+      }
+    } catch (_) {}
+  }
 
   bool get isRunning => _isRunning;
   String get tripId => _tripId;
@@ -64,10 +103,7 @@ class TripTrackerService {
     _persistentClient?.close();
     _persistentClient = null;
 
-    if (resetTrip || _tripId.isEmpty) {
-      _tripId = 'trip_${DateTime.now().toUtc().millisecondsSinceEpoch}';
-      uploadedPointsNotifier.value = 0;
-    }
+    await _restoreOrInitTripId(resetTrip);
 
     if (_isRunning) return;
     _isRunning = true;
@@ -99,16 +135,16 @@ class TripTrackerService {
     } catch (_) {}
   }
 
-  /// Sampling ALWAYS runs every 10s regardless of whether an HTTP upload is in flight.
+  /// Sampling runs natively in KeepAliveService; every 10s we safely peek -> upload -> ack
+  /// so GPS points are NEVER deleted from disk before HTTP 200 OK succeeds.
   Future<void> _tick() async {
     if (!_isRunning) return;
-    await _collectNativePoints();
     if (!_uploadInFlight) {
       unawaited(_flushPendingAndObd());
     }
   }
 
-  void _appendLocationMap(Map<dynamic, dynamic> loc) {
+  Map<String, dynamic>? _normalizeLocationMap(Map<dynamic, dynamic> loc) {
     final lat = (loc['latitude'] as num?)?.toDouble();
     final lon = (loc['longitude'] as num?)?.toDouble();
     if (lat == null ||
@@ -118,7 +154,7 @@ class TripTrackerService {
         (lat == 0.0 && lon == 0.0) ||
         lat.abs() > 90 ||
         lon.abs() > 180) {
-      return;
+      return null;
     }
     final speedKmh = (loc['speed_kmh'] as num?)?.toDouble();
     final accuracyM = (loc['accuracy_m'] as num?)?.toDouble();
@@ -134,7 +170,7 @@ class TripTrackerService {
     }
     _lastPointTime = ptTime;
 
-    _pendingPoints.add({
+    return {
       '_trip_id': _tripId,
       'latitude': lat,
       'longitude': lon,
@@ -143,33 +179,15 @@ class TripTrackerService {
       if (accuracyM != null && accuracyM >= 0 && accuracyM <= 5000)
         'accuracy_m': accuracyM,
       'recorded_at': ptTime.toIso8601String(),
-    });
-    if (_pendingPoints.length > maxBufferedPoints) {
-      _pendingPoints.removeRange(0, _pendingPoints.length - maxBufferedPoints);
-    }
+    };
   }
 
-  Future<void> _collectNativePoints() async {
-    try {
-      final drained = await _locationChannel.invokeMethod<List<dynamic>>(
-        'drainBufferedLocations',
-      );
-      if (drained != null && drained.isNotEmpty) {
-        for (final item in drained) {
-          if (item is Map) _appendLocationMap(item);
-        }
-        return;
-      }
-    } catch (_) {}
-
-    // Fallback to single getLatestLocation if native buffer returned empty
-    try {
-      final loc = await _locationChannel.invokeMethod<Map<dynamic, dynamic>>(
-        'getLatestLocation',
-      );
-      if (loc != null) _appendLocationMap(loc);
-    } catch (e) {
-      debugPrint('[TripTracker] Location sample skipped: $e');
+  void _appendLocationMap(Map<dynamic, dynamic> loc) {
+    final normalized = _normalizeLocationMap(loc);
+    if (normalized == null) return;
+    _pendingPoints.add(normalized);
+    if (_pendingPoints.length > maxBufferedPoints) {
+      _pendingPoints.removeRange(0, _pendingPoints.length - maxBufferedPoints);
     }
   }
 
@@ -177,6 +195,79 @@ class TripTrackerService {
     if (!_isRunning || _uploadInFlight) return;
     _uploadInFlight = true;
     try {
+      // Phase 1: Two-phase crash-safe upload from native disk queue (peek -> upload -> ack)
+      while (_isRunning) {
+        List<dynamic>? peeked;
+        try {
+          peeked = await _locationChannel.invokeMethod<List<dynamic>>(
+            'peekBufferedLocations',
+            {'maxCount': 100},
+          );
+        } catch (_) {
+          break;
+        }
+        if (peeked == null || peeked.isEmpty) break;
+
+        final validBatch = <Map<String, dynamic>>[];
+        String? batchTripId;
+        int consumedRawCount = 0;
+
+        for (final item in peeked) {
+          if (item is! Map) {
+            consumedRawCount++;
+            continue;
+          }
+          final norm = _normalizeLocationMap(item);
+          if (norm == null) {
+            consumedRawCount++;
+            continue;
+          }
+          final tid = norm['_trip_id']?.toString() ?? _tripId;
+          batchTripId ??= tid;
+          if (tid != batchTripId) {
+            // Stop before trip boundary so each batch maps to one trip_id
+            break;
+          }
+          consumedRawCount++;
+          validBatch.add({
+            for (final e in norm.entries)
+              if (e.key != '_trip_id') e.key: e.value,
+          });
+        }
+
+        if (validBatch.isNotEmpty && batchTripId != null) {
+          final ok = await _postBatch(batchTripId, validBatch);
+          if (!ok) {
+            // Keep points safely on disk for next retry!
+            break;
+          }
+          uploadedPointsNotifier.value += validBatch.length;
+          unawaited(_persistTripState());
+        }
+
+        if (consumedRawCount > 0) {
+          try {
+            await _locationChannel.invokeMethod<int>(
+              'ackBufferedLocations',
+              {'count': consumedRawCount},
+            );
+          } catch (_) {
+            break;
+          }
+        } else {
+          break;
+        }
+      }
+
+      // Phase 2: Fallback flush if any points were queued in RAM
+      if (_pendingPoints.isEmpty) {
+        try {
+          final loc = await _locationChannel.invokeMethod<Map<dynamic, dynamic>>(
+            'getLatestLocation',
+          );
+          if (loc != null) _appendLocationMap(loc);
+        } catch (_) {}
+      }
       while (_isRunning && _pendingPoints.isNotEmpty) {
         final targetTripId = _pendingPoints.first['_trip_id']?.toString() ?? _tripId;
         final batch = <Map<String, dynamic>>[];
@@ -193,6 +284,7 @@ class TripTrackerService {
         if (!ok) break;
         _pendingPoints.removeRange(0, batch.length);
         uploadedPointsNotifier.value += batch.length;
+        unawaited(_persistTripState());
       }
 
       await _uploadObdSnapshotIfReady();
