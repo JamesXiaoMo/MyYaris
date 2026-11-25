@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="navitime_accessibility_desc">读取 CAR NAVITIME 前台导航中的路口、车道与拥堵色条，用于 MyYaris 中文 AI 语音播报提醒。</string>
+</resources>

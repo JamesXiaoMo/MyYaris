@@ -1,4 +1,5 @@
 import 'package:audio_service/audio_service.dart';
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'services/built_in_player_service.dart';
 import 'services/car_audio_handler.dart';
@@ -7,6 +8,7 @@ import 'services/storage_service.dart';
 import 'services/system_ui_service.dart';
 import 'services/task_poller_service.dart';
 import 'services/trip_tracker_service.dart';
+import 'services/navitime_guide_service.dart';
 import 'ui/car_home_page.dart';
 import 'ui/yaris_car_theme.dart';
 
@@ -59,6 +61,9 @@ void main() async {
       resetTrip: true,
     );
   }
+
+  // 4. Start CAR NAVITIME Chinese voice guide listener
+  unawaited(NavitimeGuideService().init(storage));
 
   runApp(MyYarisApp(storage: storage, poller: poller));
 }

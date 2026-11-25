@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'built_in_player_service.dart';
+import 'navitime_guide_service.dart';
 import 'storage_service.dart';
 
 enum VoiceAssistantState {
@@ -174,6 +175,62 @@ class CarVoiceAssistantService extends ChangeNotifier {
     }
   }
 
+  /// Speaks a proactive Chinese navigation/safety announcement using backend TTS
+  /// while temporarily ducking music volume to 15%.
+  Future<void> speakAnnouncement(IStorageService storage, String text) async {
+    final clean = text.trim();
+    if (clean.isEmpty || isBusy || isRecording) return;
+    final baseUrl = _normalizeBaseUrl(storage.backendUrl);
+    if (baseUrl.isEmpty || storage.carToken.trim().isEmpty) return;
+
+    _state = VoiceAssistantState.speaking;
+    _statusText = '导航中文播报';
+    _replyText = clean;
+    _bannerVisible = true;
+    notifyListeners();
+
+    await BuiltInPlayerService().duckForVoiceInput();
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 6);
+    try {
+      final uri = Uri.parse('$baseUrl/api/v1/assistant/tts');
+      final req = await client.postUrl(uri).timeout(const Duration(seconds: 10));
+      req.headers.set('Authorization', 'Bearer ${storage.carToken}');
+      req.headers.set('X-Device-Token', storage.carToken);
+      req.headers.set('Content-Type', 'application/json; charset=utf-8');
+      req.add(utf8.encode(jsonEncode({'text': clean})));
+      final resp = await req.close().timeout(const Duration(seconds: 12));
+      final raw = await resp.transform(utf8.decoder).join();
+      if (resp.statusCode >= 200 && resp.statusCode < 300) {
+        final decoded = jsonDecode(raw);
+        final ttsUrl = decoded is Map ? (decoded['tts_url'] ?? '').toString().trim() : '';
+        if (ttsUrl.isNotEmpty) {
+          await BuiltInPlayerService().playVoiceReply(ttsUrl);
+        } else {
+          await BuiltInPlayerService().restoreMusicVolume();
+        }
+      } else {
+        await BuiltInPlayerService().restoreMusicVolume();
+      }
+    } catch (e) {
+      debugPrint('[VoiceAssistant] Proactive TTS note: $e');
+      await BuiltInPlayerService().restoreMusicVolume();
+    } finally {
+      client.close(force: true);
+      if (_state == VoiceAssistantState.speaking) {
+        _state = VoiceAssistantState.idle;
+        _statusText = '已完成';
+        notifyListeners();
+        _bannerDismissTimer?.cancel();
+        _bannerDismissTimer = Timer(const Duration(seconds: 6), () {
+          if (_state == VoiceAssistantState.idle) {
+            _bannerVisible = false;
+            notifyListeners();
+          }
+        });
+      }
+    }
+  }
+
   Future<void> selectCandidate(IStorageService storage, int oneBasedIndex) async {
     if (isBusy || _state == VoiceAssistantState.recording) return;
     _bannerDismissTimer?.cancel();
@@ -301,6 +358,10 @@ class CarVoiceAssistantService extends ChangeNotifier {
       addField('lat', lat.toStringAsFixed(6));
       addField('lng', lng.toStringAsFixed(6));
     }
+    final navCtx = NavitimeGuideService().buildVoiceContext();
+    if (navCtx != null) {
+      addField('navitime_context', jsonEncode(navCtx));
+    }
 
     bodyBuilder.add(utf8.encode('--$boundary\r\n'));
     bodyBuilder.add(
@@ -341,12 +402,14 @@ class CarVoiceAssistantService extends ChangeNotifier {
   }) async {
     final baseUrl = _normalizeBaseUrl(storage.backendUrl);
     final uri = Uri.parse('$baseUrl/api/v1/assistant/text');
+    final navCtx = NavitimeGuideService().buildVoiceContext();
     final payload = utf8.encode(
       jsonEncode({
         'text': text,
         'device_id': storage.deviceId,
         'lat': ?lat,
         'lng': ?lng,
+        'navitime_context': ?navCtx,
       }),
     );
     final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);

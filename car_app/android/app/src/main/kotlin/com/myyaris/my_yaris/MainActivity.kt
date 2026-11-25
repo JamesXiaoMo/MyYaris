@@ -86,7 +86,43 @@ class MainActivity : AudioServiceActivity() {
         setupStorageChannel(flutterEngine)
         setupUpdaterChannel(flutterEngine)
         setupVoiceChannel(flutterEngine)
+        setupNavitimeGuideChannel(flutterEngine)
         ObdReportExporter.register(this, flutterEngine)
+    }
+
+    private fun setupNavitimeGuideChannel(flutterEngine: FlutterEngine) {
+        val channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.myyaris.my_yaris/navitime_guide")
+        NavitimeAccessibilityService.onSnapshotUpdated = { snapshot ->
+            runOnUiThread {
+                try {
+                    channel.invokeMethod("onNavitimeSnapshot", snapshot)
+                } catch (_: Exception) {
+                }
+            }
+        }
+        channel.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "getStatus" -> {
+                    result.success(
+                        mapOf(
+                            "running" to NavitimeAccessibilityService.isRunning,
+                            "snapshot" to NavitimeAccessibilityService.latestSnapshot,
+                        )
+                    )
+                }
+                "openAccessibilitySettings" -> {
+                    try {
+                        val intent = Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        startActivity(intent)
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("OPEN_FAILED", e.message, null)
+                    }
+                }
+                else -> result.notImplemented()
+            }
+        }
     }
 
     @Volatile

@@ -8,6 +8,7 @@ import '../services/car_music_sync_service.dart';
 import '../services/car_obd_service.dart';
 import '../services/music_cache_service.dart';
 import '../services/music_service.dart';
+import '../services/navitime_guide_service.dart';
 import '../services/storage_service.dart';
 import '../services/system_ui_service.dart';
 import '../services/task_poller_service.dart';
@@ -47,6 +48,7 @@ class _CarSettingsTabState extends State<CarSettingsTab> {
     _isFullscreen = widget.storage.isFullscreenEnabled;
     _refreshNotificationPermission();
     _refreshOverlayPermission();
+    NavitimeGuideService().refreshStatus();
     MusicCacheService().init();
     AppUpdateService.getCurrentVersion().then((v) {
       if (mounted && v != _appVersion) {
@@ -681,6 +683,41 @@ class _CarSettingsTabState extends State<CarSettingsTab> {
                                       ? YarisCarTheme.green
                                       : YarisCarTheme.blue,
                                   onTap: _openNotificationSettings,
+                                ),
+                                const Divider(height: 1, color: YarisCarTheme.line),
+                                ListenableBuilder(
+                                  listenable: NavitimeGuideService(),
+                                  builder: (context, _) {
+                                    final svc = NavitimeGuideService();
+                                    return Column(
+                                      children: [
+                                        _SettingsActionRow(
+                                          icon: Icons.record_voice_over_rounded,
+                                          title: '导航读屏辅助权限',
+                                          trailingText: svc.serviceRunning ? '已运行' : '去开启',
+                                          trailingColor: svc.serviceRunning
+                                              ? YarisCarTheme.green
+                                              : YarisCarTheme.blue,
+                                          onTap: () async {
+                                            await svc.openAccessibilitySettings();
+                                            if (!context.mounted) return;
+                                            ScaffoldMessenger.of(context).showSnackBar(
+                                              const SnackBar(
+                                                content: Text('请在系统无障碍设置中开启「MyYaris 导航中文播报辅助」'),
+                                              ),
+                                            );
+                                          },
+                                        ),
+                                        const Divider(height: 1, color: YarisCarTheme.line),
+                                        _SettingsSwitchRow(
+                                          icon: Icons.alt_route_rounded,
+                                          title: '车道与拥堵主动播报',
+                                          value: svc.autoAnnounceEnabled,
+                                          onChanged: svc.setAutoAnnounceEnabled,
+                                        ),
+                                      ],
+                                    );
+                                  },
                                 ),
                               ],
                             ),
