@@ -732,6 +732,26 @@ class CarObdService {
     return liters;
   }
 
+  /// Parses Toyota TNGA Combination Meter (`7C0` -> `22 10 22`) response `62 10 22 AA BB`.
+  double? _parseToyotaMeter221022Liters(String resp) {
+    final clean = _matchedPayload(resp, const ['221022']);
+    if (clean.isEmpty) return null;
+    final idx = clean.indexOf('621022');
+    if (idx < 0 || idx + 10 > clean.length) return null;
+    final hi = int.tryParse(clean.substring(idx + 6, idx + 8), radix: 16);
+    final lo = int.tryParse(clean.substring(idx + 8, idx + 10), radix: 16);
+    if (hi == null || lo == null) return null;
+    final raw = (hi << 8) | lo;
+    // TNGA meter fuel volume is typically 0.01 L or 0.1 L per bit
+    final liters001 = raw * 0.01;
+    if (liters001 >= 0.5 && liters001 <= 45.0) return liters001;
+    final liters01 = raw * 0.1;
+    if (liters01 >= 0.5 && liters01 <= 45.0) return liters01;
+    return null;
+  }
+
+  bool _loggedFuelProbeRaw = false;
+
   double? _recordSpeedForTrip(double? speedKmh, DateTime now) {
     if (speedKmh == null || speedKmh < 0) return _integratedTripKm;
     final prevAt = _lastSpeedSampleAt;
@@ -799,18 +819,30 @@ class CarObdService {
     double? fuelPct = _parsePercent(await sendRawCommand('012F'));
     double? fuelLiters = fuelPct != null ? (fuelPct / 100.0) * 36.0 : null;
 
-    // 丰田 TNGA Yaris Hybrid 发动机 ECU 通常不应答标准 012F，油量传感器在组合仪表 ECU (7C0)
+    // 丰田 TNGA Yaris Hybrid 发动机 ECU 通常不应答标准 012F，油量传感器在组合仪表 ECU (7C0 -> 7C8)
+    // 必须显式设置 ATCRA7C8 接收过滤器，避免 ELM327 丢弃 7C8 响应；读完立即恢复 ATCRA + ATSH7DF
     if (fuelPct == null) {
+      String r2129 = '';
+      String r221022 = '';
       try {
         await sendRawCommand('ATSH7C0');
-        final r2129 = await sendRawCommand('2129', timeout: const Duration(milliseconds: 1200));
-        final meterLiters = _parseToyotaMeter2129Liters(r2129);
+        await sendRawCommand('ATCRA7C8');
+        r2129 = await sendRawCommand('2129', timeout: const Duration(milliseconds: 1200));
+        double? meterLiters = _parseToyotaMeter2129Liters(r2129);
+        if (meterLiters == null) {
+          r221022 = await sendRawCommand('221022', timeout: const Duration(milliseconds: 1200));
+          meterLiters = _parseToyotaMeter221022Liters(r221022);
+        }
         if (meterLiters != null) {
           fuelLiters = meterLiters;
           fuelPct = (meterLiters / 36.0 * 100.0).clamp(0.0, 100.0);
+        } else if (!_loggedFuelProbeRaw) {
+          _loggedFuelProbeRaw = true;
+          log('⛽ 仪表油量原始应答: 2129=[$r2129] | 221022=[$r221022]');
         }
       } catch (_) {
       } finally {
+        await sendRawCommand('ATCRA');
         await sendRawCommand('ATSH7DF');
       }
     }
