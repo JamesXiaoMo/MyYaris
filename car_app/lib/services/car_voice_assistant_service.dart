@@ -175,13 +175,11 @@ class CarVoiceAssistantService extends ChangeNotifier {
     }
   }
 
-  /// Speaks a proactive Chinese navigation/safety announcement using backend TTS
-  /// while temporarily ducking music volume to 15%.
+  /// Speaks a proactive Chinese navigation/safety announcement using backend edge-tts
+  /// with automatic instant fallback to offline Android Chinese TTS (for tunnels/offline).
   Future<void> speakAnnouncement(IStorageService storage, String text) async {
     final clean = text.trim();
     if (clean.isEmpty || isBusy || isRecording) return;
-    final baseUrl = _normalizeBaseUrl(storage.backendUrl);
-    if (baseUrl.isEmpty || storage.carToken.trim().isEmpty) return;
 
     _state = VoiceAssistantState.speaking;
     _statusText = '导航中文播报';
@@ -190,44 +188,58 @@ class CarVoiceAssistantService extends ChangeNotifier {
     notifyListeners();
 
     await BuiltInPlayerService().duckForVoiceInput();
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 6);
-    try {
-      final uri = Uri.parse('$baseUrl/api/v1/assistant/tts');
-      final req = await client.postUrl(uri).timeout(const Duration(seconds: 10));
-      req.headers.set('Authorization', 'Bearer ${storage.carToken}');
-      req.headers.set('X-Device-Token', storage.carToken);
-      req.headers.set('Content-Type', 'application/json; charset=utf-8');
-      req.add(utf8.encode(jsonEncode({'text': clean})));
-      final resp = await req.close().timeout(const Duration(seconds: 12));
-      final raw = await resp.transform(utf8.decoder).join();
-      if (resp.statusCode >= 200 && resp.statusCode < 300) {
-        final decoded = jsonDecode(raw);
-        final ttsUrl = decoded is Map ? (decoded['tts_url'] ?? '').toString().trim() : '';
-        if (ttsUrl.isNotEmpty) {
-          await BuiltInPlayerService().playVoiceReply(ttsUrl);
-        } else {
-          await BuiltInPlayerService().restoreMusicVolume();
+    var playedCloud = false;
+    final baseUrl = _normalizeBaseUrl(storage.backendUrl);
+    if (baseUrl.isNotEmpty && storage.carToken.trim().isNotEmpty) {
+      final client = HttpClient()..connectionTimeout = const Duration(seconds: 2);
+      try {
+        final uri = Uri.parse('$baseUrl/api/v1/assistant/tts');
+        final req = await client.postUrl(uri).timeout(const Duration(seconds: 2));
+        req.headers.set('Authorization', 'Bearer ${storage.carToken}');
+        req.headers.set('X-Device-Token', storage.carToken);
+        req.headers.set('Content-Type', 'application/json; charset=utf-8');
+        req.add(utf8.encode(jsonEncode({'text': clean})));
+        final resp = await req.close().timeout(const Duration(seconds: 3));
+        final raw = await resp.transform(utf8.decoder).join();
+        if (resp.statusCode >= 200 && resp.statusCode < 300) {
+          final decoded = jsonDecode(raw);
+          final ttsUrl =
+              decoded is Map ? (decoded['tts_url'] ?? '').toString().trim() : '';
+          if (ttsUrl.isNotEmpty) {
+            await BuiltInPlayerService().playVoiceReply(ttsUrl);
+            playedCloud = true;
+          }
         }
-      } else {
+      } catch (e) {
+        debugPrint('[VoiceAssistant] Cloud TTS unavailable, switching to offline TTS: $e');
+      } finally {
+        client.close(force: true);
+      }
+    }
+
+    if (!playedCloud) {
+      try {
+        await _voiceChannel
+            .invokeMethod<bool>('speakOfflineTts', {'text': clean})
+            .timeout(const Duration(seconds: 10));
+      } catch (e) {
+        debugPrint('[VoiceAssistant] Offline TTS note: $e');
+      } finally {
         await BuiltInPlayerService().restoreMusicVolume();
       }
-    } catch (e) {
-      debugPrint('[VoiceAssistant] Proactive TTS note: $e');
-      await BuiltInPlayerService().restoreMusicVolume();
-    } finally {
-      client.close(force: true);
-      if (_state == VoiceAssistantState.speaking) {
-        _state = VoiceAssistantState.idle;
-        _statusText = '已完成';
-        notifyListeners();
-        _bannerDismissTimer?.cancel();
-        _bannerDismissTimer = Timer(const Duration(seconds: 6), () {
-          if (_state == VoiceAssistantState.idle) {
-            _bannerVisible = false;
-            notifyListeners();
-          }
-        });
-      }
+    }
+
+    if (_state == VoiceAssistantState.speaking) {
+      _state = VoiceAssistantState.idle;
+      _statusText = '已完成';
+      notifyListeners();
+      _bannerDismissTimer?.cancel();
+      _bannerDismissTimer = Timer(const Duration(seconds: 6), () {
+        if (_state == VoiceAssistantState.idle) {
+          _bannerVisible = false;
+          notifyListeners();
+        }
+      });
     }
   }
 
@@ -361,6 +373,18 @@ class CarVoiceAssistantService extends ChangeNotifier {
     final navCtx = NavitimeGuideService().buildVoiceContext();
     if (navCtx != null) {
       addField('navitime_context', jsonEncode(navCtx));
+      final screenJpeg = await NavitimeGuideService().getLatestScreenshotJpeg();
+      if (screenJpeg != null && screenJpeg.isNotEmpty) {
+        bodyBuilder.add(utf8.encode('--$boundary\r\n'));
+        bodyBuilder.add(
+          utf8.encode(
+            'Content-Disposition: form-data; name="navitime_screenshot"; filename="navitime.jpg"\r\n'
+            'Content-Type: image/jpeg\r\n\r\n',
+          ),
+        );
+        bodyBuilder.add(screenJpeg);
+        bodyBuilder.add(utf8.encode('\r\n'));
+      }
     }
 
     bodyBuilder.add(utf8.encode('--$boundary\r\n'));

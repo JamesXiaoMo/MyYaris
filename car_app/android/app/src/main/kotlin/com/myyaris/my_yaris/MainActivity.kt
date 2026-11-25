@@ -120,6 +120,15 @@ class MainActivity : AudioServiceActivity() {
                         result.error("OPEN_FAILED", e.message, null)
                     }
                 }
+                "getLatestScreenshotJpeg" -> {
+                    val ageMs = System.currentTimeMillis() - NavitimeAccessibilityService.latestScreenJpegAtMs
+                    val jpeg = NavitimeAccessibilityService.latestScreenJpeg
+                    if (jpeg != null && ageMs in 0..20000) {
+                        result.success(jpeg)
+                    } else {
+                        result.success(null)
+                    }
+                }
                 else -> result.notImplemented()
             }
         }
@@ -211,7 +220,76 @@ class MainActivity : AudioServiceActivity() {
                     stopVoiceRecorderInternal()
                     result.success(true)
                 }
+                "speakOfflineTts" -> {
+                    val text = (call.argument<String>("text") ?: "").trim()
+                    if (text.isEmpty()) {
+                        result.success(false)
+                        return@setMethodCallHandler
+                    }
+                    speakOfflineChineseTts(text) { ok ->
+                        runOnUiThread {
+                            try {
+                                result.success(ok)
+                            } catch (_: Exception) {
+                            }
+                        }
+                    }
+                }
                 else -> result.notImplemented()
+            }
+        }
+    }
+
+    private var offlineTts: android.speech.tts.TextToSpeech? = null
+    @Volatile
+    private var offlineTtsReady: Boolean = false
+    private val offlineTtsCallbacks = java.util.concurrent.ConcurrentHashMap<String, (Boolean) -> Unit>()
+
+    private fun speakOfflineChineseTts(text: String, onDone: (Boolean) -> Unit) {
+        val dispatchSpeak: (android.speech.tts.TextToSpeech) -> Unit = { engine ->
+            val uttId = "myyaris_nav_${System.currentTimeMillis()}"
+            offlineTtsCallbacks[uttId] = onDone
+            engine.setOnUtteranceProgressListener(object : android.speech.tts.UtteranceProgressListener() {
+                override fun onStart(utteranceId: String?) {}
+                override fun onDone(utteranceId: String?) {
+                    utteranceId?.let { offlineTtsCallbacks.remove(it)?.invoke(true) }
+                }
+                @Deprecated("Deprecated in Java")
+                override fun onError(utteranceId: String?) {
+                    utteranceId?.let { offlineTtsCallbacks.remove(it)?.invoke(false) }
+                }
+                override fun onError(utteranceId: String?, errorCode: Int) {
+                    utteranceId?.let { offlineTtsCallbacks.remove(it)?.invoke(false) }
+                }
+            })
+            val params = android.os.Bundle().apply {
+                putFloat(android.speech.tts.TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
+            }
+            val code = engine.speak(text, android.speech.tts.TextToSpeech.QUEUE_FLUSH, params, uttId)
+            if (code != android.speech.tts.TextToSpeech.SUCCESS) {
+                offlineTtsCallbacks.remove(uttId)?.invoke(false)
+            }
+        }
+
+        val existing = offlineTts
+        if (existing != null && offlineTtsReady) {
+            dispatchSpeak(existing)
+            return
+        }
+        offlineTts = android.speech.tts.TextToSpeech(applicationContext) { status ->
+            if (status == android.speech.tts.TextToSpeech.SUCCESS) {
+                val engine = offlineTts ?: return@TextToSpeech
+                val langRes = engine.setLanguage(java.util.Locale.SIMPLIFIED_CHINESE)
+                if (langRes == android.speech.tts.TextToSpeech.LANG_MISSING_DATA ||
+                    langRes == android.speech.tts.TextToSpeech.LANG_NOT_SUPPORTED
+                ) {
+                    engine.setLanguage(java.util.Locale.CHINESE)
+                }
+                engine.setSpeechRate(1.05f)
+                offlineTtsReady = true
+                dispatchSpeak(engine)
+            } else {
+                onDone(false)
             }
         }
     }

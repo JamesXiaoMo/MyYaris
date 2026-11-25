@@ -709,11 +709,80 @@ class _CarSettingsTabState extends State<CarSettingsTab> {
                                           },
                                         ),
                                         const Divider(height: 1, color: YarisCarTheme.line),
-                                        _SettingsSwitchRow(
-                                          icon: Icons.alt_route_rounded,
-                                          title: '车道与拥堵主动播报',
-                                          value: svc.autoAnnounceEnabled,
-                                          onChanged: svc.setAutoAnnounceEnabled,
+                                        Padding(
+                                          padding: const EdgeInsets.fromLTRB(14, 10, 14, 12),
+                                          child: Column(
+                                            crossAxisAlignment: CrossAxisAlignment.start,
+                                            children: [
+                                              Row(
+                                                children: [
+                                                  const Icon(
+                                                    Icons.alt_route_rounded,
+                                                    size: 18,
+                                                    color: YarisCarTheme.blue,
+                                                  ),
+                                                  const SizedBox(width: 10),
+                                                  const Text(
+                                                    '导航中文播报模式',
+                                                    style: TextStyle(
+                                                      fontSize: 13.5,
+                                                      fontWeight: FontWeight.w600,
+                                                      color: YarisCarTheme.ink,
+                                                    ),
+                                                  ),
+                                                  const Spacer(),
+                                                  if (svc.currentSpeedLimitKmh != null)
+                                                    Text(
+                                                      '限速 ${svc.currentSpeedLimitKmh}',
+                                                      style: const TextStyle(
+                                                        fontSize: 11.5,
+                                                        fontWeight: FontWeight.w700,
+                                                        color: YarisCarTheme.red,
+                                                      ),
+                                                    ),
+                                                ],
+                                              ),
+                                              const SizedBox(height: 8),
+                                              Row(
+                                                children: [
+                                                  for (final mode in NavitimeBroadcastMode.values) ...[
+                                                    if (mode != NavitimeBroadcastMode.values.first)
+                                                      const SizedBox(width: 6),
+                                                    Expanded(
+                                                      child: GestureDetector(
+                                                        onTap: () => svc.setBroadcastMode(mode),
+                                                        child: Container(
+                                                          padding: const EdgeInsets.symmetric(vertical: 7),
+                                                          alignment: Alignment.center,
+                                                          decoration: BoxDecoration(
+                                                            color: svc.broadcastMode == mode
+                                                                ? YarisCarTheme.blue
+                                                                : YarisCarTheme.canvas,
+                                                            borderRadius: BorderRadius.circular(10),
+                                                            border: Border.all(
+                                                              color: svc.broadcastMode == mode
+                                                                  ? YarisCarTheme.blue
+                                                                  : YarisCarTheme.line,
+                                                            ),
+                                                          ),
+                                                          child: Text(
+                                                            mode.label,
+                                                            style: TextStyle(
+                                                              fontSize: 11.5,
+                                                              fontWeight: FontWeight.w700,
+                                                              color: svc.broadcastMode == mode
+                                                                  ? Colors.white
+                                                                  : YarisCarTheme.ink,
+                                                            ),
+                                                          ),
+                                                        ),
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ],
+                                              ),
+                                            ],
+                                          ),
                                         ),
                                       ],
                                     );
