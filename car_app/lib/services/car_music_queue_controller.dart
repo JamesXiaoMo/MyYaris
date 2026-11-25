@@ -1,7 +1,11 @@
+import 'dart:async';
+import 'dart:convert';
 import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../models/music_queue_models.dart';
 import 'backend_client.dart';
+import 'music_cache_service.dart';
 
 enum CircuitBreakerAction {
   skipToNext,
@@ -177,6 +181,132 @@ class CarMusicQueueController {
   final ValueNotifier<int> queueVersionNotifier = ValueNotifier(0);
   final ValueNotifier<NeteaseQueueTrackItem?> currentTrackNotifier = ValueNotifier(null);
   final ValueNotifier<PlaybackMode> appliedModeNotifier = ValueNotifier(PlaybackMode.listLoop);
+
+  static const String _prefSavedQueueKey = 'myyaris_saved_queue_snapshot_v1';
+
+  /// Persists the active queue snapshot, cursor, and mode locally so offline cold boot
+  /// can immediately resume the exact last playlist in order with zero network delay.
+  Future<void> persistActiveQueueToDisk() async {
+    if (_tracks.isEmpty || _queueId.isEmpty) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final payload = {
+        'queue_id': _queueId,
+        'queue_version': _queueVersion,
+        'source': _queueSource,
+        'name': _queueName,
+        'total': _total,
+        'is_complete': _isComplete,
+        'current_index': _currentIndex,
+        'applied_mode': _appliedMode.value,
+        'tracks': _tracks
+            .map((t) => {
+                  'track_id': t.trackId,
+                  'song_id': t.songId,
+                  'title': t.title,
+                  'artist': t.artist,
+                  'album': t.album,
+                  'duration_ms': t.durationMs,
+                  'cover_url': t.coverUrl,
+                  'stream_url': t.streamUrl,
+                  'fee': t.fee,
+                  'playable': t.playable,
+                  'queue_index': t.queueIndex,
+                })
+            .toList(growable: false),
+      };
+      await prefs.setString(_prefSavedQueueKey, jsonEncode(payload));
+    } catch (_) {}
+  }
+
+  /// Restores the last persisted queue silently on startup if no queue is loaded yet.
+  Future<bool> restoreLastQueueFromDisk() async {
+    if (_tracks.isNotEmpty) return true;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_prefSavedQueueKey);
+      if (raw == null || raw.isEmpty) return false;
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map<String, dynamic>) return false;
+      final rawTracks = decoded['tracks'];
+      if (rawTracks is! List || rawTracks.isEmpty) return false;
+
+      final restored = <NeteaseQueueTrackItem>[];
+      for (var i = 0; i < rawTracks.length; i++) {
+        final item = rawTracks[i];
+        if (item is Map) {
+          restored.add(
+            NeteaseQueueTrackItem.fromJson(
+              Map<String, dynamic>.from(item),
+              fallbackIndex: i,
+            ),
+          );
+        }
+      }
+      if (restored.isEmpty) return false;
+
+      _queueId = (decoded['queue_id'] ?? 'q_offline_restored').toString();
+      _queueVersion = (decoded['queue_version'] as num?)?.toInt() ?? 1;
+      _queueSource = (decoded['source'] ?? QueueSource.neteaseFavorite).toString();
+      _queueName = decoded['name']?.toString();
+      _total = (decoded['total'] as num?)?.toInt() ?? restored.length;
+      _isComplete = decoded['is_complete'] == true;
+      _tracks
+        ..clear()
+        ..addAll(restored);
+      _isFullyLoaded = _tracks.length >= _total;
+      final savedIdx = (decoded['current_index'] as num?)?.toInt() ?? 0;
+      _currentIndex = savedIdx.clamp(0, _tracks.length - 1);
+      final mode = PlaybackMode.fromString(decoded['applied_mode']?.toString());
+      _appliedMode = mode;
+      _requestedMode = mode;
+      if (_appliedMode == PlaybackMode.shuffle) {
+        _generateShuffleOrder(seedIndex: _currentIndex);
+      }
+      queueVersionNotifier.value = _queueVersion;
+      appliedModeNotifier.value = _appliedMode;
+      currentTrackNotifier.value = currentTrack;
+      debugPrint(
+        '[CarMusicQueue] Restored ${_tracks.length} tracks from disk (source=$_queueSource, idx=$_currentIndex)',
+      );
+      return true;
+    } catch (e) {
+      debugPrint('[CarMusicQueue] Restore queue from disk note: $e');
+      return false;
+    }
+  }
+
+  /// Advances to the next locally cached track when offline (0 network wait).
+  NeteaseQueueTrackItem? getNextCachedTrack() {
+    if (_tracks.isEmpty) return null;
+    final cache = MusicCacheService();
+    for (var step = 1; step <= _tracks.length; step++) {
+      final idx = (_currentIndex + step) % _tracks.length;
+      if (cache.getCachedFile(_tracks[idx].songId) != null) {
+        _currentIndex = idx;
+        currentTrackNotifier.value = currentTrack;
+        unawaited(persistActiveQueueToDisk());
+        return currentTrack;
+      }
+    }
+    return null;
+  }
+
+  /// Steps to the previous locally cached track when offline (0 network wait).
+  NeteaseQueueTrackItem? getPreviousCachedTrack() {
+    if (_tracks.isEmpty) return null;
+    final cache = MusicCacheService();
+    for (var step = 1; step <= _tracks.length; step++) {
+      final idx = (_currentIndex - step + _tracks.length) % _tracks.length;
+      if (cache.getCachedFile(_tracks[idx].songId) != null) {
+        _currentIndex = idx;
+        currentTrackNotifier.value = currentTrack;
+        unawaited(persistActiveQueueToDisk());
+        return currentTrack;
+      }
+    }
+    return null;
+  }
 
   void configure({
     required String baseUrl,
@@ -508,6 +638,7 @@ class CarMusicQueueController {
 
     queueVersionNotifier.value = _queueVersion;
     currentTrackNotifier.value = currentTrack;
+    unawaited(persistActiveQueueToDisk());
     debugPrint('[CarMusicQueue] Queue atomically applied: $_queueId v$_queueVersion ($_total tracks, source=$_queueSource, index=$_currentIndex)');
   }
 
@@ -712,6 +843,7 @@ class CarMusicQueueController {
       final nextIdx = _shuffleIndices[_shufflePosition];
       _currentIndex = nextIdx.clamp(0, _tracks.length - 1);
       currentTrackNotifier.value = currentTrack;
+      unawaited(persistActiveQueueToDisk());
       return currentTrack;
     }
 
@@ -772,6 +904,7 @@ class CarMusicQueueController {
     // Default: listLoop
     _currentIndex = (_currentIndex + 1) % _tracks.length;
     currentTrackNotifier.value = currentTrack;
+    unawaited(persistActiveQueueToDisk());
     return currentTrack;
   }
 
@@ -808,6 +941,7 @@ class CarMusicQueueController {
     // Default: listLoop
     _currentIndex = (_currentIndex - 1 + _tracks.length) % _tracks.length;
     currentTrackNotifier.value = currentTrack;
+    unawaited(persistActiveQueueToDisk());
     return currentTrack;
   }
 
@@ -820,6 +954,7 @@ class CarMusicQueueController {
         _generateShuffleOrder(seedIndex: _currentIndex);
       }
       currentTrackNotifier.value = currentTrack;
+      unawaited(persistActiveQueueToDisk());
       return true;
     }
     return false;
@@ -832,6 +967,7 @@ class CarMusicQueueController {
         _generateShuffleOrder(seedIndex: _currentIndex);
       }
       currentTrackNotifier.value = currentTrack;
+      unawaited(persistActiveQueueToDisk());
       return true;
     }
     return false;

@@ -221,13 +221,32 @@ class BuiltInPlayerService {
       await _player.setLoopMode(LoopMode.off);
       await _player.setShuffleModeEnabled(false);
 
-      // 3. Start in-app loopback proxy & init SD-card music cache
+      // 3. Start in-app loopback proxy & init SD-card music cache BEFORE restoring last queue
       try {
         await InAppAudioStreamProxy().start();
       } catch (e) {
         debugPrint('[BuiltInPlayer] InAppAudioStreamProxy start note: $e');
       }
-      unawaited(MusicCacheService().init());
+      await MusicCacheService().init();
+      final restoredQueue = await CarMusicQueueController().restoreLastQueueFromDisk();
+      if (restoredQueue && _activeRemoteTrack == null) {
+        final cur = CarMusicQueueController().currentTrack;
+        if (cur != null) {
+          final isCached = MusicCacheService().getCachedFile(cur.songId) != null;
+          _savedLastTrack ??= cur;
+          _activeRemoteTrack = LocalTrackItem(
+            id: cur.trackId,
+            title: cur.title,
+            artist: cur.artist,
+            assetPath: cur.streamUrl,
+            isLocal: isCached,
+            durationDesc: '${cur.durationMs ~/ 1000}秒${isCached ? " • 本地 SD 缓存" : ""}',
+            tag: isCached ? 'SD 离线' : (cur.album ?? '网络歌单'),
+            coverUrl: cur.coverUrl,
+          );
+          activeRemoteTrackNotifier.value = _activeRemoteTrack;
+        }
+      }
 
       _isInitialized = true;
       debugPrint('[BuiltInPlayer] Initialized successfully with ${tracks.length} tracks.');
@@ -289,29 +308,30 @@ class BuiltInPlayerService {
     _loadingSource = true;
     try {
       if (track.playable == false) throw StateError('歌曲当前不可播放');
-      String fullStreamUrl = track.streamUrl;
-      if (fullStreamUrl.startsWith('/')) {
-        fullStreamUrl = '$_currentBaseUrl$fullStreamUrl';
-      }
 
-      final streamUri = Uri.parse(fullStreamUrl);
-      final backendUri = Uri.parse(_currentBaseUrl);
-      if (streamUri.scheme != 'https' || streamUri.host.isEmpty ||
-          streamUri.userInfo.isNotEmpty || streamUri.host != backendUri.host ||
-          streamUri.port != backendUri.port) {
-        throw StateError('媒体流地址不受信任，需要后端 HTTPS 代理');
-      }
+      // Check local SD-card cache FIRST for instant (<50ms) zero-network playback!
+      final cachedFile = MusicCacheService().getCachedFile(track.songId);
+      final bool playedFromCache = cachedFile != null;
+      String fullStreamUrl = track.streamUrl;
       final token = headers?['X-Device-Token'] ??
           headers?['Authorization']?.replaceAll('Bearer ', '') ??
           _currentDeviceToken;
 
-      final cachedFile = MusicCacheService().getCachedFile(track.songId);
-      final bool playedFromCache = cachedFile != null;
       final AudioSource source;
       if (playedFromCache) {
         source = AudioSource.file(cachedFile.path);
         debugPrint('[BuiltInPlayer] Playing song ${track.songId} from local SD cache (0 data)');
       } else {
+        if (fullStreamUrl.startsWith('/')) {
+          fullStreamUrl = '$_currentBaseUrl$fullStreamUrl';
+        }
+        final streamUri = Uri.parse(fullStreamUrl);
+        final backendUri = Uri.parse(_currentBaseUrl);
+        if (streamUri.scheme != 'https' || streamUri.host.isEmpty ||
+            streamUri.userInfo.isNotEmpty || streamUri.host != backendUri.host ||
+            streamUri.port != backendUri.port) {
+          throw StateError('媒体流地址不受信任，需要后端 HTTPS 代理');
+        }
         final resolvedUrl = InAppAudioStreamProxy().resolveStreamUrl(
           fullStreamUrl,
           token: token,
@@ -337,11 +357,14 @@ class BuiltInPlayerService {
         tag: playedFromCache ? 'SD 离线' : (track.album ?? '网络歌单'),
         coverUrl: track.coverUrl,
       );
-      unawaited(_prefetchNextTrackOnBackend());
+      if (!playedFromCache) {
+        unawaited(_prefetchNextTrackOnBackend());
+      }
       activeRemoteTrackNotifier.value = _activeRemoteTrack;
       _savedLastTrack = track;
       _savedLastPositionMs = (initialPosition ?? Duration.zero).inMilliseconds;
       unawaited(_persistLastTrack(track, _savedLastPositionMs));
+      unawaited(CarMusicQueueController().persistActiveQueueToDisk());
 
       if (startPlaying) {
         unawaited(_player.play().catchError((Object _) {}));

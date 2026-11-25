@@ -7,6 +7,7 @@ import 'backend_client.dart';
 import 'built_in_player_service.dart';
 import 'in_app_audio_stream_proxy.dart';
 import 'car_music_queue_controller.dart';
+import 'music_cache_service.dart';
 import '../models/music_queue_models.dart';
 
 enum MusicSyncMode {
@@ -386,6 +387,10 @@ class CarMusicSyncService {
   /// orchestration when server-side queue preparation is required.
   Future<void> requestLocalCommand(String action, [Map<String, dynamic> params = const {}]) async {
     final queueCtrl = CarMusicQueueController();
+    if (queueCtrl.tracks.isEmpty &&
+        (action == 'resume' || action == 'next' || action == 'prev' || action == 'previous')) {
+      await queueCtrl.restoreLastQueueFromDisk();
+    }
     final canExecuteLocally = switch (action) {
       'pause' || 'stop' => true,
       'resume' => _playerService.activeRemoteTrack != null || queueCtrl.tracks.isNotEmpty,
@@ -719,7 +724,18 @@ class CarMusicSyncService {
           final sameQueue = (serverQueueId == null || serverQueueId == queueCtrl.queueId) &&
               (serverQueueVersion == null || serverQueueVersion == queueCtrl.queueVersion);
           if (sameQueue && queueCtrl.currentTrack != null) {
-            if (prevActiveTrack?.id == queueCtrl.currentTrack?.trackId) {
+            final curTrack = queueCtrl.currentTrack!;
+            // When offline and current track is not cached locally, jump straight to next cached SD track (0 wait)
+            if (!isHealthyNotifier.value &&
+                _playerService.player.audioSource == null &&
+                MusicCacheService().getCachedFile(curTrack.songId) == null) {
+              final cached = queueCtrl.getNextCachedTrack();
+              if (cached != null) {
+                await _playerService.playQueueTrack(cached, startPlaying: true, rethrowOnError: true);
+                break;
+              }
+            }
+            if (prevActiveTrack?.id == curTrack.trackId) {
               if (seek is num) await _playerService.seek(Duration(milliseconds: seek.toInt()));
               await _playerService.play();
             } else {
@@ -761,11 +777,25 @@ class CarMusicSyncService {
           break;
 
         case 'next':
+          if (!isHealthyNotifier.value && queueCtrl.tracks.isNotEmpty) {
+            final cached = queueCtrl.getNextCachedTrack();
+            if (cached != null) {
+              await _playerService.playQueueTrack(cached, startPlaying: true);
+              break;
+            }
+          }
           await _playerService.skipToNext();
           break;
 
         case 'prev':
         case 'previous':
+          if (!isHealthyNotifier.value && queueCtrl.tracks.isNotEmpty) {
+            final cached = queueCtrl.getPreviousCachedTrack();
+            if (cached != null) {
+              await _playerService.playQueueTrack(cached, startPlaying: true);
+              break;
+            }
+          }
           await _playerService.skipToPrevious();
           break;
 
