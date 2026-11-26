@@ -60,11 +60,31 @@ class BuiltInPlayerService {
   double _aiVoiceVolume = 0.95;
   double get aiVoiceVolume => _aiVoiceVolume;
   final ValueNotifier<double> aiVoiceVolumeNotifier = ValueNotifier<double>(0.95);
+  bool _voiceDuckActive = false;
+  bool _osFocusDucked = false;
+  Future<void> _voiceReplyTail = Future.value();
+
+  Future<void> _applyMusicVolume() async {
+    final double target;
+    if (_voiceDuckActive) {
+      target = (_currentVolume * 0.20).clamp(0.03, 0.25);
+    } else if (_osFocusDucked) {
+      target = (_currentVolume * 0.50).clamp(0.05, 1.0);
+    } else {
+      target = _currentVolume;
+    }
+    try {
+      await _player.setVolume(target);
+    } catch (_) {}
+  }
 
   Future<void> setAiVoiceVolume(double value) async {
     final clamped = value.clamp(0.1, 1.0);
     _aiVoiceVolume = clamped;
     aiVoiceVolumeNotifier.value = clamped;
+    try {
+      await _sfxPlayer?.setVolume(clamped);
+    } catch (_) {}
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setDouble(_savedAiVoiceVolumeKey, clamped);
@@ -154,8 +174,9 @@ class BuiltInPlayerService {
           _resumeAfterInterruption = _player.playing;
           switch (event.type) {
             case AudioInterruptionType.duck:
-              debugPrint('[BuiltInPlayer] Audio focus ducking: lowering volume from $_currentVolume to ${_currentVolume * 0.5}');
-              _player.setVolume((_currentVolume * 0.5).clamp(0.0, 1.0));
+              debugPrint('[BuiltInPlayer] Audio focus ducking');
+              _osFocusDucked = true;
+              unawaited(_applyMusicVolume());
               break;
             case AudioInterruptionType.pause:
             case AudioInterruptionType.unknown:
@@ -166,8 +187,9 @@ class BuiltInPlayerService {
         } else {
           switch (event.type) {
             case AudioInterruptionType.duck:
-              debugPrint('[BuiltInPlayer] Audio focus unduck: restoring volume to $_currentVolume');
-              _player.setVolume(_currentVolume);
+              debugPrint('[BuiltInPlayer] Audio focus unduck');
+              _osFocusDucked = false;
+              unawaited(_applyMusicVolume());
               break;
             case AudioInterruptionType.pause:
               debugPrint('[BuiltInPlayer] Audio focus restored: resuming playback');
@@ -494,57 +516,111 @@ class BuiltInPlayerService {
 
   /// Ducks music volume sharply while the driver is speaking to the AI assistant.
   Future<void> duckForVoiceInput() async {
-    try {
-      final duckVol = (_currentVolume * 0.15).clamp(0.03, 0.25);
-      await _player.setVolume(duckVol);
-    } catch (_) {}
+    _voiceDuckActive = true;
+    await _applyMusicVolume();
   }
 
   /// Restores music volume back to the user's configured level.
   Future<void> restoreMusicVolume() async {
-    try {
-      await _player.setVolume(_currentVolume);
-    } catch (_) {}
+    _voiceDuckActive = false;
+    await _applyMusicVolume();
   }
 
   /// Plays a Chinese AI TTS voice response over ducked music, then restores volume.
   /// Returns true only when cloud audio loaded and played cleanly; false triggers offline TTS fallback.
-  Future<bool> playVoiceReply(String ttsUrl) async {
+  Future<bool> playVoiceReply(
+    String ttsUrl, {
+    String? baseUrl,
+    String? token,
+  }) async {
+    final completer = Completer<bool>();
+    final prev = _voiceReplyTail;
+    _voiceReplyTail = completer.future.then((_) {}, onError: (_) {});
+    await prev;
+    try {
+      final ok = await _playVoiceReplyInternal(
+        ttsUrl,
+        baseUrl: baseUrl,
+        token: token,
+      );
+      completer.complete(ok);
+      return ok;
+    } catch (e) {
+      completer.complete(false);
+      return false;
+    }
+  }
+
+  Future<bool> _playVoiceReplyInternal(
+    String ttsUrl, {
+    String? baseUrl,
+    String? token,
+  }) async {
     if (ttsUrl.trim().isEmpty) {
       await restoreMusicVolume();
       return false;
     }
     try {
+      var effectiveBase = (baseUrl ?? _currentBaseUrl).trim();
+      while (effectiveBase.endsWith('/')) {
+        effectiveBase = effectiveBase.substring(0, effectiveBase.length - 1);
+      }
+      final effectiveToken = (token != null && token.trim().isNotEmpty)
+          ? token.trim()
+          : _currentDeviceToken;
+
       String fullUrl = ttsUrl.trim();
-      if (fullUrl.startsWith('/') && _currentBaseUrl.isNotEmpty) {
-        fullUrl = '$_currentBaseUrl$fullUrl';
+      if (fullUrl.startsWith('/')) {
+        if (effectiveBase.isEmpty) {
+          debugPrint('[BuiltInPlayer] Voice reply skipped: missing baseUrl for relative TTS URL');
+          return false;
+        }
+        fullUrl = '$effectiveBase$fullUrl';
       }
       final resolved = InAppAudioStreamProxy().resolveStreamUrl(
         fullUrl,
-        token: _currentDeviceToken,
+        token: effectiveToken,
       );
-      _sfxPlayer ??= AudioPlayer();
-      final duckVol = (_currentVolume * 0.28).clamp(0.05, 0.35);
-      await _player.setVolume(duckVol);
+
+      // Disable AudioSession interruption handling on _sfxPlayer so it NEVER fights
+      // _player for audio focus or gets ducked to 50% by CAR NAVITIME / Android focus events.
+      _sfxPlayer ??= AudioPlayer(
+        handleInterruptions: false,
+        androidApplyAudioAttributes: false,
+      );
+
+      _voiceDuckActive = true;
+      await _applyMusicVolume();
+
+      // Always reset prior completed state before setting the new clip
+      try {
+        await _sfxPlayer!.stop();
+      } catch (_) {}
+
       await _sfxPlayer!.setVolume(_aiVoiceVolume);
-      await _sfxPlayer!.setAudioSource(AudioSource.uri(Uri.parse(resolved))).timeout(
-        const Duration(seconds: 6),
-      );
+      final duration = await _sfxPlayer!
+          .setAudioSource(AudioSource.uri(Uri.parse(resolved)), preload: true)
+          .timeout(const Duration(seconds: 6));
+
+      final waitSec = duration != null && duration.inSeconds > 0
+          ? (duration.inSeconds + 5).clamp(6, 25)
+          : 15;
       var timedOut = false;
       final done = _sfxPlayer!.playerStateStream
           .firstWhere((s) => s.processingState == ProcessingState.completed)
-          .timeout(const Duration(seconds: 15), onTimeout: () {
+          .timeout(Duration(seconds: waitSec), onTimeout: () {
             timedOut = true;
             return _sfxPlayer!.playerState;
           });
-      await _sfxPlayer!.play();
+      await _sfxPlayer!.setVolume(_aiVoiceVolume);
+      unawaited(_sfxPlayer!.play().catchError((Object _) {}));
       await done;
       if (timedOut) {
         try {
           await _sfxPlayer!.stop();
         } catch (_) {}
       }
-      return true;
+      return !timedOut;
     } catch (e) {
       debugPrint('[BuiltInPlayer] Voice reply playback note: $e');
       return false;
@@ -629,11 +705,44 @@ class BuiltInPlayerService {
 
   Future<void> setVolume(double val) async {
     _currentVolume = val.clamp(0.0, 1.0);
-    await _player.setVolume(_currentVolume);
+    await _applyMusicVolume();
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setDouble(_savedVolumeKey, _currentVolume);
     } catch (_) {}
+  }
+
+  /// Immediately caches the currently active Netease track to SD card (even if cache-on-play is off).
+  Future<bool> cacheCurrentTrackNow({
+    required String baseUrl,
+    required String token,
+  }) async {
+    final queueTrack = CarMusicQueueController().currentTrack ?? _savedLastTrack;
+    int songId = queueTrack?.songId ?? 0;
+    String streamUrl = queueTrack?.streamUrl ?? '';
+    if (songId <= 0) {
+      final match = RegExp(r'(\d+)').firstMatch(currentTrack.id);
+      if (match != null) {
+        songId = int.tryParse(match.group(1)!) ?? 0;
+      }
+    }
+    if (songId <= 0) return false;
+    var effectiveBase = baseUrl.trim();
+    while (effectiveBase.endsWith('/')) {
+      effectiveBase = effectiveBase.substring(0, effectiveBase.length - 1);
+    }
+    if (streamUrl.isEmpty) {
+      streamUrl = '/api/v1/music/netease/stream/$songId';
+    }
+    if (streamUrl.startsWith('/')) {
+      if (effectiveBase.isEmpty) return false;
+      streamUrl = '$effectiveBase$streamUrl';
+    }
+    return MusicCacheService().downloadTrack(
+      songId: songId,
+      fullStreamUrl: streamUrl,
+      token: token.trim(),
+    );
   }
 
   Future<void> dispose() async {

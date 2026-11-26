@@ -59,11 +59,15 @@ class CarVoiceAssistantService extends ChangeNotifier {
   static const MethodChannel _locationChannel =
       MethodChannel('com.myyaris.my_yaris/location');
   static const String _prefWakeWordEnabled = 'myyaris_wake_word_enabled';
+  static const String _prefStartupBriefingEnabled = 'myyaris_startup_briefing_enabled';
+  static const String _prefLastBriefingMs = 'myyaris_last_briefing_ms';
 
   IStorageService? _storage;
   bool _wakeWordInitialized = false;
+  bool _briefingScheduled = false;
   final ValueNotifier<bool> wakeWordEnabledNotifier = ValueNotifier<bool>(true);
   final ValueNotifier<bool> wakeWordListeningNotifier = ValueNotifier<bool>(false);
+  final ValueNotifier<bool> startupBriefingEnabledNotifier = ValueNotifier<bool>(true);
   String? _wakeWordNote;
 
   VoiceAssistantState _state = VoiceAssistantState.idle;
@@ -83,6 +87,7 @@ class CarVoiceAssistantService extends ChangeNotifier {
   bool get bannerVisible => _bannerVisible;
   bool get wakeWordEnabled => wakeWordEnabledNotifier.value;
   bool get wakeWordListening => wakeWordListeningNotifier.value;
+  bool get startupBriefingEnabled => startupBriefingEnabledNotifier.value;
   String? get wakeWordNote => _wakeWordNote;
 
   bool get isRecording => _state == VoiceAssistantState.recording;
@@ -100,9 +105,81 @@ class CarVoiceAssistantService extends ChangeNotifier {
       final prefs = await SharedPreferences.getInstance();
       final saved = prefs.getBool(_prefWakeWordEnabled) ?? true;
       wakeWordEnabledNotifier.value = saved;
+      startupBriefingEnabledNotifier.value =
+          prefs.getBool(_prefStartupBriefingEnabled) ?? true;
       await _syncWakeWordToNative(saved);
     } catch (e) {
       debugPrint('[VoiceAssistant] initWakeWord note: $e');
+    }
+  }
+
+  Future<void> setStartupBriefingEnabled(bool enabled) async {
+    startupBriefingEnabledNotifier.value = enabled;
+    notifyListeners();
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_prefStartupBriefingEnabled, enabled);
+    } catch (_) {}
+  }
+
+  /// Speaks a concise Chinese startup briefing once per drive (30-min cooldown)
+  /// after network and GPS settle.
+  Future<void> maybeSpeakStartupBriefing(IStorageService storage) async {
+    _storage = storage;
+    if (_briefingScheduled) return;
+    _briefingScheduled = true;
+
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final enabled = prefs.getBool(_prefStartupBriefingEnabled) ?? true;
+      startupBriefingEnabledNotifier.value = enabled;
+      if (!enabled) return;
+
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      final lastMs = prefs.getInt(_prefLastBriefingMs) ?? 0;
+      if (lastMs > 0 && (nowMs - lastMs) < const Duration(minutes: 30).inMilliseconds) {
+        return;
+      }
+
+      // Wait ~8s for Tailscale / GPS / OBD startup handshake to settle
+      await Future<void>.delayed(const Duration(seconds: 8));
+      if (!startupBriefingEnabledNotifier.value || isBusy || isRecording) return;
+
+      final baseUrl = _normalizeBaseUrl(storage.backendUrl);
+      if (baseUrl.isEmpty || storage.carToken.trim().isEmpty) return;
+
+      final loc = await _tryGetLastGps();
+      final uri = Uri.parse('$baseUrl/api/v1/assistant/briefing');
+      final payload = utf8.encode(
+        jsonEncode({
+          'device_id': storage.deviceId,
+          'lat': ?loc?.$1,
+          'lng': ?loc?.$2,
+        }),
+      );
+      final client = HttpClient()..connectionTimeout = const Duration(seconds: 6);
+      try {
+        final req = await client.postUrl(uri).timeout(const Duration(seconds: 8));
+        req.headers.set('Authorization', 'Bearer ${storage.carToken}');
+        req.headers.set('X-Device-Token', storage.carToken);
+        req.headers.set('Content-Type', 'application/json; charset=utf-8');
+        req.add(payload);
+        final resp = await req.close().timeout(const Duration(seconds: 12));
+        final raw = await resp.transform(utf8.decoder).join();
+        if (resp.statusCode < 200 || resp.statusCode >= 300) return;
+        final decoded = jsonDecode(raw);
+        if (decoded is! Map) return;
+        final data = Map<String, dynamic>.from(decoded);
+        final reply = (data['reply_text'] ?? '').toString().trim();
+        if (reply.isEmpty || isBusy || isRecording) return;
+
+        await prefs.setInt(_prefLastBriefingMs, DateTime.now().millisecondsSinceEpoch);
+        await _applyAssistantResponse(data, storage: storage);
+      } finally {
+        client.close(force: true);
+      }
+    } catch (e) {
+      debugPrint('[VoiceAssistant] Startup briefing skipped: $e');
     }
   }
 
@@ -311,7 +388,7 @@ class CarVoiceAssistantService extends ChangeNotifier {
         lat: loc?.$1,
         lng: loc?.$2,
       );
-      await _applyAssistantResponse(respJson);
+      await _applyAssistantResponse(respJson, storage: storage);
     } catch (e) {
       await BuiltInPlayerService().restoreMusicVolume();
       _setError('AI 助手连接失败：$e');
@@ -351,7 +428,11 @@ class CarVoiceAssistantService extends ChangeNotifier {
           final ttsUrl =
               decoded is Map ? (decoded['tts_url'] ?? '').toString().trim() : '';
           if (ttsUrl.isNotEmpty) {
-            playedCloud = await BuiltInPlayerService().playVoiceReply(ttsUrl);
+            playedCloud = await BuiltInPlayerService().playVoiceReply(
+              ttsUrl,
+              baseUrl: baseUrl,
+              token: storage.carToken,
+            );
           }
         }
       } catch (e) {
@@ -407,14 +488,18 @@ class CarVoiceAssistantService extends ChangeNotifier {
         lat: loc?.$1,
         lng: loc?.$2,
       );
-      await _applyAssistantResponse(respJson);
+      await _applyAssistantResponse(respJson, storage: storage);
     } catch (e) {
       await BuiltInPlayerService().restoreMusicVolume();
       _setError('选点失败：$e');
     }
   }
 
-  Future<void> _applyAssistantResponse(Map<String, dynamic> data) async {
+  Future<void> _applyAssistantResponse(
+    Map<String, dynamic> data, {
+    IStorageService? storage,
+  }) async {
+    final effectiveStorage = storage ?? _storage;
     _transcript = (data['transcript'] ?? '').toString().trim();
     _replyText = (data['reply_text'] ?? '').toString().trim();
     final rawCands = data['candidates'];
@@ -427,14 +512,67 @@ class CarVoiceAssistantService extends ChangeNotifier {
       _candidates = const [];
     }
 
+    // Execute optional local client action (volume adjustment, SD-card cache)
+    final rawAction = data['client_action'];
+    if (rawAction is Map) {
+      final actionMap = Map<String, dynamic>.from(rawAction);
+      final actionType = (actionMap['type'] ?? '').toString().trim();
+      if (actionType == 'adjust_volume') {
+        final target = (actionMap['target'] ?? 'music').toString().trim();
+        final delta = (actionMap['delta'] is num)
+            ? (actionMap['delta'] as num).toDouble()
+            : 0.0;
+        if (target == 'ai') {
+          await BuiltInPlayerService().setAiVoiceVolume(
+            (BuiltInPlayerService().aiVoiceVolume + delta).clamp(0.1, 1.0),
+          );
+        } else {
+          await BuiltInPlayerService().setVolume(
+            (BuiltInPlayerService().currentVolume + delta).clamp(0.05, 1.0),
+          );
+        }
+      } else if (actionType == 'cache_current' && effectiveStorage != null) {
+        unawaited(
+          BuiltInPlayerService().cacheCurrentTrackNow(
+            baseUrl: _normalizeBaseUrl(effectiveStorage.backendUrl),
+            token: effectiveStorage.carToken,
+          ),
+        );
+      }
+    }
+
     final ttsUrl = (data['tts_url'] ?? '').toString().trim();
+    var playedCloud = false;
     if (ttsUrl.isNotEmpty) {
+      await _pauseWakeWord();
       _state = VoiceAssistantState.speaking;
       _statusText = 'AI 语音播报中…';
       _bannerVisible = true;
       notifyListeners();
-      await BuiltInPlayerService().playVoiceReply(ttsUrl);
-    } else {
+      playedCloud = await BuiltInPlayerService().playVoiceReply(
+        ttsUrl,
+        baseUrl: effectiveStorage != null
+            ? _normalizeBaseUrl(effectiveStorage.backendUrl)
+            : null,
+        token: effectiveStorage?.carToken,
+      );
+    }
+    if (!playedCloud && _replyText.isNotEmpty) {
+      await _pauseWakeWord();
+      await BuiltInPlayerService().duckForVoiceInput();
+      try {
+        await _voiceChannel
+            .invokeMethod<bool>('speakOfflineTts', {
+              'text': _replyText,
+              'volume': BuiltInPlayerService().aiVoiceVolume,
+            })
+            .timeout(const Duration(seconds: 12));
+      } catch (e) {
+        debugPrint('[VoiceAssistant] Offline fallback TTS note: $e');
+      } finally {
+        await BuiltInPlayerService().restoreMusicVolume();
+      }
+    } else if (!playedCloud) {
       await BuiltInPlayerService().restoreMusicVolume();
     }
 

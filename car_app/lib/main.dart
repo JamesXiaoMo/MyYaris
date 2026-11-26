@@ -63,9 +63,10 @@ void main() async {
     );
   }
 
-  // 4. Start CAR NAVITIME Chinese voice guide listener & offline "Hey Yaris" wake word
+  // 4. Start CAR NAVITIME Chinese voice guide listener, offline "Hey Yaris" wake word & startup briefing
   unawaited(NavitimeGuideService().init(storage));
   unawaited(CarVoiceAssistantService().initWakeWord(storage));
+  unawaited(CarVoiceAssistantService().maybeSpeakStartupBriefing(storage));
 
   runApp(MyYarisApp(storage: storage, poller: poller));
 }

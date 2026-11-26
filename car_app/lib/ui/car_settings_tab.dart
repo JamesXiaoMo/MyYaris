@@ -796,13 +796,26 @@ class _CarSettingsTabState extends State<CarSettingsTab> {
                                             final statusLabel = !enabled
                                                 ? '已关闭'
                                                 : (listening ? '离线监听中' : (voiceSvc.wakeWordNote ?? '待就绪'));
-                                            return _SettingsSwitchRow(
-                                              icon: Icons.mic_rounded,
-                                              title: 'Hey Yaris 语音唤醒（$statusLabel）',
-                                              value: enabled,
-                                              onChanged: (v) {
-                                                voiceSvc.setWakeWordEnabled(v);
-                                              },
+                                            return Column(
+                                              children: [
+                                                _SettingsSwitchRow(
+                                                  icon: Icons.mic_rounded,
+                                                  title: 'Hey Yaris 语音唤醒（$statusLabel）',
+                                                  value: enabled,
+                                                  onChanged: (v) {
+                                                    voiceSvc.setWakeWordEnabled(v);
+                                                  },
+                                                ),
+                                                const Divider(height: 1, color: YarisCarTheme.line),
+                                                _SettingsSwitchRow(
+                                                  icon: Icons.wb_sunny_rounded,
+                                                  title: '上车自动语音简报',
+                                                  value: voiceSvc.startupBriefingEnabled,
+                                                  onChanged: (v) {
+                                                    voiceSvc.setStartupBriefingEnabled(v);
+                                                  },
+                                                ),
+                                              ],
                                             );
                                           },
                                         ),
