@@ -46,6 +46,7 @@ class BuiltInPlayerService {
   bool get isInitialized => _isInitialized;
 
   static const String _savedVolumeKey = 'myyaris_saved_music_volume';
+  static const String _savedAiVoiceVolumeKey = 'myyaris_saved_ai_voice_volume';
   static const String _savedLastTrackKey = 'myyaris_saved_last_track_v1';
 
   NeteaseQueueTrackItem? _savedLastTrack;
@@ -56,6 +57,19 @@ class BuiltInPlayerService {
   // Safe initial low volume to prevent blasting car speakers
   double _currentVolume = 0.25;
   double get currentVolume => _currentVolume;
+  double _aiVoiceVolume = 0.95;
+  double get aiVoiceVolume => _aiVoiceVolume;
+  final ValueNotifier<double> aiVoiceVolumeNotifier = ValueNotifier<double>(0.95);
+
+  Future<void> setAiVoiceVolume(double value) async {
+    final clamped = value.clamp(0.1, 1.0);
+    _aiVoiceVolume = clamped;
+    aiVoiceVolumeNotifier.value = clamped;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setDouble(_savedAiVoiceVolumeKey, clamped);
+    } catch (_) {}
+  }
 
   List<LocalTrackItem> get tracks => CarMusicQueueController().tracks.map((t) => LocalTrackItem(
     id: t.trackId, title: t.title, artist: t.artist, assetPath: t.streamUrl,
@@ -194,6 +208,11 @@ class BuiltInPlayerService {
         final saved = prefs.getDouble(_savedVolumeKey);
         if (saved != null && saved >= 0.05 && saved <= 1.0) {
           _currentVolume = saved;
+        }
+        final savedAi = prefs.getDouble(_savedAiVoiceVolumeKey);
+        if (savedAi != null && savedAi >= 0.1 && savedAi <= 1.0) {
+          _aiVoiceVolume = savedAi;
+          aiVoiceVolumeNotifier.value = savedAi;
         }
         final rawLast = prefs.getString(_savedLastTrackKey);
         if (rawLast != null && rawLast.isNotEmpty) {
@@ -507,7 +526,7 @@ class BuiltInPlayerService {
       _sfxPlayer ??= AudioPlayer();
       final duckVol = (_currentVolume * 0.28).clamp(0.05, 0.35);
       await _player.setVolume(duckVol);
-      await _sfxPlayer!.setVolume(1.0);
+      await _sfxPlayer!.setVolume(_aiVoiceVolume);
       await _sfxPlayer!.setAudioSource(AudioSource.uri(Uri.parse(resolved))).timeout(
         const Duration(seconds: 6),
       );

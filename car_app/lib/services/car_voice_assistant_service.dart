@@ -191,15 +191,15 @@ class CarVoiceAssistantService extends ChangeNotifier {
     var playedCloud = false;
     final baseUrl = _normalizeBaseUrl(storage.backendUrl);
     if (baseUrl.isNotEmpty && storage.carToken.trim().isNotEmpty) {
-      final client = HttpClient()..connectionTimeout = const Duration(seconds: 2);
+      final client = HttpClient()..connectionTimeout = const Duration(seconds: 4);
       try {
         final uri = Uri.parse('$baseUrl/api/v1/assistant/tts');
-        final req = await client.postUrl(uri).timeout(const Duration(seconds: 2));
+        final req = await client.postUrl(uri).timeout(const Duration(seconds: 4));
         req.headers.set('Authorization', 'Bearer ${storage.carToken}');
         req.headers.set('X-Device-Token', storage.carToken);
         req.headers.set('Content-Type', 'application/json; charset=utf-8');
         req.add(utf8.encode(jsonEncode({'text': clean})));
-        final resp = await req.close().timeout(const Duration(seconds: 3));
+        final resp = await req.close().timeout(const Duration(seconds: 6));
         final raw = await resp.transform(utf8.decoder).join();
         if (resp.statusCode >= 200 && resp.statusCode < 300) {
           final decoded = jsonDecode(raw);
@@ -219,7 +219,10 @@ class CarVoiceAssistantService extends ChangeNotifier {
     if (!playedCloud) {
       try {
         await _voiceChannel
-            .invokeMethod<bool>('speakOfflineTts', {'text': clean})
+            .invokeMethod<bool>('speakOfflineTts', {
+              'text': clean,
+              'volume': BuiltInPlayerService().aiVoiceVolume,
+            })
             .timeout(const Duration(seconds: 10));
       } catch (e) {
         debugPrint('[VoiceAssistant] Offline TTS note: $e');

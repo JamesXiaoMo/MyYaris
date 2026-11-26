@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import '../models/obd_telemetry.dart';
 import '../services/app_update_service.dart';
 import '../services/backend_client.dart';
+import '../services/built_in_player_service.dart';
 import '../services/car_music_sync_service.dart';
 import '../services/car_obd_service.dart';
 import '../services/music_cache_service.dart';
@@ -783,6 +784,71 @@ class _CarSettingsTabState extends State<CarSettingsTab> {
                                               ),
                                             ],
                                           ),
+                                        ),
+                                        const Divider(height: 1, color: YarisCarTheme.line),
+                                        ValueListenableBuilder<double>(
+                                          valueListenable:
+                                              BuiltInPlayerService().aiVoiceVolumeNotifier,
+                                          builder: (context, aiVol, _) {
+                                            return Padding(
+                                              padding: const EdgeInsets.fromLTRB(14, 10, 14, 8),
+                                              child: Column(
+                                                crossAxisAlignment: CrossAxisAlignment.start,
+                                                children: [
+                                                  Row(
+                                                    children: [
+                                                      const Icon(
+                                                        Icons.volume_up_rounded,
+                                                        size: 18,
+                                                        color: YarisCarTheme.blue,
+                                                      ),
+                                                      const SizedBox(width: 10),
+                                                      const Text(
+                                                        'AI 语音播报音量',
+                                                        style: TextStyle(
+                                                          fontSize: 13.5,
+                                                          fontWeight: FontWeight.w600,
+                                                          color: YarisCarTheme.ink,
+                                                        ),
+                                                      ),
+                                                      const Spacer(),
+                                                      Text(
+                                                        '${(aiVol * 100).round()}%',
+                                                        style: const TextStyle(
+                                                          fontSize: 12.5,
+                                                          fontWeight: FontWeight.w700,
+                                                          color: YarisCarTheme.blue,
+                                                        ),
+                                                      ),
+                                                    ],
+                                                  ),
+                                                  SliderTheme(
+                                                    data: SliderTheme.of(context).copyWith(
+                                                      trackHeight: 4,
+                                                      thumbShape: const RoundSliderThumbShape(
+                                                        enabledThumbRadius: 7,
+                                                      ),
+                                                      overlayShape: const RoundSliderOverlayShape(
+                                                        overlayRadius: 14,
+                                                      ),
+                                                      activeTrackColor: YarisCarTheme.blue,
+                                                      inactiveTrackColor: YarisCarTheme.line,
+                                                      thumbColor: YarisCarTheme.blue,
+                                                    ),
+                                                    child: Slider(
+                                                      value: aiVol.clamp(0.1, 1.0),
+                                                      min: 0.1,
+                                                      max: 1.0,
+                                                      divisions: 18,
+                                                      onChanged: (v) {
+                                                        BuiltInPlayerService().setAiVoiceVolume(v);
+                                                      },
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
+                                            );
+                                          },
                                         ),
                                       ],
                                     );

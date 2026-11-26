@@ -222,11 +222,12 @@ class MainActivity : AudioServiceActivity() {
                 }
                 "speakOfflineTts" -> {
                     val text = (call.argument<String>("text") ?: "").trim()
+                    val vol = ((call.argument<Double>("volume") ?: 0.95).toFloat()).coerceIn(0.1f, 1.0f)
                     if (text.isEmpty()) {
                         result.success(false)
                         return@setMethodCallHandler
                     }
-                    speakOfflineChineseTts(text) { ok ->
+                    speakOfflineChineseTts(text, vol) { ok ->
                         runOnUiThread {
                             try {
                                 result.success(ok)
@@ -249,12 +250,12 @@ class MainActivity : AudioServiceActivity() {
     private val offlineTtsPending = mutableListOf<Pair<String, (Boolean) -> Unit>>()
     private val offlineTtsCallbacks = java.util.concurrent.ConcurrentHashMap<String, (Boolean) -> Unit>()
 
-    private fun speakOfflineChineseTts(text: String, onDone: (Boolean) -> Unit) {
+    private fun speakOfflineChineseTts(text: String, volume: Float = 0.95f, onDone: (Boolean) -> Unit) {
         val dispatchSpeak: (android.speech.tts.TextToSpeech, String, (Boolean) -> Unit) -> Unit = { engine, msg, cb ->
             val uttId = "myyaris_nav_${offlineTtsSeq.incrementAndGet()}"
             offlineTtsCallbacks[uttId] = cb
             val params = android.os.Bundle().apply {
-                putFloat(android.speech.tts.TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
+                putFloat(android.speech.tts.TextToSpeech.Engine.KEY_PARAM_VOLUME, volume)
             }
             val code = engine.speak(msg, android.speech.tts.TextToSpeech.QUEUE_FLUSH, params, uttId)
             if (code != android.speech.tts.TextToSpeech.SUCCESS) {
