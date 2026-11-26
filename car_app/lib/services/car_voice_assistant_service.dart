@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'built_in_player_service.dart';
 import 'navitime_guide_service.dart';
 import 'storage_service.dart';
@@ -57,6 +58,13 @@ class CarVoiceAssistantService extends ChangeNotifier {
       MethodChannel('com.myyaris.my_yaris/voice');
   static const MethodChannel _locationChannel =
       MethodChannel('com.myyaris.my_yaris/location');
+  static const String _prefWakeWordEnabled = 'myyaris_wake_word_enabled';
+
+  IStorageService? _storage;
+  bool _wakeWordInitialized = false;
+  final ValueNotifier<bool> wakeWordEnabledNotifier = ValueNotifier<bool>(true);
+  final ValueNotifier<bool> wakeWordListeningNotifier = ValueNotifier<bool>(false);
+  String? _wakeWordNote;
 
   VoiceAssistantState _state = VoiceAssistantState.idle;
   String _statusText = '';
@@ -73,11 +81,122 @@ class CarVoiceAssistantService extends ChangeNotifier {
   String get replyText => _replyText;
   List<VoicePlaceCandidate> get candidates => _candidates;
   bool get bannerVisible => _bannerVisible;
+  bool get wakeWordEnabled => wakeWordEnabledNotifier.value;
+  bool get wakeWordListening => wakeWordListeningNotifier.value;
+  String? get wakeWordNote => _wakeWordNote;
 
   bool get isRecording => _state == VoiceAssistantState.recording;
   bool get isBusy =>
       _state == VoiceAssistantState.thinking ||
       _state == VoiceAssistantState.speaking;
+
+  /// Initializes offline "Hey Yaris" wake-word listener and native voice callbacks.
+  Future<void> initWakeWord(IStorageService storage) async {
+    _storage = storage;
+    if (_wakeWordInitialized) return;
+    _wakeWordInitialized = true;
+    _voiceChannel.setMethodCallHandler(_handleNativeVoiceCall);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final saved = prefs.getBool(_prefWakeWordEnabled) ?? true;
+      wakeWordEnabledNotifier.value = saved;
+      await _syncWakeWordToNative(saved);
+    } catch (e) {
+      debugPrint('[VoiceAssistant] initWakeWord note: $e');
+    }
+  }
+
+  Future<void> setWakeWordEnabled(bool enabled) async {
+    wakeWordEnabledNotifier.value = enabled;
+    notifyListeners();
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_prefWakeWordEnabled, enabled);
+    } catch (_) {}
+    await _syncWakeWordToNative(enabled);
+  }
+
+  Future<void> _syncWakeWordToNative(bool enabled) async {
+    try {
+      final res = await _voiceChannel.invokeMapMethod<String, dynamic>(
+        'setWakeWordEnabled',
+        {'enabled': enabled},
+      );
+      final listening = res?['listening'] == true;
+      final err = res?['lastError']?.toString();
+      wakeWordListeningNotifier.value = listening;
+      _wakeWordNote = (err != null && err.isNotEmpty) ? err : null;
+      notifyListeners();
+    } catch (e) {
+      wakeWordListeningNotifier.value = false;
+      _wakeWordNote = '$e';
+      notifyListeners();
+    }
+  }
+
+  Future<void> _pauseWakeWord() async {
+    if (!wakeWordEnabledNotifier.value) return;
+    try {
+      await _voiceChannel.invokeMethod('pauseWakeWord');
+      wakeWordListeningNotifier.value = false;
+    } catch (_) {}
+  }
+
+  Future<void> _resumeWakeWord() async {
+    if (!wakeWordEnabledNotifier.value) return;
+    try {
+      await _voiceChannel.invokeMethod('resumeWakeWord');
+      final status = await _voiceChannel.invokeMapMethod<String, dynamic>('getWakeWordStatus');
+      wakeWordListeningNotifier.value = status?['listening'] == true;
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  Future<dynamic> _handleNativeVoiceCall(MethodCall call) async {
+    switch (call.method) {
+      case 'onWakeWordDetected':
+        final storage = _storage;
+        if (storage == null || isBusy || isRecording) {
+          unawaited(_resumeWakeWord());
+          return;
+        }
+        wakeWordListeningNotifier.value = false;
+        unawaited(_startRecording(storage, autoStopOnSilence: true));
+        return;
+      case 'onAutoRecordingComplete':
+        if (_state != VoiceAssistantState.recording) return;
+        _autoStopTimer?.cancel();
+        final args = call.arguments is Map
+            ? Map<String, dynamic>.from(call.arguments as Map)
+            : const <String, dynamic>{};
+        final wavPath = (args['wavPath'] ?? '').toString().trim();
+        final speechDetected = args['speechDetected'] == true;
+        final storage = _storage;
+        if (storage == null || !speechDetected || wavPath.isEmpty) {
+          await BuiltInPlayerService().restoreMusicVolume();
+          _state = VoiceAssistantState.idle;
+          _statusText = '已唤醒但未听到指令';
+          _bannerVisible = true;
+          notifyListeners();
+          _bannerDismissTimer?.cancel();
+          _bannerDismissTimer = Timer(const Duration(seconds: 3), () {
+            if (_state == VoiceAssistantState.idle) {
+              _bannerVisible = false;
+              notifyListeners();
+            }
+          });
+          unawaited(_resumeWakeWord());
+          return;
+        }
+        unawaited(_submitWavPath(storage, wavPath));
+        return;
+      case 'onMicPermissionGranted':
+        if (wakeWordEnabledNotifier.value) {
+          unawaited(_syncWakeWordToNative(true));
+        }
+        return;
+    }
+  }
 
   void dismissBanner() {
     _bannerDismissTimer?.cancel();
@@ -97,28 +216,39 @@ class CarVoiceAssistantService extends ChangeNotifier {
     await _startRecording(storage);
   }
 
-  Future<void> _startRecording(IStorageService storage) async {
+  Future<void> _startRecording(
+    IStorageService storage, {
+    bool autoStopOnSilence = false,
+  }) async {
+    _storage = storage;
     final baseUrl = _normalizeBaseUrl(storage.backendUrl);
     if (baseUrl.isEmpty || storage.carToken.trim().isEmpty) {
       _setError('请先在设置页配置后端地址和车机令牌');
+      unawaited(_resumeWakeWord());
       return;
     }
 
     _bannerDismissTimer?.cancel();
     _autoStopTimer?.cancel();
 
-    // Lower music volume immediately so mic picks up driver's voice cleanly
+    // Pause wake-word engine & lower music volume immediately
+    await _pauseWakeWord();
     await BuiltInPlayerService().duckForVoiceInput();
 
     try {
-      final res = await _voiceChannel.invokeMethod<String>('startRecording');
+      final res = await _voiceChannel.invokeMethod<String>(
+        'startRecording',
+        {'autoStopOnSilence': autoStopOnSilence},
+      );
       if (res == 'PERMISSION_REQUESTED') {
         await BuiltInPlayerService().restoreMusicVolume();
         _setError('请先允许麦克风权限，然后再次点击「语音」');
         return;
       }
       _state = VoiceAssistantState.recording;
-      _statusText = '正在聆听… 说完再点一次左侧「结束」';
+      _statusText = autoStopOnSilence
+          ? 'Hey Yaris 已唤醒 · 请直接说指令…'
+          : '正在聆听… 说完再点一次左侧「结束」';
       _transcript = '';
       _replyText = '';
       _bannerVisible = true;
@@ -133,6 +263,7 @@ class CarVoiceAssistantService extends ChangeNotifier {
     } catch (e) {
       await BuiltInPlayerService().restoreMusicVolume();
       _setError('麦克风启动失败：$e');
+      unawaited(_resumeWakeWord());
     }
   }
 
@@ -149,14 +280,26 @@ class CarVoiceAssistantService extends ChangeNotifier {
     } catch (e) {
       await BuiltInPlayerService().restoreMusicVolume();
       _setError('录音保存失败：$e');
+      unawaited(_resumeWakeWord());
       return;
     }
 
     if (wavPath == null || wavPath.trim().isEmpty) {
       await BuiltInPlayerService().restoreMusicVolume();
       _setError('录音太短，请说完指令后再结束');
+      unawaited(_resumeWakeWord());
       return;
     }
+
+    await _submitWavPath(storage, wavPath);
+  }
+
+  Future<void> _submitWavPath(IStorageService storage, String wavPath) async {
+    _autoStopTimer?.cancel();
+    _state = VoiceAssistantState.thinking;
+    _statusText = '正在识别并思考…';
+    _bannerVisible = true;
+    notifyListeners();
 
     try {
       final wavFile = File(wavPath);
@@ -172,6 +315,7 @@ class CarVoiceAssistantService extends ChangeNotifier {
     } catch (e) {
       await BuiltInPlayerService().restoreMusicVolume();
       _setError('AI 助手连接失败：$e');
+      unawaited(_resumeWakeWord());
     }
   }
 
@@ -187,6 +331,7 @@ class CarVoiceAssistantService extends ChangeNotifier {
     _bannerVisible = true;
     notifyListeners();
 
+    await _pauseWakeWord();
     await BuiltInPlayerService().duckForVoiceInput();
     var playedCloud = false;
     final baseUrl = _normalizeBaseUrl(storage.backendUrl);
@@ -243,6 +388,7 @@ class CarVoiceAssistantService extends ChangeNotifier {
         }
       });
     }
+    unawaited(_resumeWakeWord());
   }
 
   Future<void> selectCandidate(IStorageService storage, int oneBasedIndex) async {
@@ -293,9 +439,10 @@ class CarVoiceAssistantService extends ChangeNotifier {
     }
 
     _state = VoiceAssistantState.idle;
-    _statusText = _candidates.isNotEmpty ? '可直接点击下方地点，或再按「语音」说第几家' : '已完成';
+    _statusText = _candidates.isNotEmpty ? '可直接点击下方地点，或说「Hey Yaris」选第几家' : '已完成';
     _bannerVisible = true;
     notifyListeners();
+    unawaited(_resumeWakeWord());
 
     // Auto-hide banner after 8s if no pending candidates (or 45s if candidates wait)
     _bannerDismissTimer?.cancel();

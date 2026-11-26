@@ -7,6 +7,7 @@ import '../services/backend_client.dart';
 import '../services/built_in_player_service.dart';
 import '../services/car_music_sync_service.dart';
 import '../services/car_obd_service.dart';
+import '../services/car_voice_assistant_service.dart';
 import '../services/music_cache_service.dart';
 import '../services/music_service.dart';
 import '../services/navitime_guide_service.dart';
@@ -784,6 +785,26 @@ class _CarSettingsTabState extends State<CarSettingsTab> {
                                               ),
                                             ],
                                           ),
+                                        ),
+                                        const Divider(height: 1, color: YarisCarTheme.line),
+                                        ListenableBuilder(
+                                          listenable: CarVoiceAssistantService(),
+                                          builder: (context, _) {
+                                            final voiceSvc = CarVoiceAssistantService();
+                                            final enabled = voiceSvc.wakeWordEnabled;
+                                            final listening = voiceSvc.wakeWordListening;
+                                            final statusLabel = !enabled
+                                                ? '已关闭'
+                                                : (listening ? '离线监听中' : (voiceSvc.wakeWordNote ?? '待就绪'));
+                                            return _SettingsSwitchRow(
+                                              icon: Icons.mic_rounded,
+                                              title: 'Hey Yaris 语音唤醒（$statusLabel）',
+                                              value: enabled,
+                                              onChanged: (v) {
+                                                voiceSvc.setWakeWordEnabled(v);
+                                              },
+                                            );
+                                          },
                                         ),
                                         const Divider(height: 1, color: YarisCarTheme.line),
                                         ValueListenableBuilder<double>(

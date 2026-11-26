@@ -58,3 +58,6 @@ key.properties
 
 # Private local artifacts; never publish
 .private/
+
+# Large prebuilt Sherpa-ONNX AAR (downloaded locally for Android builds)
+car_app/android/app/libs/*.aar

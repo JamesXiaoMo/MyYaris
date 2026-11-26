@@ -137,12 +137,66 @@ class MainActivity : AudioServiceActivity() {
     @Volatile
     private var voiceRecordingActive = false
     private var voiceAudioRecord: android.media.AudioRecord? = null
+    private var voiceNoiseSuppressor: android.media.audiofx.NoiseSuppressor? = null
     private var voicePcmBuffer: java.io.ByteArrayOutputStream? = null
     private var voiceRecordThread: Thread? = null
+    private var voiceMethodChannel: MethodChannel? = null
+    private var wakeWordEngine: WakeWordEngine? = null
 
     private fun setupVoiceChannel(flutterEngine: FlutterEngine) {
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.myyaris.my_yaris/voice").setMethodCallHandler { call, result ->
+        val channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.myyaris.my_yaris/voice")
+        voiceMethodChannel = channel
+
+        wakeWordEngine?.release()
+        wakeWordEngine = WakeWordEngine(applicationContext) { keyword ->
+            runOnUiThread {
+                try {
+                    voiceMethodChannel?.invokeMethod(
+                        "onWakeWordDetected",
+                        mapOf("keyword" to keyword),
+                    )
+                } catch (_: Exception) {
+                }
+            }
+        }
+
+        channel.setMethodCallHandler { call, result ->
             when (call.method) {
+                "setWakeWordEnabled" -> {
+                    val enabled = call.argument<Boolean>("enabled") ?: false
+                    if (enabled) {
+                        val granted = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+                        if (!granted) {
+                            androidx.core.app.ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 4102)
+                            result.success(
+                                mapOf(
+                                    "enabled" to true,
+                                    "listening" to false,
+                                    "permissionRequested" to true,
+                                    "lastError" to "请先允许麦克风权限",
+                                )
+                            )
+                            return@setMethodCallHandler
+                        }
+                        try {
+                            KeepAliveService.start(this)
+                        } catch (_: Exception) {
+                        }
+                    }
+                    wakeWordEngine?.setEnabled(enabled)
+                    result.success(wakeWordEngine?.getStatus() ?: mapOf("enabled" to false, "listening" to false))
+                }
+                "pauseWakeWord" -> {
+                    wakeWordEngine?.pause()
+                    result.success(true)
+                }
+                "resumeWakeWord" -> {
+                    wakeWordEngine?.resume()
+                    result.success(true)
+                }
+                "getWakeWordStatus" -> {
+                    result.success(wakeWordEngine?.getStatus() ?: mapOf("enabled" to false, "listening" to false))
+                }
                 "startRecording" -> {
                     val granted = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
                     if (!granted) {
@@ -150,52 +204,145 @@ class MainActivity : AudioServiceActivity() {
                         result.success("PERMISSION_REQUESTED")
                         return@setMethodCallHandler
                     }
+                    val autoStopOnSilence = call.argument<Boolean>("autoStopOnSilence") ?: false
                     try {
+                        wakeWordEngine?.pause()
                         stopVoiceRecorderInternal()
                         val sampleRate = 16000
                         val channelConfig = android.media.AudioFormat.CHANNEL_IN_MONO
                         val audioFormat = android.media.AudioFormat.ENCODING_PCM_16BIT
                         val minBuf = android.media.AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
                         val bufSize = maxOf(minBuf * 2, 8192)
-                        var rec = android.media.AudioRecord(
+                        val sources = intArrayOf(
+                            android.media.MediaRecorder.AudioSource.VOICE_COMMUNICATION,
                             android.media.MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                            sampleRate,
-                            channelConfig,
-                            audioFormat,
-                            bufSize
+                            android.media.MediaRecorder.AudioSource.MIC,
                         )
-                        if (rec.state != android.media.AudioRecord.STATE_INITIALIZED) {
-                            rec.release()
-                            rec = android.media.AudioRecord(
-                                android.media.MediaRecorder.AudioSource.MIC,
-                                sampleRate,
-                                channelConfig,
-                                audioFormat,
-                                bufSize
-                            )
+                        var rec: android.media.AudioRecord? = null
+                        for (src in sources) {
+                            try {
+                                val cand = android.media.AudioRecord(src, sampleRate, channelConfig, audioFormat, bufSize)
+                                if (cand.state == android.media.AudioRecord.STATE_INITIALIZED) {
+                                    rec = cand
+                                    break
+                                } else {
+                                    cand.release()
+                                }
+                            } catch (_: Exception) {
+                            }
                         }
-                        if (rec.state != android.media.AudioRecord.STATE_INITIALIZED) {
-                            rec.release()
+                        if (rec == null) {
                             result.error("RECORDER_INIT_FAILED", "无法初始化车机麦克风", null)
                             return@setMethodCallHandler
+                        }
+                        try {
+                            if (android.media.audiofx.NoiseSuppressor.isAvailable()) {
+                                voiceNoiseSuppressor = android.media.audiofx.NoiseSuppressor.create(rec.audioSessionId)?.apply {
+                                    enabled = true
+                                }
+                            }
+                        } catch (_: Exception) {
                         }
                         val out = java.io.ByteArrayOutputStream()
                         voiceAudioRecord = rec
                         voicePcmBuffer = out
                         voiceRecordingActive = true
                         rec.startRecording()
-                        voiceRecordThread = Thread {
-                            val chunk = ByteArray(4096)
+                        voiceRecordThread = Thread({
+                            val chunk = ByteArray(3200) // 100ms @ 16kHz mono 16-bit
                             val maxBytes = sampleRate * 2 * 12 // 12s safety cap
+                            var totalMs = 0L
+                            var silentMs = 0L
+                            var speechDetected = false
+                            var noiseFloorRms = 550.0
+                            var calibrationFrames = 0
+                            var autoFinished = false
+
                             while (voiceRecordingActive && out.size() < maxBytes) {
-                                val read = rec.read(chunk, 0, chunk.size)
+                                val read = try {
+                                    rec.read(chunk, 0, chunk.size)
+                                } catch (_: Exception) {
+                                    -1
+                                }
                                 if (read > 0) {
                                     synchronized(out) {
                                         out.write(chunk, 0, read)
                                     }
+                                    if (autoStopOnSilence) {
+                                        val frameMs = (read * 1000L) / (sampleRate * 2L)
+                                        totalMs += frameMs
+                                        val rms = computePcm16Rms(chunk, read)
+                                        if (calibrationFrames < 3) {
+                                            noiseFloorRms = if (calibrationFrames == 0) rms else (noiseFloorRms * 0.6 + rms * 0.4)
+                                            noiseFloorRms = noiseFloorRms.coerceIn(300.0, 1800.0)
+                                            calibrationFrames++
+                                        } else {
+                                            val speechThresh = maxOf(noiseFloorRms * 2.1, 650.0)
+                                            val silenceThresh = maxOf(noiseFloorRms * 1.4, 420.0)
+                                            if (rms >= speechThresh) {
+                                                speechDetected = true
+                                                silentMs = 0L
+                                            } else if (speechDetected && rms < silenceThresh) {
+                                                silentMs += frameMs
+                                                if (silentMs >= 1200L && totalMs >= 900L) {
+                                                    autoFinished = true
+                                                    break
+                                                }
+                                            } else if (!speechDetected && totalMs >= 4500L) {
+                                                autoFinished = true
+                                                break
+                                            }
+                                        }
+                                    }
+                                } else if (read < 0) {
+                                    break
                                 }
                             }
-                        }.apply { start() }
+
+                            if (autoStopOnSilence && voiceRecordingActive) {
+                                voiceRecordingActive = false
+                                try {
+                                    rec.stop()
+                                } catch (_: Exception) {
+                                }
+                                try {
+                                    voiceNoiseSuppressor?.release()
+                                } catch (_: Exception) {
+                                }
+                                voiceNoiseSuppressor = null
+                                try {
+                                    rec.release()
+                                } catch (_: Exception) {
+                                }
+                                voiceAudioRecord = null
+                                voiceRecordThread = null
+                                val pcmBytes = synchronized(out) { out.toByteArray() }
+                                voicePcmBuffer = null
+
+                                var wavPath = ""
+                                if (speechDetected && pcmBytes.size >= 3200) {
+                                    try {
+                                        val wavFile = java.io.File(cacheDir, "ai_voice_input.wav")
+                                        writePcm16MonoWav(wavFile, pcmBytes, sampleRate)
+                                        wavPath = wavFile.absolutePath
+                                    } catch (_: Exception) {
+                                    }
+                                }
+                                runOnUiThread {
+                                    try {
+                                        voiceMethodChannel?.invokeMethod(
+                                            "onAutoRecordingComplete",
+                                            mapOf(
+                                                "wavPath" to wavPath,
+                                                "speechDetected" to speechDetected,
+                                                "autoFinished" to autoFinished,
+                                            ),
+                                        )
+                                    } catch (_: Exception) {
+                                    }
+                                }
+                            }
+                        }, "MyYarisVoiceRecord").apply { start() }
                         result.success("STARTED")
                     } catch (e: Exception) {
                         stopVoiceRecorderInternal()
@@ -332,14 +479,36 @@ class MainActivity : AudioServiceActivity() {
         }
     }
 
+    private fun computePcm16Rms(buf: ByteArray, len: Int): Double {
+        var sum = 0.0
+        val samples = len / 2
+        if (samples <= 0) return 0.0
+        var i = 0
+        while (i + 1 < len) {
+            val lo = buf[i].toInt() and 0xFF
+            val hi = buf[i + 1].toInt()
+            val sample = (hi shl 8) or lo
+            sum += sample.toDouble() * sample.toDouble()
+            i += 2
+        }
+        return kotlin.math.sqrt(sum / samples)
+    }
+
     private fun stopVoiceRecorderInternal(): ByteArray {
         voiceRecordingActive = false
         try {
             voiceAudioRecord?.stop()
         } catch (_: Exception) {}
+        val t = voiceRecordThread
+        if (t != null && t !== Thread.currentThread()) {
+            try {
+                t.join(500)
+            } catch (_: Exception) {}
+        }
         try {
-            voiceRecordThread?.join(500)
+            voiceNoiseSuppressor?.release()
         } catch (_: Exception) {}
+        voiceNoiseSuppressor = null
         try {
             voiceAudioRecord?.release()
         } catch (_: Exception) {}
@@ -350,6 +519,20 @@ class MainActivity : AudioServiceActivity() {
         } ?: ByteArray(0)
         voicePcmBuffer = null
         return bytes
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 4102 && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            try {
+                KeepAliveService.start(this)
+            } catch (_: Exception) {}
+            runOnUiThread {
+                try {
+                    voiceMethodChannel?.invokeMethod("onMicPermissionGranted", true)
+                } catch (_: Exception) {}
+            }
+        }
     }
 
     private fun writePcm16MonoWav(file: java.io.File, pcmData: ByteArray, sampleRate: Int) {
@@ -513,6 +696,12 @@ class MainActivity : AudioServiceActivity() {
 
     override fun onDestroy() {
         NavitimeAccessibilityService.onSnapshotUpdated = null
+        try {
+            wakeWordEngine?.release()
+        } catch (_: Exception) {
+        }
+        wakeWordEngine = null
+        stopVoiceRecorderInternal()
         try {
             offlineTts?.stop()
             offlineTts?.shutdown()

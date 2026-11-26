@@ -9,6 +9,7 @@ import 'services/system_ui_service.dart';
 import 'services/task_poller_service.dart';
 import 'services/trip_tracker_service.dart';
 import 'services/navitime_guide_service.dart';
+import 'services/car_voice_assistant_service.dart';
 import 'ui/car_home_page.dart';
 import 'ui/yaris_car_theme.dart';
 
@@ -62,8 +63,9 @@ void main() async {
     );
   }
 
-  // 4. Start CAR NAVITIME Chinese voice guide listener
+  // 4. Start CAR NAVITIME Chinese voice guide listener & offline "Hey Yaris" wake word
   unawaited(NavitimeGuideService().init(storage));
+  unawaited(CarVoiceAssistantService().initWakeWord(storage));
 
   runApp(MyYarisApp(storage: storage, poller: poller));
 }

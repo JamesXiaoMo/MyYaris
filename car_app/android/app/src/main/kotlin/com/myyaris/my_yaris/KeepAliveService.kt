@@ -182,15 +182,22 @@ class KeepAliveService : Service() {
         val notification = buildNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val hasLoc = hasLocationPermission()
-            val types = if (hasLoc && Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
-            } else {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            val hasMic = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+            var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            if (hasLoc && Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            }
+            if (hasMic && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
             }
             try {
                 startForeground(NOTIFICATION_ID, notification, types)
             } catch (_: Exception) {
-                startForeground(NOTIFICATION_ID, notification)
+                try {
+                    startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                } catch (_: Exception) {
+                    startForeground(NOTIFICATION_ID, notification)
+                }
             }
         } else {
             startForeground(NOTIFICATION_ID, notification)
