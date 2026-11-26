@@ -206,8 +206,7 @@ class CarVoiceAssistantService extends ChangeNotifier {
           final ttsUrl =
               decoded is Map ? (decoded['tts_url'] ?? '').toString().trim() : '';
           if (ttsUrl.isNotEmpty) {
-            await BuiltInPlayerService().playVoiceReply(ttsUrl);
-            playedCloud = true;
+            playedCloud = await BuiltInPlayerService().playVoiceReply(ttsUrl);
           }
         }
       } catch (e) {

@@ -13,15 +13,17 @@ import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.roundToInt
 
 /**
  * Reads live navigation cues (upcoming intersections, lane guidance boxes, VICS traffic
  * color bars, turn arrows, two-ahead turns, speed limit signs, ETA, remaining distance)
- * directly from CAR NAVITIME when it is in the foreground.
- * Uses Android 11+ AccessibilityService.takeScreenshot() for silent visual sampling
- * without any MediaProjection confirmation dialogs.
+ * directly from CAR NAVITIME when it is visible on screen (full-screen or split-screen).
+ * Uses Android 11+ AccessibilityService.takeScreenshot() on a dedicated background
+ * executor for zero main-thread jank and zero MediaProjection dialogs.
  */
 class NavitimeAccessibilityService : AccessibilityService() {
 
@@ -29,6 +31,7 @@ class NavitimeAccessibilityService : AccessibilityService() {
         private const val TAG = "NavitimeGuide"
         private const val NAVITIME_PKG = "com.navitime.local.carnavitime"
         private const val ID_PREFIX = "$NAVITIME_PKG:id/"
+        private const val VISUAL_CACHE_TTL_MS = 6000L
 
         @Volatile
         var isRunning: Boolean = false
@@ -49,97 +52,36 @@ class NavitimeAccessibilityService : AccessibilityService() {
         @Volatile
         var onSnapshotUpdated: ((Map<String, Any>) -> Unit)? = null
 
-        // Canonical 5x7 sans-serif digit bitmaps for Japanese speed-limit sign matching
         private val DIGIT_TEMPLATES: Map<Int, IntArray> = mapOf(
             0 to intArrayOf(
-                0,1,1,1,0,
-                1,0,0,0,1,
-                1,0,0,0,1,
-                1,0,0,0,1,
-                1,0,0,0,1,
-                1,0,0,0,1,
-                0,1,1,1,0,
+                0,1,1,1,0, 1,0,0,0,1, 1,0,0,0,1, 1,0,0,0,1, 1,0,0,0,1, 1,0,0,0,1, 0,1,1,1,0,
             ),
             1 to intArrayOf(
-                0,0,1,0,0,
-                0,1,1,0,0,
-                0,0,1,0,0,
-                0,0,1,0,0,
-                0,0,1,0,0,
-                0,0,1,0,0,
-                0,1,1,1,0,
+                0,0,1,0,0, 0,1,1,0,0, 0,0,1,0,0, 0,0,1,0,0, 0,0,1,0,0, 0,0,1,0,0, 0,1,1,1,0,
             ),
             2 to intArrayOf(
-                0,1,1,1,0,
-                1,0,0,0,1,
-                0,0,0,0,1,
-                0,0,1,1,0,
-                0,1,0,0,0,
-                1,0,0,0,0,
-                1,1,1,1,1,
+                0,1,1,1,0, 1,0,0,0,1, 0,0,0,0,1, 0,0,1,1,0, 0,1,0,0,0, 1,0,0,0,0, 1,1,1,1,1,
             ),
             3 to intArrayOf(
-                0,1,1,1,0,
-                1,0,0,0,1,
-                0,0,0,0,1,
-                0,0,1,1,0,
-                0,0,0,0,1,
-                1,0,0,0,1,
-                0,1,1,1,0,
+                0,1,1,1,0, 1,0,0,0,1, 0,0,0,0,1, 0,0,1,1,0, 0,0,0,0,1, 1,0,0,0,1, 0,1,1,1,0,
             ),
             4 to intArrayOf(
-                0,0,0,1,0,
-                0,0,1,1,0,
-                0,1,0,1,0,
-                1,0,0,1,0,
-                1,1,1,1,1,
-                0,0,0,1,0,
-                0,0,0,1,0,
+                0,0,0,1,0, 0,0,1,1,0, 0,1,0,1,0, 1,0,0,1,0, 1,1,1,1,1, 0,0,0,1,0, 0,0,0,1,0,
             ),
             5 to intArrayOf(
-                1,1,1,1,1,
-                1,0,0,0,0,
-                1,1,1,1,0,
-                0,0,0,0,1,
-                0,0,0,0,1,
-                1,0,0,0,1,
-                0,1,1,1,0,
+                1,1,1,1,1, 1,0,0,0,0, 1,1,1,1,0, 0,0,0,0,1, 0,0,0,0,1, 1,0,0,0,1, 0,1,1,1,0,
             ),
             6 to intArrayOf(
-                0,1,1,1,0,
-                1,0,0,0,0,
-                1,1,1,1,0,
-                1,0,0,0,1,
-                1,0,0,0,1,
-                1,0,0,0,1,
-                0,1,1,1,0,
+                0,1,1,1,0, 1,0,0,0,0, 1,1,1,1,0, 1,0,0,0,1, 1,0,0,0,1, 1,0,0,0,1, 0,1,1,1,0,
             ),
             7 to intArrayOf(
-                1,1,1,1,1,
-                0,0,0,0,1,
-                0,0,0,1,0,
-                0,0,1,0,0,
-                0,0,1,0,0,
-                0,1,0,0,0,
-                0,1,0,0,0,
+                1,1,1,1,1, 0,0,0,0,1, 0,0,0,1,0, 0,0,1,0,0, 0,0,1,0,0, 0,1,0,0,0, 0,1,0,0,0,
             ),
             8 to intArrayOf(
-                0,1,1,1,0,
-                1,0,0,0,1,
-                1,0,0,0,1,
-                0,1,1,1,0,
-                1,0,0,0,1,
-                1,0,0,0,1,
-                0,1,1,1,0,
+                0,1,1,1,0, 1,0,0,0,1, 1,0,0,0,1, 0,1,1,1,0, 1,0,0,0,1, 1,0,0,0,1, 0,1,1,1,0,
             ),
             9 to intArrayOf(
-                0,1,1,1,0,
-                1,0,0,0,1,
-                1,0,0,0,1,
-                0,1,1,1,1,
-                0,0,0,0,1,
-                0,0,0,1,0,
-                0,1,1,0,0,
+                0,1,1,1,0, 1,0,0,0,1, 1,0,0,0,1, 0,1,1,1,1, 0,0,0,0,1, 0,0,0,1,0, 0,1,1,0,0,
             ),
         )
 
@@ -156,10 +98,21 @@ class NavitimeAccessibilityService : AccessibilityService() {
     )
 
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val workerExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "NavitimeVisionWorker").apply { isDaemon = true }
+    }
     private var lastProcessMs: Long = 0L
     private var lastScreenshotMs: Long = 0L
     private var lastJpegEncodeMs: Long = 0L
     private val screenshotInFlight = AtomicBoolean(false)
+
+    // Short-TTL visual cache so non-screenshot frames never erase lane/traffic/turn/speed-limit
+    @Volatile private var lastVisualAtMs: Long = 0L
+    @Volatile private var cachedNextTurnDir: String = ""
+    @Volatile private var cachedTwoAheadDir: String = ""
+    @Volatile private var cachedSpeedLimit: Int? = null
+    private val cachedTrafficByInter = ConcurrentHashMap<String, String>()
+    private val cachedLaneByInter = ConcurrentHashMap<String, Pair<Int, List<Int>>>()
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -167,12 +120,14 @@ class NavitimeAccessibilityService : AccessibilityService() {
         Log.i(TAG, "NavitimeAccessibilityService connected")
     }
 
-    override fun onInterrupt() {
-        // No-op
-    }
+    override fun onInterrupt() {}
 
     override fun onDestroy() {
         isRunning = false
+        try {
+            workerExecutor.shutdownNow()
+        } catch (_: Exception) {
+        }
         super.onDestroy()
     }
 
@@ -185,14 +140,43 @@ class NavitimeAccessibilityService : AccessibilityService() {
         if (now - lastProcessMs < 1400L) return
         lastProcessMs = now
 
-        val root = rootInActiveWindow ?: return
+        val root = findNavitimeRootWindow() ?: return
         try {
             parseWindow(root, now)
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             Log.w(TAG, "Failed to parse CAR NAVITIME window: ${e.message}")
         } finally {
-            root.recycle()
+            try {
+                root.recycle()
+            } catch (_: Exception) {
+            }
         }
+    }
+
+    /**
+     * Searches all interactive windows so split-screen or floating voice overlays
+     * never prevent reading CAR NAVITIME's view tree.
+     */
+    private fun findNavitimeRootWindow(): AccessibilityNodeInfo? {
+        try {
+            val allWindows = windows
+            if (allWindows != null) {
+                for (w in allWindows) {
+                    val r = w.root ?: continue
+                    if (r.packageName?.toString() == NAVITIME_PKG) {
+                        return r
+                    }
+                    r.recycle()
+                }
+            }
+        } catch (_: Exception) {
+        }
+        val active = rootInActiveWindow
+        if (active != null && active.packageName?.toString() == NAVITIME_PKG) {
+            return active
+        }
+        active?.recycle()
+        return null
     }
 
     private fun parseWindow(root: AccessibilityNodeInfo, nowMs: Long) {
@@ -233,7 +217,6 @@ class NavitimeAccessibilityService : AccessibilityService() {
             itemNode.recycle()
         }
 
-        // CAR NAVITIME renders the nearest intersection at the BOTTOM of the list.
         items.sortByDescending { it.itemBottom }
 
         if (nextDestName.isEmpty() && items.isEmpty() && arrivalTime.isEmpty()) {
@@ -249,9 +232,10 @@ class NavitimeAccessibilityService : AccessibilityService() {
         ) {
             lastScreenshotMs = nowMs
             try {
+                // Run screenshot callback + pixel/JPEG work off the main thread
                 takeScreenshot(
                     Display.DEFAULT_DISPLAY,
-                    mainExecutor,
+                    workerExecutor,
                     object : TakeScreenshotCallback {
                         override fun onSuccess(screenshot: ScreenshotResult) {
                             var swBitmap: Bitmap? = null
@@ -262,7 +246,7 @@ class NavitimeAccessibilityService : AccessibilityService() {
                                 )
                                 swBitmap = hwBitmap?.copy(Bitmap.Config.ARGB_8888, false)
                                 hwBitmap?.recycle()
-                            } catch (e: Exception) {
+                            } catch (e: Throwable) {
                                 Log.w(TAG, "Screenshot bitmap copy failed: ${e.message}")
                             } finally {
                                 try {
@@ -272,7 +256,7 @@ class NavitimeAccessibilityService : AccessibilityService() {
                                 screenshotInFlight.set(false)
                             }
                             try {
-                                if (swBitmap != null && nowMs - lastJpegEncodeMs >= 3500L) {
+                                if (swBitmap != null && nowMs - lastJpegEncodeMs >= 4000L) {
                                     lastJpegEncodeMs = nowMs
                                     encodeLatestJpeg(swBitmap)
                                 }
@@ -287,7 +271,10 @@ class NavitimeAccessibilityService : AccessibilityService() {
                                     speedLimitRect = speedLimitRect,
                                     items = items,
                                     bitmap = swBitmap,
+                                    nowMs = nowMs,
                                 )
+                            } catch (e: Throwable) {
+                                Log.w(TAG, "Visual processing error: ${e.message}")
                             } finally {
                                 swBitmap?.recycle()
                             }
@@ -306,11 +293,12 @@ class NavitimeAccessibilityService : AccessibilityService() {
                                 speedLimitRect = speedLimitRect,
                                 items = items,
                                 bitmap = null,
+                                nowMs = nowMs,
                             )
                         }
                     }
                 )
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 screenshotInFlight.set(false)
                 publishSnapshot(
                     nextDestName = nextDestName,
@@ -323,6 +311,7 @@ class NavitimeAccessibilityService : AccessibilityService() {
                     speedLimitRect = speedLimitRect,
                     items = items,
                     bitmap = null,
+                    nowMs = nowMs,
                 )
             }
         } else {
@@ -337,17 +326,28 @@ class NavitimeAccessibilityService : AccessibilityService() {
                 speedLimitRect = speedLimitRect,
                 items = items,
                 bitmap = null,
+                nowMs = nowMs,
             )
         }
     }
 
     private fun encodeLatestJpeg(bmp: Bitmap) {
+        var scaled: Bitmap? = null
         try {
+            val target = if (bmp.width > 960) {
+                val ratio = 960f / bmp.width
+                scaled = Bitmap.createScaledBitmap(bmp, 960, (bmp.height * ratio).roundToInt(), true)
+                scaled
+            } else {
+                bmp
+            }
             val out = ByteArrayOutputStream()
-            bmp.compress(Bitmap.CompressFormat.JPEG, 65, out)
+            target.compress(Bitmap.CompressFormat.JPEG, 60, out)
             latestScreenJpeg = out.toByteArray()
             latestScreenJpegAtMs = System.currentTimeMillis()
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
+        } finally {
+            scaled?.recycle()
         }
     }
 
@@ -362,34 +362,62 @@ class NavitimeAccessibilityService : AccessibilityService() {
         speedLimitRect: Rect?,
         items: List<RawGuideItem>,
         bitmap: Bitmap?,
+        nowMs: Long,
     ) {
+        val visualCacheFresh = (nowMs - lastVisualAtMs) <= VISUAL_CACHE_TTL_MS
+
         val nextTurnDir = if (bitmap != null && nextTurnRect != null) {
-            classifyTurnArrow(bitmap, nextTurnRect)
+            classifyTurnArrow(bitmap, nextTurnRect).also { cachedNextTurnDir = it }
+        } else if (visualCacheFresh) {
+            cachedNextTurnDir
         } else {
             ""
         }
+
         val twoAheadDir = if (bitmap != null && twoAheadTurnRect != null) {
-            classifyTurnArrow(bitmap, twoAheadTurnRect)
+            classifyTurnArrow(bitmap, twoAheadTurnRect).also { cachedTwoAheadDir = it }
+        } else if (visualCacheFresh) {
+            cachedTwoAheadDir
         } else {
             ""
         }
-        val speedLimit = if (bitmap != null && speedLimitRect != null) {
-            classifySpeedLimit(bitmap, speedLimitRect)
+
+        val speedLimit = if (bitmap != null) {
+            val detected = if (speedLimitRect != null) classifySpeedLimit(bitmap, speedLimitRect) else null
+            cachedSpeedLimit = detected
+            detected
+        } else if (visualCacheFresh) {
+            cachedSpeedLimit
         } else {
             null
         }
 
+        if (bitmap != null) {
+            lastVisualAtMs = nowMs
+        }
+
         val parsedItems = items.map { item ->
+            val key = item.interName.ifEmpty { item.distanceText }
             val traffic = if (bitmap != null && item.trafficBounds != null) {
-                classifyTrafficBar(bitmap, item.trafficBounds)
+                classifyTrafficBar(bitmap, item.trafficBounds).also {
+                    if (key.isNotEmpty()) cachedTrafficByInter[key] = it
+                }
+            } else if (visualCacheFresh && key.isNotEmpty()) {
+                cachedTrafficByInter[key] ?: "unknown"
             } else {
                 "unknown"
             }
+
             val laneResult = if (bitmap != null && item.laneBounds != null) {
-                parseLaneGuide(bitmap, item.laneBounds)
+                parseLaneGuide(bitmap, item.laneBounds)?.also {
+                    if (key.isNotEmpty()) cachedLaneByInter[key] = it
+                }
+            } else if (visualCacheFresh && item.laneBounds != null && key.isNotEmpty()) {
+                cachedLaneByInter[key]
             } else {
                 null
             }
+
             val map = mutableMapOf<String, Any>(
                 "inter_name" to item.interName,
                 "distance_text" to item.distanceText,
@@ -425,43 +453,46 @@ class NavitimeAccessibilityService : AccessibilityService() {
         }
     }
 
-    /**
-     * Classifies a white navigation arrow icon on dark blue background into a Chinese
-     * directional phrase by comparing upper-half vs lower-half horizontal centroids.
-     */
-    private fun classifyTurnArrow(bmp: Bitmap, rect: Rect): String {
+    private fun readRegionPixels(bmp: Bitmap, rect: Rect): Pair<IntArray, Rect>? {
         val x0 = rect.left.coerceIn(0, bmp.width - 1)
         val x1 = rect.right.coerceIn(x0 + 1, bmp.width)
         val y0 = rect.top.coerceIn(0, bmp.height - 1)
         val y1 = rect.bottom.coerceIn(y0 + 1, bmp.height)
         val w = x1 - x0
         val h = y1 - y0
+        if (w <= 0 || h <= 0) return null
+        val buf = IntArray(w * h)
+        bmp.getPixels(buf, 0, w, x0, y0, w, h)
+        return Pair(buf, Rect(0, 0, w, h))
+    }
+
+    private fun classifyTurnArrow(bmp: Bitmap, rect: Rect): String {
+        val (pixels, r) = readRegionPixels(bmp, rect) ?: return ""
+        val w = r.width()
+        val h = r.height()
         if (w < 8 || h < 8) return ""
 
-        val midY = y0 + h / 2
+        val midY = h / 2
         var topXSum = 0.0
         var topCount = 0
         var botXSum = 0.0
         var botCount = 0
-        for (py in y0 until y1) {
-            for (px in x0 until x1) {
-                val c = bmp.getPixel(px, py)
+        for (py in 0 until h) {
+            val rowOff = py * w
+            for (px in 0 until w) {
+                val c = pixels[rowOff + px]
                 if (Color.red(c) > 200 && Color.green(c) > 200 && Color.blue(c) > 200) {
-                    val nx = (px - x0).toDouble() / w
+                    val nx = px.toDouble() / w
                     if (py < midY) {
-                        topXSum += nx
-                        topCount++
+                        topXSum += nx; topCount++
                     } else {
-                        botXSum += nx
-                        botCount++
+                        botXSum += nx; botCount++
                     }
                 }
             }
         }
         if (topCount < 6 || botCount < 6) return ""
-        val topMean = topXSum / topCount
-        val botMean = botXSum / botCount
-        val delta = topMean - botMean
+        val delta = (topXSum / topCount) - (botXSum / botCount)
         return when {
             delta <= -0.18 -> "左转"
             delta <= -0.07 -> "向左前方行驶"
@@ -471,24 +502,16 @@ class NavitimeAccessibilityService : AccessibilityService() {
         }
     }
 
-    /**
-     * Recognizes Japanese circular speed limit signs (20..120) inside speed_limit_view
-     * via vertical column segmentation + 5x7 normalized digit template matching.
-     */
     private fun classifySpeedLimit(bmp: Bitmap, rect: Rect): Int? {
-        val x0 = rect.left.coerceIn(0, bmp.width - 1)
-        val x1 = rect.right.coerceIn(x0 + 1, bmp.width)
-        val y0 = rect.top.coerceIn(0, bmp.height - 1)
-        val y1 = rect.bottom.coerceIn(y0 + 1, bmp.height)
-        val w = x1 - x0
-        val h = y1 - y0
+        val (pixels, r) = readRegionPixels(bmp, rect) ?: return null
+        val w = r.width()
+        val h = r.height()
         if (w < 20 || h < 20) return null
 
-        // Verify red border exists so we don't misread empty background
         var redBorderPx = 0
-        for (px in x0 until x1) {
-            for (py in listOf(y0 + 3, y1 - 4)) {
-                val c = bmp.getPixel(px, py.coerceIn(y0, y1 - 1))
+        for (px in 0 until w) {
+            for (py in listOf(3.coerceAtMost(h - 1), (h - 4).coerceAtLeast(0))) {
+                val c = pixels[py * w + px]
                 if (Color.red(c) > 150 && Color.green(c) < 90 && Color.blue(c) < 90) {
                     redBorderPx++
                 }
@@ -496,27 +519,22 @@ class NavitimeAccessibilityService : AccessibilityService() {
         }
         if (redBorderPx < 4) return null
 
-        // Inner white circle region containing black digits
-        val ix0 = x0 + (w * 0.16f).toInt()
-        val ix1 = x1 - (w * 0.16f).toInt()
-        val iy0 = y0 + (h * 0.22f).toInt()
-        val iy1 = y1 - (h * 0.22f).toInt()
+        val ix0 = (w * 0.16f).toInt()
+        val ix1 = w - (w * 0.16f).toInt()
+        val iy0 = (h * 0.22f).toInt()
+        val iy1 = h - (h * 0.22f).toInt()
         if (ix1 - ix0 < 10 || iy1 - iy0 < 10) return null
 
-        // Column projection of dark digit pixels
         val colCounts = IntArray(ix1 - ix0)
         for (px in ix0 until ix1) {
             var cnt = 0
             for (py in iy0 until iy1) {
-                val c = bmp.getPixel(px, py)
-                if (Color.red(c) < 115 && Color.green(c) < 115 && Color.blue(c) < 115) {
-                    cnt++
-                }
+                val c = pixels[py * w + px]
+                if (Color.red(c) < 115 && Color.green(c) < 115 && Color.blue(c) < 115) cnt++
             }
             colCounts[px - ix0] = cnt
         }
 
-        // Segment contiguous ink spans into digits
         val spans = mutableListOf<Pair<Int, Int>>()
         var start = -1
         for (i in colCounts.indices) {
@@ -534,19 +552,27 @@ class NavitimeAccessibilityService : AccessibilityService() {
 
         val digits = StringBuilder()
         for ((sx0, sx1) in spans) {
-            val matched = matchSingleDigit(bmp, sx0, sx1, iy0, iy1) ?: return null
+            val matched = matchSingleDigit(pixels, w, sx0, sx1, iy0, iy1) ?: return null
             digits.append(matched)
         }
         val value = digits.toString().toIntOrNull() ?: return null
         return if (value in VALID_JP_SPEED_LIMITS) value else null
     }
 
-    private fun matchSingleDigit(bmp: Bitmap, sx0: Int, sx1: Int, iy0: Int, iy1: Int): Int? {
+    private fun matchSingleDigit(
+        pixels: IntArray,
+        stride: Int,
+        sx0: Int,
+        sx1: Int,
+        iy0: Int,
+        iy1: Int,
+    ): Int? {
         var top = iy1
         var bottom = iy0
         for (py in iy0 until iy1) {
+            val rowOff = py * stride
             for (px in sx0 until sx1) {
-                val c = bmp.getPixel(px, py)
+                val c = pixels[rowOff + px]
                 if (Color.red(c) < 115 && Color.green(c) < 115 && Color.blue(c) < 115) {
                     if (py < top) top = py
                     if (py > bottom) bottom = py
@@ -556,16 +582,15 @@ class NavitimeAccessibilityService : AccessibilityService() {
         val dw = sx1 - sx0
         val dh = bottom - top + 1
         if (dw < 3 || dh < 6) return null
-
-        // Narrow tall bar is unambiguously '1'
         if (dw.toFloat() / dh < 0.36f) return 1
 
         val grid = IntArray(35)
         for (gy in 0 until 7) {
             val py = (top + ((gy + 0.5f) * dh / 7f).toInt()).coerceIn(top, bottom)
+            val rowOff = py * stride
             for (gx in 0 until 5) {
                 val px = (sx0 + ((gx + 0.5f) * dw / 5f).toInt()).coerceIn(sx0, sx1 - 1)
-                val c = bmp.getPixel(px, py)
+                val c = pixels[rowOff + px]
                 grid[gy * 5 + gx] =
                     if (Color.red(c) < 120 && Color.green(c) < 120 && Color.blue(c) < 120) 1 else 0
             }
@@ -588,27 +613,24 @@ class NavitimeAccessibilityService : AccessibilityService() {
     }
 
     private fun classifyTrafficBar(bmp: Bitmap, rect: Rect): String {
-        val x0 = rect.left.coerceIn(0, bmp.width - 1)
-        val x1 = rect.right.coerceIn(x0 + 1, bmp.width)
-        val y0 = rect.top.coerceIn(0, bmp.height - 1)
-        val y1 = rect.bottom.coerceIn(y0 + 1, bmp.height)
-        if (x1 <= x0 || y1 <= y0) return "unknown"
-
-        val cx = (x0 + x1) / 2
-        val stepY = ((y1 - y0) / 8).coerceAtLeast(1)
+        val (pixels, r) = readRegionPixels(bmp, rect) ?: return "unknown"
+        val w = r.width()
+        val h = r.height()
+        val cx = w / 2
+        val stepY = (h / 8).coerceAtLeast(1)
         var redCount = 0
         var orangeCount = 0
         var cyanCount = 0
-        var y = y0 + stepY / 2
-        while (y < y1) {
-            val px = bmp.getPixel(cx, y)
-            val r = Color.red(px)
-            val g = Color.green(px)
-            val b = Color.blue(px)
+        var y = stepY / 2
+        while (y < h) {
+            val px = pixels[y * w + cx]
+            val red = Color.red(px)
+            val green = Color.green(px)
+            val blue = Color.blue(px)
             when {
-                r > 170 && g < 95 && b < 95 -> redCount++
-                r > 180 && g in 95..200 && b < 95 -> orangeCount++
-                b > 145 && g > 135 && r < 115 -> cyanCount++
+                red > 170 && green < 95 && blue < 95 -> redCount++
+                red > 180 && green in 95..200 && blue < 95 -> orangeCount++
+                blue > 145 && green > 135 && red < 115 -> cyanCount++
             }
             y += stepY
         }
@@ -621,12 +643,9 @@ class NavitimeAccessibilityService : AccessibilityService() {
     }
 
     private fun parseLaneGuide(bmp: Bitmap, rect: Rect): Pair<Int, List<Int>>? {
-        val x0 = rect.left.coerceIn(0, bmp.width - 1)
-        val x1 = rect.right.coerceIn(x0 + 1, bmp.width)
-        val y0 = rect.top.coerceIn(0, bmp.height - 1)
-        val y1 = rect.bottom.coerceIn(y0 + 1, bmp.height)
-        val w = x1 - x0
-        val h = y1 - y0
+        val (pixels, r) = readRegionPixels(bmp, rect) ?: return null
+        val w = r.width()
+        val h = r.height()
         if (w < 10 || h < 10) return null
 
         val estSlotW = (h * 0.75f).coerceAtLeast(10f)
@@ -635,21 +654,20 @@ class NavitimeAccessibilityService : AccessibilityService() {
         val recommended = mutableListOf<Int>()
 
         for (i in 0 until laneCount) {
-            val sx0 = (x0 + (i * slotW).toInt() + 1).coerceIn(x0, x1 - 1)
-            val sx1 = (x0 + ((i + 1) * slotW).toInt() - 1).coerceIn(sx0 + 1, x1)
+            val sx0 = ((i * slotW).toInt() + 1).coerceIn(0, w - 1)
+            val sx1 = (((i + 1) * slotW).toInt() - 1).coerceIn(sx0 + 1, w)
             var blueBg = 0
             var nonWhite = 0
-            for (py in (y0 + 2) until (y1 - 2).coerceAtLeast(y0 + 3)) {
+            for (py in 2 until (h - 2).coerceAtLeast(3)) {
+                val rowOff = py * w
                 for (px in sx0 until sx1) {
-                    val c = bmp.getPixel(px, py)
-                    val r = Color.red(c)
-                    val g = Color.green(c)
-                    val b = Color.blue(c)
-                    if (r > 205 && g > 205 && b > 205) continue
+                    val c = pixels[rowOff + px]
+                    val red = Color.red(c)
+                    val green = Color.green(c)
+                    val blue = Color.blue(c)
+                    if (red > 205 && green > 205 && blue > 205) continue
                     nonWhite++
-                    if (b > r + 35 && b > 120) {
-                        blueBg++
-                    }
+                    if (blue > red + 35 && blue > 120) blueBg++
                 }
             }
             if (nonWhite > 0 && blueBg.toFloat() / nonWhite >= 0.25f) {
@@ -699,9 +717,7 @@ class NavitimeAccessibilityService : AccessibilityService() {
             if (result == null) {
                 val r = Rect()
                 n.getBoundsInScreen(r)
-                if (r.width() > 0 && r.height() > 0) {
-                    result = r
-                }
+                if (r.width() > 0 && r.height() > 0) result = r
             }
             n.recycle()
         }

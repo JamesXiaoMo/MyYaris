@@ -58,11 +58,14 @@ class NavitimeGuideService extends ChangeNotifier {
   final Set<String> _announcedKeys = <String>{};
   DateTime? _lastAnnounceAt;
   DateTime? _driveStartedAt;
+  DateTime? _lastSnapshotAt;
   String _lastAnnouncementText = '';
 
   int? _confirmedSpeedLimit;
   int? _candidateSpeedLimit;
   int _candidateSpeedLimitHits = 0;
+  int _missingSpeedLimitFrames = 0;
+  DateTime? _lastSpeedLimitSeenAt;
   DateTime? _lastOverspeedAlertAt;
 
   bool get serviceRunning => _serviceRunning;
@@ -149,10 +152,20 @@ class NavitimeGuideService extends ChangeNotifier {
   }
 
   void _handleSnapshot(Map<String, dynamic> raw) {
+    final now = DateTime.now();
+    // Reset fatigue timer & stale speed limit after a >= 15-minute driving break
+    if (_lastSnapshotAt != null &&
+        now.difference(_lastSnapshotAt!) >= const Duration(minutes: 15)) {
+      _driveStartedAt = now;
+      _confirmedSpeedLimit = null;
+      _announcedKeys.clear();
+    } else {
+      _driveStartedAt ??= now;
+    }
+    _lastSnapshotAt = now;
     _serviceRunning = true;
     _latestSnapshot = raw;
-    _driveStartedAt ??= DateTime.now();
-    _updateSpeedLimitTracker(raw);
+    _updateSpeedLimitTracker(raw, now);
     notifyListeners();
 
     if (_broadcastMode != NavitimeBroadcastMode.muted) {
@@ -166,11 +179,25 @@ class NavitimeGuideService extends ChangeNotifier {
     return 45.0;
   }
 
-  void _updateSpeedLimitTracker(Map<String, dynamic> snap) {
+  void _updateSpeedLimitTracker(Map<String, dynamic> snap, DateTime now) {
     final rawLimit = snap['speed_limit_kmh'];
-    if (rawLimit is! num) return;
+    if (rawLimit is! num) {
+      _missingSpeedLimitFrames++;
+      if (_missingSpeedLimitFrames >= 6 ||
+          (_lastSpeedLimitSeenAt != null &&
+              now.difference(_lastSpeedLimitSeenAt!) >=
+                  const Duration(seconds: 90))) {
+        _confirmedSpeedLimit = null;
+        _candidateSpeedLimit = null;
+        _candidateSpeedLimitHits = 0;
+      }
+      return;
+    }
     final limit = rawLimit.toInt();
     if (limit < 20 || limit > 120) return;
+
+    _missingSpeedLimitFrames = 0;
+    _lastSpeedLimitSeenAt = now;
 
     if (limit == _candidateSpeedLimit) {
       _candidateSpeedLimitHits++;

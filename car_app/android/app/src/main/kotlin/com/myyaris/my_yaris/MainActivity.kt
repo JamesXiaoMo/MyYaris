@@ -243,53 +243,90 @@ class MainActivity : AudioServiceActivity() {
     private var offlineTts: android.speech.tts.TextToSpeech? = null
     @Volatile
     private var offlineTtsReady: Boolean = false
+    @Volatile
+    private var offlineTtsInitializing: Boolean = false
+    private val offlineTtsSeq = java.util.concurrent.atomic.AtomicLong(0L)
+    private val offlineTtsPending = mutableListOf<Pair<String, (Boolean) -> Unit>>()
     private val offlineTtsCallbacks = java.util.concurrent.ConcurrentHashMap<String, (Boolean) -> Unit>()
 
     private fun speakOfflineChineseTts(text: String, onDone: (Boolean) -> Unit) {
-        val dispatchSpeak: (android.speech.tts.TextToSpeech) -> Unit = { engine ->
-            val uttId = "myyaris_nav_${System.currentTimeMillis()}"
-            offlineTtsCallbacks[uttId] = onDone
-            engine.setOnUtteranceProgressListener(object : android.speech.tts.UtteranceProgressListener() {
-                override fun onStart(utteranceId: String?) {}
-                override fun onDone(utteranceId: String?) {
-                    utteranceId?.let { offlineTtsCallbacks.remove(it)?.invoke(true) }
-                }
-                @Deprecated("Deprecated in Java")
-                override fun onError(utteranceId: String?) {
-                    utteranceId?.let { offlineTtsCallbacks.remove(it)?.invoke(false) }
-                }
-                override fun onError(utteranceId: String?, errorCode: Int) {
-                    utteranceId?.let { offlineTtsCallbacks.remove(it)?.invoke(false) }
-                }
-            })
+        val dispatchSpeak: (android.speech.tts.TextToSpeech, String, (Boolean) -> Unit) -> Unit = { engine, msg, cb ->
+            val uttId = "myyaris_nav_${offlineTtsSeq.incrementAndGet()}"
+            offlineTtsCallbacks[uttId] = cb
             val params = android.os.Bundle().apply {
                 putFloat(android.speech.tts.TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
             }
-            val code = engine.speak(text, android.speech.tts.TextToSpeech.QUEUE_FLUSH, params, uttId)
+            val code = engine.speak(msg, android.speech.tts.TextToSpeech.QUEUE_FLUSH, params, uttId)
             if (code != android.speech.tts.TextToSpeech.SUCCESS) {
                 offlineTtsCallbacks.remove(uttId)?.invoke(false)
             }
         }
 
-        val existing = offlineTts
-        if (existing != null && offlineTtsReady) {
-            dispatchSpeak(existing)
-            return
+        synchronized(offlineTtsPending) {
+            val existing = offlineTts
+            if (existing != null && offlineTtsReady) {
+                dispatchSpeak(existing, text, onDone)
+                return
+            }
+            offlineTtsPending.add(Pair(text, onDone))
+            if (offlineTtsInitializing) {
+                return
+            }
+            offlineTtsInitializing = true
         }
-        offlineTts = android.speech.tts.TextToSpeech(applicationContext) { status ->
-            if (status == android.speech.tts.TextToSpeech.SUCCESS) {
-                val engine = offlineTts ?: return@TextToSpeech
-                val langRes = engine.setLanguage(java.util.Locale.SIMPLIFIED_CHINESE)
-                if (langRes == android.speech.tts.TextToSpeech.LANG_MISSING_DATA ||
-                    langRes == android.speech.tts.TextToSpeech.LANG_NOT_SUPPORTED
-                ) {
-                    engine.setLanguage(java.util.Locale.CHINESE)
+
+        var createdEngine: android.speech.tts.TextToSpeech? = null
+        createdEngine = android.speech.tts.TextToSpeech(applicationContext) { status ->
+            val engine = createdEngine
+            val queued: List<Pair<String, (Boolean) -> Unit>>
+            synchronized(offlineTtsPending) {
+                offlineTtsInitializing = false
+                queued = offlineTtsPending.toList()
+                offlineTtsPending.clear()
+                if (status == android.speech.tts.TextToSpeech.SUCCESS && engine != null) {
+                    val langRes = engine.setLanguage(java.util.Locale.SIMPLIFIED_CHINESE)
+                    if (langRes == android.speech.tts.TextToSpeech.LANG_MISSING_DATA ||
+                        langRes == android.speech.tts.TextToSpeech.LANG_NOT_SUPPORTED
+                    ) {
+                        engine.setLanguage(java.util.Locale.CHINESE)
+                    }
+                    engine.setSpeechRate(1.05f)
+                    engine.setOnUtteranceProgressListener(object : android.speech.tts.UtteranceProgressListener() {
+                        override fun onStart(utteranceId: String?) {}
+                        override fun onDone(utteranceId: String?) {
+                            utteranceId?.let { offlineTtsCallbacks.remove(it)?.invoke(true) }
+                        }
+                        override fun onStop(utteranceId: String?, interrupted: Boolean) {
+                            utteranceId?.let { offlineTtsCallbacks.remove(it)?.invoke(false) }
+                        }
+                        @Deprecated("Deprecated in Java")
+                        override fun onError(utteranceId: String?) {
+                            utteranceId?.let { offlineTtsCallbacks.remove(it)?.invoke(false) }
+                        }
+                        override fun onError(utteranceId: String?, errorCode: Int) {
+                            utteranceId?.let { offlineTtsCallbacks.remove(it)?.invoke(false) }
+                        }
+                    })
+                    offlineTts = engine
+                    offlineTtsReady = true
+                } else {
+                    try {
+                        engine?.shutdown()
+                    } catch (_: Exception) {
+                    }
+                    offlineTts = null
+                    offlineTtsReady = false
                 }
-                engine.setSpeechRate(1.05f)
-                offlineTtsReady = true
-                dispatchSpeak(engine)
+            }
+
+            if (offlineTtsReady && engine != null) {
+                // Only speak the latest queued request; resolve earlier ones cleanly as interrupted
+                for (i in 0 until queued.size - 1) {
+                    queued[i].second(false)
+                }
+                queued.lastOrNull()?.let { (msg, cb) -> dispatchSpeak(engine, msg, cb) }
             } else {
-                onDone(false)
+                for ((_, cb) in queued) cb(false)
             }
         }
     }
@@ -474,6 +511,21 @@ class MainActivity : AudioServiceActivity() {
     }
 
     override fun onDestroy() {
+        NavitimeAccessibilityService.onSnapshotUpdated = null
+        try {
+            offlineTts?.stop()
+            offlineTts?.shutdown()
+        } catch (_: Exception) {
+        }
+        offlineTts = null
+        offlineTtsReady = false
+        for (cb in offlineTtsCallbacks.values) {
+            try {
+                cb(false)
+            } catch (_: Exception) {
+            }
+        }
+        offlineTtsCallbacks.clear()
         stopNativeLocationTracking()
         super.onDestroy()
     }

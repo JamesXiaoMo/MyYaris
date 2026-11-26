@@ -7,6 +7,7 @@ import 'package:just_audio/just_audio.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'in_app_audio_stream_proxy.dart';
 import 'car_music_queue_controller.dart';
+import 'car_music_sync_service.dart';
 import 'music_cache_service.dart';
 import '../models/music_queue_models.dart';
 
@@ -260,7 +261,10 @@ class BuiltInPlayerService {
     debugPrint('[BuiltInPlayer] Track completed processingState. Checking next track in queue...');
     final queueCtrl = CarMusicQueueController();
     if (queueCtrl.tracks.isNotEmpty) {
-      final nextTrack = await queueCtrl.nextTrackForPlayback();
+      final online = CarMusicSyncService().isHealthyNotifier.value;
+      final nextTrack = online
+          ? await queueCtrl.nextTrackForPlayback()
+          : (queueCtrl.getNextCachedTrack() ?? await queueCtrl.nextTrackForPlayback());
       if (nextTrack == null) {
         debugPrint('[BuiltInPlayer] No next track available. Stopping player.');
         await stop();
@@ -280,10 +284,21 @@ class BuiltInPlayerService {
       final ctrl = CarMusicQueueController();
       while (true) {
         if (ctrl.recordPlaybackFailure(reason) == CircuitBreakerAction.stopPlayer) {
+          // Before giving up offline, try jumping directly to a locally cached track
+          final cachedFallback = ctrl.getNextCachedTrack();
+          if (cachedFallback != null) {
+            try {
+              await playQueueTrack(cachedFallback, rethrowOnError: true);
+              return;
+            } catch (_) {}
+          }
           await stop();
           return;
         }
-        final next = await ctrl.nextTrackForPlayback();
+        final online = CarMusicSyncService().isHealthyNotifier.value;
+        final next = online
+            ? await ctrl.nextTrackForPlayback()
+            : (ctrl.getNextCachedTrack() ?? await ctrl.nextTrackForPlayback());
         if (next == null) { await stop(); return; }
         try {
           await playQueueTrack(next, rethrowOnError: true);
@@ -474,10 +489,11 @@ class BuiltInPlayerService {
   }
 
   /// Plays a Chinese AI TTS voice response over ducked music, then restores volume.
-  Future<void> playVoiceReply(String ttsUrl) async {
+  /// Returns true only when cloud audio loaded and played cleanly; false triggers offline TTS fallback.
+  Future<bool> playVoiceReply(String ttsUrl) async {
     if (ttsUrl.trim().isEmpty) {
       await restoreMusicVolume();
-      return;
+      return false;
     }
     try {
       String fullUrl = ttsUrl.trim();
@@ -492,14 +508,27 @@ class BuiltInPlayerService {
       final duckVol = (_currentVolume * 0.28).clamp(0.05, 0.35);
       await _player.setVolume(duckVol);
       await _sfxPlayer!.setVolume(1.0);
-      await _sfxPlayer!.setAudioSource(AudioSource.uri(Uri.parse(resolved)));
+      await _sfxPlayer!.setAudioSource(AudioSource.uri(Uri.parse(resolved))).timeout(
+        const Duration(seconds: 6),
+      );
+      var timedOut = false;
       final done = _sfxPlayer!.playerStateStream
           .firstWhere((s) => s.processingState == ProcessingState.completed)
-          .timeout(const Duration(seconds: 15), onTimeout: () => _sfxPlayer!.playerState);
+          .timeout(const Duration(seconds: 15), onTimeout: () {
+            timedOut = true;
+            return _sfxPlayer!.playerState;
+          });
       await _sfxPlayer!.play();
       await done;
+      if (timedOut) {
+        try {
+          await _sfxPlayer!.stop();
+        } catch (_) {}
+      }
+      return true;
     } catch (e) {
       debugPrint('[BuiltInPlayer] Voice reply playback note: $e');
+      return false;
     } finally {
       await restoreMusicVolume();
     }
