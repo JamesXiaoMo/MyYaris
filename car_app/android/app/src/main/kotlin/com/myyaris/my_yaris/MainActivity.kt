@@ -253,7 +253,8 @@ class MainActivity : AudioServiceActivity() {
                             var totalMs = 0L
                             var silentMs = 0L
                             var speechDetected = false
-                            var noiseFloorRms = 550.0
+                            var noiseFloorRms = 480.0
+                            var warmupFrames = 0
                             var calibrationFrames = 0
                             var autoFinished = false
 
@@ -271,13 +272,16 @@ class MainActivity : AudioServiceActivity() {
                                         val frameMs = (read * 1000L) / (sampleRate * 2L)
                                         totalMs += frameMs
                                         val rms = computePcm16Rms(chunk, read)
-                                        if (calibrationFrames < 3) {
+                                        if (warmupFrames < 2) {
+                                            // Skip first ~200ms so wake-chime tail never inflates noise floor
+                                            warmupFrames++
+                                        } else if (calibrationFrames < 3) {
                                             noiseFloorRms = if (calibrationFrames == 0) rms else (noiseFloorRms * 0.6 + rms * 0.4)
-                                            noiseFloorRms = noiseFloorRms.coerceIn(300.0, 1800.0)
+                                            noiseFloorRms = noiseFloorRms.coerceIn(250.0, 900.0)
                                             calibrationFrames++
                                         } else {
-                                            val speechThresh = maxOf(noiseFloorRms * 2.1, 650.0)
-                                            val silenceThresh = maxOf(noiseFloorRms * 1.4, 420.0)
+                                            val speechThresh = maxOf(noiseFloorRms * 2.0, 620.0)
+                                            val silenceThresh = maxOf(noiseFloorRms * 1.35, 380.0)
                                             if (rms >= speechThresh) {
                                                 speechDetected = true
                                                 silentMs = 0L

@@ -44,6 +44,7 @@ class WakeWordEngine(
     private var aec: AcousticEchoCanceler? = null
     private var ns: NoiseSuppressor? = null
     private var workerThread: Thread? = null
+    private var activeLoopFlag: java.util.concurrent.atomic.AtomicBoolean? = null
 
     @Volatile
     private var desiredEnabled: Boolean = false
@@ -260,10 +261,12 @@ class WakeWordEngine(
         audioRecord = rec
         running = true
         lastError = null
+        val loopFlag = java.util.concurrent.atomic.AtomicBoolean(true)
+        activeLoopFlag = loopFlag
         Log.i(TAG, "Wake-word listening started (source=$chosenSource, AEC=$aecActive, NS=$nsActive)")
 
         val thread = Thread({
-            runDecodeLoop(rec)
+            runDecodeLoop(rec, loopFlag)
         }, "MyYarisWakeWord").apply {
             isDaemon = true
             start()
@@ -272,20 +275,20 @@ class WakeWordEngine(
         return true
     }
 
-    private fun runDecodeLoop(rec: AudioRecord) {
+    private fun runDecodeLoop(rec: AudioRecord, loopFlag: java.util.concurrent.atomic.AtomicBoolean) {
         val pcm = ShortArray(CHUNK_SAMPLES)
         val floats = FloatArray(CHUNK_SAMPLES)
         val kws = spotter ?: return
         val st = stream ?: return
 
-        while (running) {
+        while (loopFlag.get() && running) {
             val read = try {
                 rec.read(pcm, 0, pcm.size)
             } catch (_: Exception) {
                 -1
             }
             if (read <= 0) {
-                if (!running) break
+                if (!loopFlag.get() || !running) break
                 try {
                     Thread.sleep(30)
                 } catch (_: InterruptedException) {
@@ -301,7 +304,7 @@ class WakeWordEngine(
 
             var detectedKeyword = ""
             synchronized(lock) {
-                if (!running || spotter == null || stream == null) return@synchronized
+                if (!loopFlag.get() || !running || spotter == null || stream == null) return@synchronized
                 try {
                     st.acceptWaveform(input, SAMPLE_RATE)
                     while (kws.isReady(st)) {
@@ -322,9 +325,14 @@ class WakeWordEngine(
                 if (now - lastTriggerAtMs >= COOLDOWN_MS) {
                     lastTriggerAtMs = now
                     Log.i(TAG, "Wake word detected: '$detectedKeyword'")
-                    // Immediately release mic before notifying Flutter so recording can start cleanly
+                    // Immediately release mic, play short chime, and let it finish before
+                    // notifying Flutter so chime audio never pollutes VAD noise-floor calibration.
                     pause()
                     playWakeChime()
+                    try {
+                        Thread.sleep(160)
+                    } catch (_: InterruptedException) {
+                    }
                     try {
                         onWakeWordDetected(detectedKeyword)
                     } catch (e: Exception) {
@@ -338,11 +346,11 @@ class WakeWordEngine(
 
     private fun playWakeChime() {
         try {
-            val tg = ToneGenerator(AudioManager.STREAM_MUSIC, 70)
-            tg.startTone(ToneGenerator.TONE_PROP_BEEP, 130)
+            val tg = ToneGenerator(AudioManager.STREAM_MUSIC, 65)
+            tg.startTone(ToneGenerator.TONE_PROP_BEEP, 110)
             Thread {
                 try {
-                    Thread.sleep(220)
+                    Thread.sleep(190)
                 } catch (_: InterruptedException) {
                 }
                 try {
@@ -357,6 +365,8 @@ class WakeWordEngine(
 
     private fun stopLoopLocked() {
         running = false
+        activeLoopFlag?.set(false)
+        activeLoopFlag = null
         val rec = audioRecord
         audioRecord = null
         try {

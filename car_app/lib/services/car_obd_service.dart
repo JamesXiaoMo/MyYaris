@@ -751,6 +751,58 @@ class CarObdService {
   }
 
   bool _loggedFuelProbeRaw = false;
+  final List<double> _fuelSampleWindow = <double>[];
+  double? _smoothedFuelLiters;
+  int _refuelJumpConfirmCount = 0;
+
+  /// Applies Toyota-style fuel tank damping: rejects isolated slosh/sensor glitches (>4L sudden drop),
+  /// computes a 7-sample sliding median, and smooths with slow EMA (fast-tracking confirmed refuels).
+  double _smoothFuelLiters(double rawLiters, {double? speedKmh}) {
+    final clamped = rawLiters.clamp(0.0, 36.0);
+    final prev = _smoothedFuelLiters;
+    if (prev == null) {
+      _fuelSampleWindow
+        ..clear()
+        ..add(clamped);
+      _smoothedFuelLiters = clamped;
+      return clamped;
+    }
+
+    final delta = clamped - prev;
+    // Reject single-frame sudden drop > 4.0L (>11% of 36L tank) — impossible in 15 seconds
+    if (delta < -4.0) {
+      return prev;
+    }
+    // Detect genuine refueling (+4.0L or more while nearly stationary, confirmed on 2 consecutive reads)
+    if (delta >= 4.0 && (speedKmh == null || speedKmh <= 5.0)) {
+      _refuelJumpConfirmCount++;
+      if (_refuelJumpConfirmCount < 2) {
+        return prev;
+      }
+      _refuelJumpConfirmCount = 0;
+      _fuelSampleWindow
+        ..clear()
+        ..add(clamped);
+      _smoothedFuelLiters = clamped;
+      return clamped;
+    }
+    _refuelJumpConfirmCount = 0;
+
+    // Ignore large upward slosh (>4L) while driving at speed
+    if (delta > 4.0 && speedKmh != null && speedKmh > 5.0) {
+      return prev;
+    }
+
+    _fuelSampleWindow.add(clamped);
+    if (_fuelSampleWindow.length > 7) {
+      _fuelSampleWindow.removeAt(0);
+    }
+    final sorted = List<double>.from(_fuelSampleWindow)..sort();
+    final med = sorted[sorted.length ~/ 2];
+    final next = prev * 0.78 + med * 0.22;
+    _smoothedFuelLiters = double.parse(next.toStringAsFixed(2));
+    return _smoothedFuelLiters!;
+  }
 
   double? _recordSpeedForTrip(double? speedKmh, DateTime now) {
     if (speedKmh == null || speedKmh < 0) return _integratedTripKm;
@@ -835,7 +887,6 @@ class CarObdService {
         }
         if (meterLiters != null) {
           fuelLiters = meterLiters;
-          fuelPct = (meterLiters / 36.0 * 100.0).clamp(0.0, 100.0);
         } else if (!_loggedFuelProbeRaw) {
           _loggedFuelProbeRaw = true;
           log('⛽ 仪表油量原始应答: 2129=[$r2129] | 221022=[$r221022]');
@@ -845,6 +896,14 @@ class CarObdService {
         await sendRawCommand('ATCRA');
         await sendRawCommand('ATSH7DF');
       }
+    }
+
+    if (fuelLiters != null) {
+      fuelLiters = _smoothFuelLiters(
+        fuelLiters,
+        speedKmh: telemetryNotifier.value.speedKmh,
+      );
+      fuelPct = (fuelLiters / 36.0 * 100.0).clamp(0.0, 100.0);
     }
 
     final ambient = _parseStandardTemp(await sendRawCommand('0146'));

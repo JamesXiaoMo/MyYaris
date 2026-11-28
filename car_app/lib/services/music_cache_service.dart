@@ -5,7 +5,6 @@ import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/music_queue_models.dart';
 import 'backend_client.dart';
-import 'car_music_queue_controller.dart';
 
 enum BatchCacheState { idle, running, paused, completed, error }
 
@@ -438,24 +437,39 @@ class MusicCacheService {
       if (overrideTracks != null) {
         tracks = overrideTracks;
       } else {
-        final ctrl = CarMusicQueueController();
-        ctrl.configure(
-          baseUrl: normalizedBase,
-          token: token,
-          deviceId: deviceId,
-          backendClient: client,
-        );
-        final snap = await ctrl.fetchAndValidateQueueSnapshot(
-          source: QueueSource.neteaseFavorite,
-        );
-        if (snap == null || snap.tracks.isEmpty) {
+        // Fetch favorite playlist pages directly with our temporary client so we NEVER
+        // overwrite or close the global CarMusicQueueController's shared BackendClient!
+        final fetched = <NeteaseQueueTrackItem>[];
+        String? qid;
+        int? qver;
+        int offset = 0;
+        const pageSize = 100;
+        for (int page = 0; page < 40; page++) {
+          final snap = await client.fetchMusicQueuePage(
+            baseUrl: normalizedBase,
+            token: token,
+            deviceId: deviceId,
+            source: 'netease_favorite',
+            offset: offset,
+            limit: pageSize,
+            queueId: qid,
+            queueVersion: qver,
+          );
+          qid ??= snap.queueId;
+          qver ??= snap.queueVersion;
+          if (snap.tracks.isEmpty) break;
+          fetched.addAll(snap.tracks);
+          offset += snap.tracks.length;
+          if (!snap.hasMore || offset >= snap.total) break;
+        }
+        if (fetched.isEmpty) {
           batchProgressNotifier.value = const BatchCacheProgress(
             state: BatchCacheState.error,
             message: '未能获取喜欢歌单，请检查后端连接',
           );
           return;
         }
-        tracks = snap.tracks;
+        tracks = fetched;
       }
 
       // Deduplicate by songId so no track can ever be queued twice in one batch

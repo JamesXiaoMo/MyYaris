@@ -41,6 +41,7 @@ class BuiltInPlayerService {
   final AudioPlayer _player = AudioPlayer();
   AudioPlayer get player => _player;
   AudioPlayer? _sfxPlayer;
+  AudioPlayer? _djSfxPlayer;
 
   bool _isInitialized = false;
   bool get isInitialized => _isInitialized;
@@ -498,19 +499,23 @@ class BuiltInPlayerService {
     final nextIdx = (ctrl.currentIndex + 1) % tracks.length;
     final nextTrack = tracks[nextIdx];
     if (nextTrack.songId <= 0) return;
+    final httpClient = HttpClient()..connectionTimeout = const Duration(seconds: 4);
     try {
       final uri = Uri.parse('$_currentBaseUrl/api/v1/music/netease/prefetch/${nextTrack.songId}');
-      final req = await HttpClient().postUrl(uri).timeout(const Duration(seconds: 4));
+      final req = await httpClient.postUrl(uri).timeout(const Duration(seconds: 4));
       req.headers.set('Authorization', 'Bearer $_currentDeviceToken');
       req.headers.set('X-Device-Token', _currentDeviceToken);
       final res = await req.close().timeout(const Duration(seconds: 4));
       await res.drain<void>();
-    } catch (_) {}
+    } catch (_) {
+    } finally {
+      httpClient.close(force: true);
+    }
   }
 
-  /// Plays a short DJ sound effect overlaid on top of current music (briefly ducking volume).
+  /// Plays a short DJ sound effect overlaid on top of current music without interfering with AI TTS.
   Future<void> playSoundEffect(String sfxUrl) async {
-    if (sfxUrl.trim().isEmpty) return;
+    if (sfxUrl.trim().isEmpty || _voiceDuckActive) return;
     try {
       String fullUrl = sfxUrl.trim();
       if (fullUrl.startsWith('/') && _currentBaseUrl.isNotEmpty) {
@@ -520,21 +525,22 @@ class BuiltInPlayerService {
         fullUrl,
         token: _currentDeviceToken,
       );
-      _sfxPlayer ??= AudioPlayer();
+      _djSfxPlayer ??= AudioPlayer(
+        handleInterruptions: false,
+        androidApplyAudioAttributes: false,
+      );
       final prevVol = _currentVolume;
       final duckVol = (prevVol * 0.45).clamp(0.05, 1.0);
-      if (_player.playing) {
+      if (_player.playing && !_voiceDuckActive) {
         await _player.setVolume(duckVol);
       }
-      await _sfxPlayer!.setVolume((prevVol * 1.35).clamp(0.35, 1.0));
-      await _sfxPlayer!.setAudioSource(AudioSource.uri(Uri.parse(resolved)));
-      await _sfxPlayer!.play();
-      // Restore music volume smoothly after the short effect
+      await _djSfxPlayer!.setVolume((prevVol * 1.35).clamp(0.35, 1.0));
+      await _djSfxPlayer!.setAudioSource(AudioSource.uri(Uri.parse(resolved)));
+      await _djSfxPlayer!.play();
+      // Restore music volume via unified state machine (never overrides active AI voice duck)
       unawaited(
         Future<void>.delayed(const Duration(milliseconds: 1800), () async {
-          try {
-            await _player.setVolume(_currentVolume);
-          } catch (_) {}
+          await _applyMusicVolume();
         }),
       );
     } catch (e) {

@@ -154,6 +154,7 @@ class KeepAliveService : Service() {
     private var locationListener: LocationListener? = null
     private var samplerExecutor: ScheduledExecutorService? = null
     private var lastRecordedWallMs: Long = 0L
+    private var lastRecordedFixTimeMs: Long = 0L
     private var lastRecordedLocation: Location? = null
 
     override fun onCreate() {
@@ -291,6 +292,11 @@ class KeepAliveService : Service() {
     private fun persistLocationIfEligible(loc: Location) {
         if (loc.latitude == 0.0 && loc.longitude == 0.0) return
         val nowMs = System.currentTimeMillis()
+        // Reject stale GPS fixes (e.g. inside tunnel/garage) so we never forge repeated high-speed points
+        val fixTimeMs = if (loc.time > 0L) loc.time else nowMs
+        if (fixTimeMs <= lastRecordedFixTimeMs) return
+        if ((nowMs - fixTimeMs) > 15_000L) return
+
         val prevLoc = lastRecordedLocation
         val elapsedMs = nowMs - lastRecordedWallMs
         val speedKmh = if (loc.hasSpeed()) (loc.speed * 3.6).toDouble() else null
@@ -302,6 +308,7 @@ class KeepAliveService : Service() {
         if (elapsedMs < 1_800L) return
 
         lastRecordedWallMs = nowMs
+        lastRecordedFixTimeMs = fixTimeMs
         lastRecordedLocation = loc
 
         val obj = JSONObject().apply {
@@ -309,7 +316,7 @@ class KeepAliveService : Service() {
             put("longitude", loc.longitude)
             put("speed_kmh", speedKmh ?: JSONObject.NULL)
             put("accuracy_m", if (loc.hasAccuracy()) loc.accuracy.toDouble() else JSONObject.NULL)
-            put("timestamp_ms", nowMs)
+            put("timestamp_ms", fixTimeMs)
             put("provider", loc.provider ?: "gps")
         }
 

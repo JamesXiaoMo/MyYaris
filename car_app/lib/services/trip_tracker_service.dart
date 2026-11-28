@@ -163,15 +163,8 @@ class TripTrackerService {
         ? DateTime.fromMillisecondsSinceEpoch(tsMs, isUtc: true)
         : DateTime.now().toUtc();
 
-    // Auto-start a new trip if parked / idle for >= 15 minutes
-    if (_lastPointTime != null &&
-        ptTime.difference(_lastPointTime!).abs() >= tripSplitGap) {
-      _tripId = 'trip_${ptTime.millisecondsSinceEpoch}';
-    }
-    _lastPointTime = ptTime;
-
     return {
-      '_trip_id': _tripId,
+      '_pt_time_ms': ptTime.millisecondsSinceEpoch,
       'latitude': lat,
       'longitude': lon,
       if (speedKmh != null && speedKmh >= 0 && speedKmh <= 400)
@@ -182,20 +175,12 @@ class TripTrackerService {
     };
   }
 
-  void _appendLocationMap(Map<dynamic, dynamic> loc) {
-    final normalized = _normalizeLocationMap(loc);
-    if (normalized == null) return;
-    _pendingPoints.add(normalized);
-    if (_pendingPoints.length > maxBufferedPoints) {
-      _pendingPoints.removeRange(0, _pendingPoints.length - maxBufferedPoints);
-    }
-  }
-
   Future<void> _flushPendingAndObd() async {
     if (!_isRunning || _uploadInFlight) return;
     _uploadInFlight = true;
     try {
       // Phase 1: Two-phase crash-safe upload from native disk queue (peek -> upload -> ack)
+      // Trip segmentation uses local cursor state and only commits after _postBatch succeeds!
       while (_isRunning) {
         List<dynamic>? peeked;
         try {
@@ -209,6 +194,8 @@ class TripTrackerService {
         if (peeked == null || peeked.isEmpty) break;
 
         final validBatch = <Map<String, dynamic>>[];
+        String cursorTripId = _tripId;
+        DateTime? cursorLastTime = _lastPointTime;
         String? batchTripId;
         int consumedRawCount = 0;
 
@@ -222,25 +209,35 @@ class TripTrackerService {
             consumedRawCount++;
             continue;
           }
-          final tid = norm['_trip_id']?.toString() ?? _tripId;
-          batchTripId ??= tid;
-          if (tid != batchTripId) {
+          final ptTime = DateTime.fromMillisecondsSinceEpoch(
+            norm['_pt_time_ms'] as int,
+            isUtc: true,
+          );
+          if (cursorLastTime != null &&
+              ptTime.difference(cursorLastTime).abs() >= tripSplitGap) {
+            cursorTripId = 'trip_${ptTime.millisecondsSinceEpoch}';
+          }
+          batchTripId ??= cursorTripId;
+          if (cursorTripId != batchTripId) {
             // Stop before trip boundary so each batch maps to one trip_id
             break;
           }
+          cursorLastTime = ptTime;
           consumedRawCount++;
           validBatch.add({
             for (final e in norm.entries)
-              if (e.key != '_trip_id') e.key: e.value,
+              if (e.key != '_pt_time_ms') e.key: e.value,
           });
         }
 
         if (validBatch.isNotEmpty && batchTripId != null) {
           final ok = await _postBatch(batchTripId, validBatch);
           if (!ok) {
-            // Keep points safely on disk for next retry!
+            // Keep points safely on disk and leave _tripId/_lastPointTime untouched for next retry!
             break;
           }
+          _tripId = batchTripId;
+          _lastPointTime = cursorLastTime;
           uploadedPointsNotifier.value += validBatch.length;
           unawaited(_persistTripState());
         }
@@ -259,30 +256,38 @@ class TripTrackerService {
         }
       }
 
-      // Phase 2: Fallback flush if any points were queued in RAM
-      if (_pendingPoints.isEmpty) {
-        try {
-          final loc = await _locationChannel.invokeMethod<Map<dynamic, dynamic>>(
-            'getLatestLocation',
-          );
-          if (loc != null) _appendLocationMap(loc);
-        } catch (_) {}
-      }
+      // Phase 2: Fallback flush if any fresh points were queued in RAM
       while (_isRunning && _pendingPoints.isNotEmpty) {
-        final targetTripId = _pendingPoints.first['_trip_id']?.toString() ?? _tripId;
+        String cursorTripId = _tripId;
+        DateTime? cursorLastTime = _lastPointTime;
+        String? batchTripId;
         final batch = <Map<String, dynamic>>[];
+        int takeCount = 0;
         for (final pt in _pendingPoints) {
-          if ((pt['_trip_id']?.toString() ?? _tripId) != targetTripId) break;
+          final ptTime = DateTime.fromMillisecondsSinceEpoch(
+            pt['_pt_time_ms'] as int,
+            isUtc: true,
+          );
+          if (cursorLastTime != null &&
+              ptTime.difference(cursorLastTime).abs() >= tripSplitGap) {
+            cursorTripId = 'trip_${ptTime.millisecondsSinceEpoch}';
+          }
+          batchTripId ??= cursorTripId;
+          if (cursorTripId != batchTripId) break;
+          cursorLastTime = ptTime;
           batch.add({
             for (final e in pt.entries)
-              if (e.key != '_trip_id') e.key: e.value,
+              if (e.key != '_pt_time_ms') e.key: e.value,
           });
+          takeCount++;
           if (batch.length >= 100) break;
         }
-        if (batch.isEmpty) break;
-        final ok = await _postBatch(targetTripId, batch);
+        if (batch.isEmpty || batchTripId == null) break;
+        final ok = await _postBatch(batchTripId, batch);
         if (!ok) break;
-        _pendingPoints.removeRange(0, batch.length);
+        _tripId = batchTripId;
+        _lastPointTime = cursorLastTime;
+        _pendingPoints.removeRange(0, takeCount);
         uploadedPointsNotifier.value += batch.length;
         unawaited(_persistTripState());
       }

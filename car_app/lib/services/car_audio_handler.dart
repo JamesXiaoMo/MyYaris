@@ -15,6 +15,7 @@ class CarAudioHandler extends BaseAudioHandler with SeekHandler {
   StreamSubscription? _playerStateSubscription;
   StreamSubscription? _playbackEventSubscription;
   StreamSubscription? _sequenceStateSubscription;
+  StreamSubscription? _durationSubscription;
 
   CarAudioHandler() {
     _initStreams();
@@ -30,8 +31,11 @@ class CarAudioHandler extends BaseAudioHandler with SeekHandler {
       _broadcastPlaybackState();
     });
 
-    // 2. Sync track / sequence metadata
+    // 2. Sync track / sequence metadata & duration
     _sequenceStateSubscription = _playerService.player.sequenceStateStream.listen((_) {
+      _broadcastMediaItem();
+    });
+    _durationSubscription = _playerService.player.durationStream.listen((_) {
       _broadcastMediaItem();
     });
     _playerService.activeRemoteTrackNotifier.addListener(_broadcastMediaItem);
@@ -49,7 +53,8 @@ class CarAudioHandler extends BaseAudioHandler with SeekHandler {
 
   void _broadcastMediaItem() {
     final track = _playerService.currentTrack;
-    final duration = _playerService.player.duration;
+    final effDur = _playerService.effectiveDuration;
+    final duration = effDur.inMilliseconds > 0 ? effDur : null;
 
     mediaItem.add(MediaItem(
       id: track.id,
@@ -153,8 +158,10 @@ class CarAudioHandler extends BaseAudioHandler with SeekHandler {
   }
 
   Future<void> dispose() async {
+    _playerService.activeRemoteTrackNotifier.removeListener(_broadcastMediaItem);
     await _playerStateSubscription?.cancel();
     await _playbackEventSubscription?.cancel();
     await _sequenceStateSubscription?.cancel();
+    await _durationSubscription?.cancel();
   }
 }

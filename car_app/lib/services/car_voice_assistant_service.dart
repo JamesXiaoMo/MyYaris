@@ -543,12 +543,15 @@ class CarVoiceAssistantService extends ChangeNotifier {
 
     final ttsUrl = (data['tts_url'] ?? '').toString().trim();
     var playedCloud = false;
-    if (ttsUrl.isNotEmpty) {
-      await _pauseWakeWord();
+    if (ttsUrl.isNotEmpty || _replyText.isNotEmpty) {
+      // Set speaking synchronously BEFORE any await so proactive nav announcements cannot overlap
       _state = VoiceAssistantState.speaking;
       _statusText = 'AI 语音播报中…';
       _bannerVisible = true;
       notifyListeners();
+      await _pauseWakeWord();
+    }
+    if (ttsUrl.isNotEmpty) {
       playedCloud = await BuiltInPlayerService().playVoiceReply(
         ttsUrl,
         baseUrl: effectiveStorage != null
@@ -558,7 +561,6 @@ class CarVoiceAssistantService extends ChangeNotifier {
       );
     }
     if (!playedCloud && _replyText.isNotEmpty) {
-      await _pauseWakeWord();
       await BuiltInPlayerService().duckForVoiceInput();
       try {
         await _voiceChannel
