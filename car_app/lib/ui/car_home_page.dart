@@ -731,9 +731,10 @@ class _CarHomePageState extends State<CarHomePage> {
             stream: _playerService.player.positionStream,
             builder: (context, posSnap) {
               final pos = posSnap.data ?? Duration.zero;
-              final total = _playerService.player.duration ?? Duration.zero;
-              final maxMs = total.inMilliseconds > 0 ? total.inMilliseconds.toDouble() : 1.0;
-              final curMs = pos.inMilliseconds.toDouble().clamp(0.0, maxMs);
+              final total = _playerService.effectiveDuration;
+              final hasDur = total.inMilliseconds > 0;
+              final maxMs = hasDur ? total.inMilliseconds.toDouble() : 1.0;
+              final curMs = hasDur ? pos.inMilliseconds.toDouble().clamp(0.0, maxMs) : 0.0;
 
               return Column(
                 children: [

@@ -78,6 +78,33 @@ class BuiltInPlayerService {
     } catch (_) {}
   }
 
+  /// Ensures Android AudioFocus / CarPlay media audio bridge is active and volume is applied
+  /// before starting playback (fixes silent music on cold boot until AI TTS wakes the HAL).
+  Future<void> _ensureAudioSessionActive() async {
+    _osFocusDucked = false;
+    try {
+      final session = await AudioSession.instance;
+      await session.setActive(true);
+    } catch (_) {}
+    await _applyMusicVolume();
+  }
+
+  /// Best-known duration of the current track: prefers ExoPlayer's parsed duration,
+  /// falling back to Netease queue metadata so streaming tracks never stick at 100%.
+  Duration get effectiveDuration {
+    final playerDur = _player.duration;
+    if (playerDur != null && playerDur.inMilliseconds > 0) {
+      return playerDur;
+    }
+    final metaMs = CarMusicQueueController().currentTrack?.durationMs ??
+        _savedLastTrack?.durationMs ??
+        0;
+    if (metaMs > 0) {
+      return Duration(milliseconds: metaMs);
+    }
+    return Duration.zero;
+  }
+
   Future<void> setAiVoiceVolume(double value) async {
     final clamped = value.clamp(0.1, 1.0);
     _aiVoiceVolume = clamped;
@@ -423,6 +450,7 @@ class BuiltInPlayerService {
       unawaited(CarMusicQueueController().persistActiveQueueToDisk());
 
       if (startPlaying) {
+        await _ensureAudioSessionActive();
         unawaited(_player.play().catchError((Object _) {}));
         if (!playedFromCache) {
           MusicCacheService().cacheInBackgroundIfEnabled(
@@ -641,6 +669,7 @@ class BuiltInPlayerService {
       return;
     }
     _stopped = false;
+    await _ensureAudioSessionActive();
     unawaited(_player.play().catchError((Object _) {}));
   }
 

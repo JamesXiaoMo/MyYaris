@@ -281,9 +281,10 @@ class _BuiltInPlayerPageState extends State<BuiltInPlayerPage> {
             stream: _service.player.positionStream,
             builder: (context, posSnap) {
               final pos = posSnap.data ?? Duration.zero;
-              final total = _service.player.duration ?? const Duration(seconds: 3);
-              final maxSec = total.inMilliseconds.toDouble();
-              final curSec = pos.inMilliseconds.toDouble().clamp(0.0, maxSec);
+              final total = _service.effectiveDuration;
+              final hasDur = total.inMilliseconds > 0;
+              final maxSec = hasDur ? total.inMilliseconds.toDouble() : 1.0;
+              final curSec = hasDur ? pos.inMilliseconds.toDouble().clamp(0.0, maxSec) : 0.0;
 
               return Column(
                 children: [
