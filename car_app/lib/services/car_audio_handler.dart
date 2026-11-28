@@ -92,6 +92,11 @@ class CarAudioHandler extends BaseAudioHandler with SeekHandler {
         MediaControl.skipToNext,
       ],
       systemActions: const {
+        MediaAction.play,
+        MediaAction.pause,
+        MediaAction.playPause,
+        MediaAction.skipToNext,
+        MediaAction.skipToPrevious,
         MediaAction.seek,
         MediaAction.seekForward,
         MediaAction.seekBackward,

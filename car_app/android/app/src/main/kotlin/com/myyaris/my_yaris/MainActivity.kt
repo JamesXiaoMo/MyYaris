@@ -214,7 +214,6 @@ class MainActivity : AudioServiceActivity() {
                         val minBuf = android.media.AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
                         val bufSize = maxOf(minBuf * 2, 8192)
                         val sources = intArrayOf(
-                            android.media.MediaRecorder.AudioSource.VOICE_COMMUNICATION,
                             android.media.MediaRecorder.AudioSource.VOICE_RECOGNITION,
                             android.media.MediaRecorder.AudioSource.MIC,
                         )

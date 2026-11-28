@@ -204,8 +204,12 @@ class WakeWordEngine(
         )
         val bufBytes = maxOf(minBuf * 2, CHUNK_SAMPLES * 2 * 4)
 
+        // IMPORTANT: Never use VOICE_COMMUNICATION or hardware AcousticEchoCanceler on Android
+        // car boxes (e.g. OttoAibox P3 Pro / CarPlay bridge). VOICE_COMMUNICATION / AEC forces
+        // the audio HAL into call/VoIP routing mode, which causes severe clipping/crackling on
+        // STREAM_MUSIC and hijacks steering-wheel volume & media skip buttons.
+        // VOICE_RECOGNITION is designed for always-on voice assistants without touching media output.
         val sources = intArrayOf(
-            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
             MediaRecorder.AudioSource.VOICE_RECOGNITION,
             MediaRecorder.AudioSource.MIC,
         )
@@ -236,29 +240,9 @@ class WakeWordEngine(
             return false
         }
 
-        // Attach hardware AEC + NoiseSuppressor when supported
+        // Keep AEC/NS disabled on continuous background capture so media output stays pure Hi-Fi stereo
         aecActive = false
         nsActive = false
-        try {
-            if (AcousticEchoCanceler.isAvailable()) {
-                aec = AcousticEchoCanceler.create(rec.audioSessionId)?.apply {
-                    enabled = true
-                    aecActive = this.enabled
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "AEC attach note: ${e.message}")
-        }
-        try {
-            if (NoiseSuppressor.isAvailable()) {
-                ns = NoiseSuppressor.create(rec.audioSessionId)?.apply {
-                    enabled = true
-                    nsActive = this.enabled
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "NS attach note: ${e.message}")
-        }
 
         try {
             rec.startRecording()

@@ -394,7 +394,7 @@ class CarMusicSyncService {
     final canExecuteLocally = switch (action) {
       'pause' || 'stop' => true,
       'resume' => _playerService.activeRemoteTrack != null || queueCtrl.tracks.isNotEmpty,
-      'next' || 'prev' => queueCtrl.tracks.isNotEmpty,
+      'next' || 'prev' || 'previous' => queueCtrl.tracks.isNotEmpty,
       'play_track' =>
         queueCtrl.tracks.isNotEmpty &&
             (params['queue_id'] == null || params['queue_id'] == queueCtrl.queueId),
